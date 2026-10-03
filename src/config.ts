@@ -17,6 +17,8 @@ export type Config = {
   smtpUser: string | null;
   smtpPass: string | null;
   mailFrom: string | null;
+  geminiApiKey: string | null;
+  geminiModel: string;
 };
 
 const PENDING_TTL_SECONDS = 600;
@@ -96,6 +98,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     smtpUser: nonempty(env.SMTP_USER),
     smtpPass: nonempty(env.SMTP_PASS),
     mailFrom: nonempty(env.MAIL_FROM),
+    geminiApiKey: nonempty(env.GEMINI_API_KEY),
+    geminiModel: nonempty(env.GEMINI_MODEL) ?? "gemini-flash-latest",
   };
 }
 

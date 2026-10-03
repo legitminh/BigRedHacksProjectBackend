@@ -6,6 +6,7 @@ import { GoogleExchangeError, authorizationUrl, createGoogleClient, type GoogleC
 import { PendingLogins, type CompletedLogin } from "./auth/pending.ts";
 import { hashToken, newOpaqueToken, signAccessToken, verifyAccessToken } from "./auth/tokens.ts";
 import { emailCodeTtlSeconds, googleConfigured, pendingTtlSeconds, type Config } from "./config.ts";
+import { mintEphemeralToken, type FetchLike } from "./gemini/ephemeral.ts";
 import { createMailer, type Mailer } from "./mailer.ts";
 import {
   HttpError,
@@ -27,6 +28,7 @@ export type AppDeps = {
   google?: GoogleClient;
   mailer?: Mailer;
   now?: () => Date;
+  fetch?: FetchLike;
 };
 
 function nowSeconds(now: Date): number {
@@ -83,6 +85,7 @@ export function createApp(deps: AppDeps): Server {
   const google = deps.google ?? createGoogleClient();
   const mailer = deps.mailer ?? createMailer(deps.config);
   const nowFn = deps.now ?? (() => new Date());
+  const fetchImpl = deps.fetch ?? fetch;
 
   return createServer((req, res) => {
     applyCors(req, res, deps.config);
@@ -90,16 +93,18 @@ export function createApp(deps: AppDeps): Server {
       sendEmpty(res, 204);
       return;
     }
-    void handle(req, res, { ...deps, pending, google, mailer, now: nowFn }).catch((error: unknown) => {
-      if (!res.headersSent) sendError(res, error);
-    });
+    void handle(req, res, { ...deps, pending, google, mailer, now: nowFn, fetch: fetchImpl }).catch(
+      (error: unknown) => {
+        if (!res.headersSent) sendError(res, error);
+      },
+    );
   });
 }
 
 async function handle(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: Required<Pick<AppDeps, "config" | "store" | "pending" | "google" | "mailer" | "now">>,
+  deps: Required<Pick<AppDeps, "config" | "store" | "pending" | "google" | "mailer" | "now" | "fetch">>,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const path = url.pathname;
@@ -143,6 +148,10 @@ async function handle(
     sendJson(res, 200, user);
     return;
   }
+  if (method === "POST" && path === "/v1/session/ephemeral-token") {
+    await issueEphemeralToken(req, res, deps);
+    return;
+  }
 
   if (
     path === "/v1/auth/google/start" ||
@@ -153,6 +162,7 @@ async function handle(
     path === "/v1/me" ||
     path === "/v1/auth/google/callback" ||
     path === "/v1/auth/google/poll" ||
+    path === "/v1/session/ephemeral-token" ||
     path === "/health"
   ) {
     throw new HttpError(405, "method_not_allowed", "Method not allowed.");
@@ -398,6 +408,29 @@ async function refresh(
     access_token: issueAccessToken(deps.config, rotated.user, now),
     refresh_token: next.token,
     expires_in: deps.config.accessTokenTtlSeconds,
+  });
+}
+
+async function issueEphemeralToken(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: Required<Pick<AppDeps, "config" | "store" | "now" | "fetch">>,
+): Promise<void> {
+  const now = deps.now();
+  await requireUser(deps, req, now);
+  await readJson(req);
+  if (!deps.config.geminiApiKey) {
+    throw new HttpError(503, "gemini_not_configured", "Set GEMINI_API_KEY in .env.");
+  }
+  const minted = await mintEphemeralToken({
+    apiKey: deps.config.geminiApiKey,
+    now,
+    fetchImpl: deps.fetch,
+  });
+  sendJson(res, 200, {
+    token: minted.token,
+    expire_time: minted.expireTime,
+    model: deps.config.geminiModel,
   });
 }
 
