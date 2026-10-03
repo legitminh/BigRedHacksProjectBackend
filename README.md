@@ -18,7 +18,7 @@ There is no `.env` with real keys in the repo. Fill `.env` before trying a real 
 openssl rand -base64 32
 ```
 
-Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup.
+Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup. Set `GEMINI_API_KEY` when the desktop app should mint Gemini Live tokens. Leave it blank and `POST /v1/session/ephemeral-token` returns `503`.
 
 ```bash
 npm run dev
@@ -171,6 +171,33 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 
 The access token itself keeps working until it expires. Drop it locally on sign-out anyway.
 
+### 6. Gemini Live token
+
+The desktop app must not ship `GEMINI_API_KEY`. Sign in first (steps 1–2) so the app holds a Waypoint access token. Then ask this server for a Gemini credential and use that token for Gemini Live instead of a key baked into the app.
+
+`POST /v1/session/ephemeral-token`
+
+Auth required: `Authorization: Bearer ACCESS_TOKEN`. Body is optional (`{}` or empty).
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/session/ephemeral-token \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+```json
+{
+  "token": "auth_tokens/...",
+  "expire_time": "2026-10-03T17:02:00.000Z",
+  "model": "gemini-flash-latest"
+}
+```
+
+`token` is single-use and lasts about 30 minutes (`expire_time`). Pass it to the Gemini Live client where an API key would go. Live sessions that use this token need the `v1alpha` API. `model` is `GEMINI_MODEL`, or `gemini-flash-latest` when that variable is blank. Mint a new token for each Live session. Do not log it.
+
+`401` `unauthorized` means the Waypoint bearer token is missing or invalid. Refresh it (step 4) or sign in again, then retry. `503` `gemini_not_configured` means `GEMINI_API_KEY` is blank on the server. `502` `gemini_token_failed` means Google did not issue a token. This response never includes the long-lived Gemini API key.
+
 ## Rust sketch
 
 This is the shape of a Tauri command that replaces `sign_in_waypoint`. It is not wired into the app in this branch.
@@ -245,4 +272,4 @@ Persist `access_token` and `refresh_token` from the `complete` poll the same way
 
 ## What this server does not do yet
 
-Email login, mail delivery, Gemini ephemeral tokens, preference and history APIs, and session summaries are later slices. See `devplan.md`.
+Email login, mail delivery, preference and history APIs, and session summaries are later slices. See `devplan.md`.

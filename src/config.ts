@@ -12,6 +12,8 @@ export type Config = {
   refreshTokenTtlSeconds: number;
   corsOrigins: string[];
   redirectUri: string;
+  geminiApiKey: string | null;
+  geminiModel: string;
 };
 
 const PENDING_TTL_SECONDS = 600;
@@ -74,6 +76,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0),
     redirectUri: `${publicBaseUrl}/v1/auth/google/callback`,
+    geminiApiKey: nonempty(env.GEMINI_API_KEY),
+    geminiModel: nonempty(env.GEMINI_MODEL) ?? "gemini-flash-latest",
   };
 }
 
