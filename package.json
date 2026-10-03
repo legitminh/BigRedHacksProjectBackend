@@ -1,0 +1,17 @@
+{
+  "name": "waypoint-api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node --watch --experimental-strip-types src/index.ts",
+    "start": "node --experimental-strip-types src/index.ts",
+    "test": "node --experimental-strip-types --test test/auth.test.ts"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
