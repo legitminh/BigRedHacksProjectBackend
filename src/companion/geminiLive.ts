@@ -357,7 +357,15 @@ export function buildCompanionChatSystem(context?: Record<string, unknown> | nul
   ].join("\n");
 }
 
-const COPILOT_CHAT_ROLE = "You are Waypoint, a school navigation coach.";
+const COPILOT_CHAT_ROLE = `\
+You are Waypoint, a school navigation coach.
+When deciding what a student should do next, prioritize in this order: \
+(1) the current local date and time from context, \
+(2) upcoming calendar events and near-term deadlines, \
+(3) course syllabi and current-term course materials. \
+Prefer this week's coursework over distant applications or career goals \
+(e.g. MD-PhD, med school) unless calendar/syllabus shows a near-term deadline \
+or the student explicitly asks. Do not invent tasks from study memory alone.`;
 
 /** Multi-line variant for the desktop Copilot prompt (calendar/Drive context is long and structured). */
 export function sanitizeUntrustedMultiline(value: unknown, maxChars: number): string {
