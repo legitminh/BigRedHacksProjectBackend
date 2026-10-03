@@ -405,7 +405,7 @@ function dashboardPage(config: Config, overview: AdminOverview): string {
         <tbody>
           <tr><th>Google OAuth</th><td>${flag(Boolean(config.googleClientId && config.googleClientSecret))}</td></tr>
           <tr><th>Gemini</th><td>${flag(Boolean(config.geminiApiKey), config.geminiModel, "not set")}</td></tr>
-          <tr><th>Coach / Ollama</th><td>${flag(Boolean(config.ollamaBaseUrl), config.ollamaModel, "disabled")}</td></tr>
+          <tr><th>Coach / Ollama</th><td>${flag(Boolean(config.ollamaBaseUrl), `${config.ollamaModel} · chat:${config.localChatProvider}`, "disabled")}</td></tr>
           <tr><th>Coach API token</th><td>${flag(Boolean(config.coachApiToken))}</td></tr>
           <tr><th>Session secret</th><td>${flag(Boolean(config.sessionSecret))}</td></tr>
           <tr><th>Public base</th><td><span class="pill soft">${escapeHtml(config.publicBaseUrl)}</span></td></tr>

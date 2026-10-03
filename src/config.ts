@@ -22,12 +22,36 @@ export type Config = {
   mailFrom: string | null;
   geminiApiKey: string | null;
   geminiModel: string;
+  /** Gemini Live model for study companion WebSocket proxy (`/v1/companion/live`). */
+  geminiLiveModel: string;
+  /**
+   * xAI / Grok API key for study heads-up TTS (`POST /v1/voice/tts` → api.x.ai/v1/tts).
+   * Stays on this server only — never bake into Waypoint.app.
+   */
+  xaiApiKey: string | null;
+  /** Built-in xAI voice id (eve, ara, …). Defaults to eve. */
+  xaiTtsVoice: string;
+  /**
+   * Which engine serves Copilot chat when local inference is preferred.
+   * - `ollama`: always use Ollama (`OLLAMA_CHAT_MODEL`); never call Gemini for chat.
+   * - `gemini`: Gemini first; silent Ollama fallback on quota/outage (cloud companion path).
+   * Set via LOCAL_CHAT_PROVIDER (`ollama`|`llama`|`local`|`gemini`|`cloud`).
+   */
+  localChatProvider: "ollama" | "gemini";
   /** Ollama base on the API host (not the end-user machine), e.g. http://127.0.0.1:11434 */
   ollamaBaseUrl: string | null;
   /** Shared secret the desktop app sends as Bearer for /v1/coach/* (optional if using user JWT). */
   coachApiToken: string | null;
+  /** Tiny lock-in coach model (fast, on-device via API proxy). */
   ollamaModel: string;
   ollamaVisionModel: string;
+  /**
+   * Stronger quantized chat model for local Copilot (and Gemini fallback).
+   * Runs on the API host via Ollama (not the end-user Mac).
+   */
+  ollamaChatModel: string;
+  /** Context window for Copilot local path (calendar/Drive-heavy prompts). */
+  ollamaChatNumCtx: number;
   /** Shared secret for the local HTML admin console at /admin. */
   adminPassword: string | null;
 };
@@ -88,6 +112,22 @@ function optionalPort(value: string | undefined): number | null {
   return parsed;
 }
 
+/** Parse LOCAL_CHAT_PROVIDER — aliases map onto ollama vs gemini. */
+export function parseLocalChatProvider(
+  value: string | undefined,
+): "ollama" | "gemini" {
+  const raw = (value ?? "").trim().toLowerCase();
+  if (!raw) return "gemini";
+  if (raw === "ollama" || raw === "llama" || raw === "local" || raw === "on-device") {
+    return "ollama";
+  }
+  if (raw === "gemini" || raw === "cloud" || raw === "google") {
+    return "gemini";
+  }
+  // Unknown values fall back to cloud companion path (safer than forcing local).
+  return "gemini";
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = positiveInt(env.PORT, 8787);
   const publicBaseUrl = (nonempty(env.PUBLIC_BASE_URL) ?? `http://127.0.0.1:${port}`).replace(
@@ -119,6 +159,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mailFrom: nonempty(env.MAIL_FROM),
     geminiApiKey: nonempty(env.GEMINI_API_KEY),
     geminiModel: nonempty(env.GEMINI_MODEL) ?? "gemini-flash-latest",
+    // Match gemini_live_demo default; override via GEMINI_LIVE_MODEL when Google renames models.
+    geminiLiveModel: nonempty(env.GEMINI_LIVE_MODEL) ?? "gemini-3.8-live",
+    xaiApiKey: nonempty(env.XAI_API_KEY),
+    xaiTtsVoice: nonempty(env.XAI_TTS_VOICE) ?? "eve",
+    // Default gemini keeps cloud companion; set LOCAL_CHAT_PROVIDER=ollama to force Llama.
+    localChatProvider: parseLocalChatProvider(env.LOCAL_CHAT_PROVIDER),
     // Default local Ollama when unset. Set OLLAMA_BASE_URL= (empty) to disable the proxy.
     ollamaBaseUrl:
       env.OLLAMA_BASE_URL === undefined
@@ -127,6 +173,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     coachApiToken: nonempty(env.COACH_API_TOKEN),
     ollamaModel: nonempty(env.OLLAMA_MODEL) ?? "qwen2.5:0.5b",
     ollamaVisionModel: nonempty(env.OLLAMA_VISION_MODEL) ?? "moondream",
+    // 7B Q4 is a good M1/server default: long context + calendar/Drive prompts without Gemini.
+    ollamaChatModel: nonempty(env.OLLAMA_CHAT_MODEL) ?? "qwen2.5:7b",
+    ollamaChatNumCtx: positiveInt(env.OLLAMA_CHAT_NUM_CTX, 16384),
     adminPassword: nonempty(env.ADMIN_PASSWORD),
   };
 }

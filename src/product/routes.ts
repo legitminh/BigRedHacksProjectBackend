@@ -17,6 +17,12 @@ import {
 import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
 import { createDriveClient, summarizeDriveFiles, type DriveClient } from "../drive/client.ts";
 import { geminiChat } from "../gemini/chat.ts";
+import {
+  isLocalChatForced,
+  ollamaChat,
+  selectChatBackend,
+  shouldFallbackToLocal,
+} from "../gemini/localChat.ts";
 import type { FetchLike } from "../gemini/ephemeral.ts";
 import { googleConfigured, pendingTtlSeconds, type Config } from "../config.ts";
 import { HttpError, bearerToken, page, readJson, sendEmpty, sendHtml, sendJson } from "../http.ts";
@@ -91,6 +97,7 @@ function isProductPath(path: string): boolean {
     path === "/v1/drive/recent" ||
     path === "/v1/drive/search" ||
     path === "/v1/gemini/chat" ||
+    path === "/v1/companion/chat" ||
     path === "/v1/me/data" ||
     path === "/v1/tasks" ||
     path === "/v1/tasks/active" ||
@@ -222,9 +229,6 @@ export async function handleProduct(
   }
   if (method === "POST" && path === "/v1/gemini/chat") {
     const user = await requireUser(deps, req, now);
-    if (!deps.config.geminiApiKey) {
-      throw new HttpError(503, "gemini_not_configured", "Set GEMINI_API_KEY in .env.");
-    }
     const body = await readJson(req);
     if (!body || typeof body !== "object") {
       throw new HttpError(400, "invalid_chat", "Expected a JSON object.");
@@ -250,13 +254,36 @@ export async function handleProduct(
       }))
       .filter((item) => item.content.length > 0)
       .slice(-40);
-    const reply = await geminiChat({
-      apiKey: deps.config.geminiApiKey,
-      model: deps.config.geminiModel,
+
+    const reply = await chatWithLocalFallback(deps, {
       system,
       history,
       message,
-      fetchImpl: deps.fetch,
+    });
+    // Same shape either way — desktop must not show quota / provider friction.
+    sendJson(res, 200, { role: "assistant", content: reply, user_id: user.id });
+    return true;
+  }
+  if (method === "POST" && path === "/v1/companion/chat") {
+    const user = await requireUser(deps, req, now);
+    const body = await readJson(req);
+    if (!body || typeof body !== "object") {
+      throw new HttpError(400, "invalid_companion", "Expected a JSON object.");
+    }
+    const record = body as Record<string, unknown>;
+    const message = typeof record.message === "string" ? record.message.trim() : "";
+    if (!message) throw new HttpError(400, "invalid_companion", "message is required.");
+    const history = parseChatHistory(record.history).slice(-40);
+    const contextBlock = formatCompanionContext(record.context);
+    const system =
+      typeof record.system === "string" && record.system.trim()
+        ? record.system.trim()
+        : defaultCompanionSystem(contextBlock);
+
+    const reply = await chatWithLocalFallback(deps, {
+      system,
+      history,
+      message,
     });
     sendJson(res, 200, { role: "assistant", content: reply, user_id: user.id });
     return true;
@@ -441,6 +468,145 @@ async function memoryCard(store: Store, userId: string) {
     updated_at: profile.updated_at,
     study_memory: profile.study_memory ?? null,
   };
+}
+
+type CompanionTurn = { role: "user" | "assistant" | "system"; content: string };
+
+function parseChatHistory(raw: unknown): CompanionTurn[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item) => ({
+      role:
+        item.role === "assistant" || item.role === "model"
+          ? ("assistant" as const)
+          : item.role === "system"
+            ? ("system" as const)
+            : ("user" as const),
+      content: typeof item.content === "string" ? item.content : "",
+    }))
+    .filter((item) => item.content.length > 0);
+}
+
+function formatCompanionContext(raw: unknown): string {
+  if (!raw || typeof raw !== "object") return "No active study context.";
+  const ctx = raw as Record<string, unknown>;
+  const lines: string[] = [];
+  const goals = typeof ctx.goals === "string" ? ctx.goals.trim() : "";
+  if (goals) lines.push(`Mission / material: ${goals}`);
+  const notes = typeof ctx.notes === "string" ? ctx.notes.trim() : "";
+  if (notes) lines.push(`Student notes: ${notes}`);
+  const modality = typeof ctx.modality === "string" ? ctx.modality.trim() : "";
+  if (modality) lines.push(`Modality: ${modality}`);
+  if (typeof ctx.duration_mins === "number" && Number.isFinite(ctx.duration_mins)) {
+    lines.push(`Planned duration: ${Math.round(ctx.duration_mins)} minutes`);
+  }
+  if (typeof ctx.remaining_mins === "number" && Number.isFinite(ctx.remaining_mins)) {
+    lines.push(`Time remaining: about ${Math.max(0, Math.round(ctx.remaining_mins))} minutes`);
+  }
+  if (typeof ctx.next_step_secs === "number" && Number.isFinite(ctx.next_step_secs)) {
+    const secs = Math.max(0, Math.round(ctx.next_step_secs));
+    lines.push(`Next-step timer: ${secs} seconds left`);
+  }
+  if (typeof ctx.paused === "boolean") {
+    lines.push(ctx.paused ? "Session is paused (on a break)." : "Session is active.");
+  }
+  return lines.length ? lines.join("\n") : "No active study context.";
+}
+
+function defaultCompanionSystem(contextBlock: string): string {
+  return [
+    "You are Waypoint Companion — a calm conversational study partner during an active lock-in.",
+    "Talk with the student turn-by-turn: answer questions, quiz gently, unstick them, and keep focus on their current material.",
+    "Keep replies short enough to speak aloud (usually 2–5 sentences). Prefer one clear next step.",
+    "Use the STUDY CONTEXT below; do not invent calendar, Drive, or syllabus facts beyond it.",
+    "Do not ask them to type into a chat box — you are already in a spoken/typed companion loop.",
+    "Format lightly: plain sentences, short lists only when helpful. Avoid long motivational preambles.",
+    "",
+    "STUDY CONTEXT:",
+    contextBlock,
+  ].join("\n");
+}
+
+async function chatWithLocalFallback(
+  deps: ProductDeps,
+  input: {
+    system: string;
+    history: Array<{ role: "user" | "assistant" | "system"; content: string }>;
+    message: string;
+  },
+): Promise<string> {
+  const localReady = Boolean(deps.config.ollamaBaseUrl);
+  const backend = selectChatBackend(deps.config);
+  const forceLocal = isLocalChatForced(deps.config);
+
+  // LOCAL_CHAT_PROVIDER=ollama|llama|local → Llama/Ollama only (no Gemini).
+  if (backend === "ollama" || forceLocal) {
+    if (!localReady) {
+      throw new HttpError(
+        503,
+        "local_chat_not_configured",
+        "LOCAL_CHAT_PROVIDER is ollama but OLLAMA_BASE_URL is unset. Set OLLAMA_BASE_URL + OLLAMA_CHAT_MODEL.",
+      );
+    }
+    if (forceLocal) {
+      console.warn(
+        "LOCAL_CHAT_PROVIDER=ollama; using local Llama model",
+        deps.config.ollamaChatModel,
+      );
+    } else {
+      console.warn(
+        "GEMINI_API_KEY unset; using local Ollama model",
+        deps.config.ollamaChatModel,
+      );
+    }
+    return ollamaChat({
+      baseUrl: deps.config.ollamaBaseUrl!,
+      model: deps.config.ollamaChatModel,
+      system: input.system,
+      history: input.history,
+      message: input.message,
+      numCtx: deps.config.ollamaChatNumCtx,
+      fetchImpl: deps.fetch,
+    });
+  }
+
+  // Cloud companion path: Gemini first, silent Ollama fallback on quota/outage.
+  if (!deps.config.geminiApiKey) {
+    throw new HttpError(
+      503,
+      "gemini_not_configured",
+      "Set GEMINI_API_KEY or LOCAL_CHAT_PROVIDER=ollama with OLLAMA_BASE_URL + OLLAMA_CHAT_MODEL for Copilot.",
+    );
+  }
+
+  try {
+    return await geminiChat({
+      apiKey: deps.config.geminiApiKey,
+      model: deps.config.geminiModel,
+      system: input.system,
+      history: input.history,
+      message: input.message,
+      fetchImpl: deps.fetch,
+    });
+  } catch (error) {
+    if (!localReady || !shouldFallbackToLocal(error)) throw error;
+    console.warn(
+      "Gemini chat unavailable; falling back to local Ollama model",
+      deps.config.ollamaChatModel,
+      error instanceof HttpError ? error.code : error,
+    );
+  }
+
+  return ollamaChat({
+    baseUrl: deps.config.ollamaBaseUrl!,
+    model: deps.config.ollamaChatModel,
+    system: input.system,
+    history: input.history,
+    message: input.message,
+    numCtx: deps.config.ollamaChatNumCtx,
+    fetchImpl: deps.fetch,
+  });
 }
 
 function clampInt(value: string | null, fallback: number, min: number, max: number): number {

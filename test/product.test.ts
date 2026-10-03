@@ -221,6 +221,256 @@ test("tasks replace the active one and completion records pace", async () => {
   });
 });
 
+test("companion chat injects study context and stays backend-mediated", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-companion-"));
+  const sent: { code: string }[] = [];
+  const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  let sawSystem = "";
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes("generativelanguage.googleapis.com")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        systemInstruction?: { parts?: Array<{ text?: string }> };
+      };
+      sawSystem = body.systemInstruction?.parts?.map((p) => p.text ?? "").join("") ?? "";
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: "Let's walk through one heap example." }] } }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return fetch(input, init);
+  };
+  const server: Server = createApp({
+    config: loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      SESSION_SECRET: SECRET,
+      PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+      GEMINI_API_KEY: "test-gemini-key",
+    }),
+    store: openFileStore(join(dir, "store.json")),
+    google: google(),
+    mailer,
+    calendar: calendar([]),
+    fetch: fetchImpl,
+    now: () => new Date("2026-10-03T18:00:00.000Z"),
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const token = await tokenFor(base, sent);
+    const res = await fetch(`${base}/v1/companion/chat`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: "Quiz me on heaps",
+        history: [{ role: "user", content: "I'm reviewing priority queues" }, { role: "assistant", content: "Sounds good." }],
+        context: {
+          goals: "CS 2110 heaps",
+          remaining_mins: 18,
+          next_step_secs: 240,
+          notes: "binary heap insert",
+          paused: false,
+        },
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { content: string; role: string };
+    assert.equal(body.role, "assistant");
+    assert.equal(body.content, "Let's walk through one heap example.");
+    assert.match(sawSystem, /CS 2110 heaps/);
+    assert.match(sawSystem, /binary heap insert/);
+    assert.match(sawSystem, /Waypoint Companion/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test("gemini chat falls back to local Ollama on quota without surfacing friction", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
+  const sent: { code: string }[] = [];
+  const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes("generativelanguage.googleapis.com")) {
+      return new Response(
+        JSON.stringify({ error: { message: "Quota exceeded for free_tier", status: "RESOURCE_EXHAUSTED" } }),
+        { status: 429, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.includes("/api/chat")) {
+      return new Response(
+        JSON.stringify({ message: { role: "assistant", content: "Local coach reply from Ollama." } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return fetch(input, init);
+  };
+  const server: Server = createApp({
+    config: loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      SESSION_SECRET: SECRET,
+      PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+      GEMINI_API_KEY: "test-gemini-key",
+      LOCAL_CHAT_PROVIDER: "gemini",
+      OLLAMA_BASE_URL: "http://127.0.0.1:11434",
+      OLLAMA_CHAT_MODEL: "qwen2.5:7b",
+    }),
+    store: openFileStore(join(dir, "store.json")),
+    google: google(),
+    mailer,
+    calendar: calendar([]),
+    fetch: fetchImpl,
+    now: () => new Date("2026-10-03T18:00:00.000Z"),
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const token = await tokenFor(base, sent);
+    const res = await fetch(`${base}/v1/gemini/chat`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "What should I study next?", history: [] }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { content: string };
+    assert.equal(body.content, "Local coach reply from Ollama.");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test("LOCAL_CHAT_PROVIDER=ollama never calls Gemini even when GEMINI_API_KEY is set", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
+  const sent: { code: string }[] = [];
+  const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  const hitGemini: string[] = [];
+  const hitOllama: string[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes("generativelanguage.googleapis.com")) {
+      hitGemini.push(url);
+      return new Response(
+        JSON.stringify({ candidates: [{ content: { parts: [{ text: "should-not-see" }] } }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.includes("/api/chat")) {
+      hitOllama.push(url);
+      return new Response(
+        JSON.stringify({ message: { role: "assistant", content: "Forced local Llama reply." } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return fetch(input, init);
+  };
+  const server: Server = createApp({
+    config: loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      SESSION_SECRET: SECRET,
+      PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+      GEMINI_API_KEY: "test-gemini-key",
+      LOCAL_CHAT_PROVIDER: "llama",
+      OLLAMA_BASE_URL: "http://127.0.0.1:11434",
+      OLLAMA_CHAT_MODEL: "qwen2.5:7b",
+    }),
+    store: openFileStore(join(dir, "store.json")),
+    google: google(),
+    mailer,
+    calendar: calendar([]),
+    fetch: fetchImpl,
+    now: () => new Date("2026-10-03T18:00:00.000Z"),
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const token = await tokenFor(base, sent);
+    const res = await fetch(`${base}/v1/gemini/chat`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Quiz me on heaps", history: [] }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { content: string };
+    assert.equal(body.content, "Forced local Llama reply.");
+    assert.equal(hitGemini.length, 0, "local mode must not call Gemini");
+    assert.equal(hitOllama.length, 1);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini when healthy (cloud companion)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
+  const sent: { code: string }[] = [];
+  const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  const hitGemini: string[] = [];
+  const hitOllama: string[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes("generativelanguage.googleapis.com")) {
+      hitGemini.push(url);
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: "Cloud companion reply." }] } }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.includes("/api/chat")) {
+      hitOllama.push(url);
+      return new Response(
+        JSON.stringify({ message: { role: "assistant", content: "unexpected local" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return fetch(input, init);
+  };
+  const server: Server = createApp({
+    config: loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      SESSION_SECRET: SECRET,
+      PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+      GEMINI_API_KEY: "test-gemini-key",
+      LOCAL_CHAT_PROVIDER: "gemini",
+      OLLAMA_BASE_URL: "http://127.0.0.1:11434",
+      OLLAMA_CHAT_MODEL: "qwen2.5:7b",
+    }),
+    store: openFileStore(join(dir, "store.json")),
+    google: google(),
+    mailer,
+    calendar: calendar([]),
+    fetch: fetchImpl,
+    now: () => new Date("2026-10-03T18:00:00.000Z"),
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const token = await tokenFor(base, sent);
+    const res = await fetch(`${base}/v1/gemini/chat`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Help me plan tomorrow", history: [] }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { content: string };
+    assert.equal(body.content, "Cloud companion reply.");
+    assert.equal(hitGemini.length, 1);
+    assert.equal(hitOllama.length, 0, "healthy Gemini must not fall through to Ollama");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
 test("DELETE /v1/me/data removes the user account entirely", async () => {
   await withApp(async (base, inbox) => {
     const token = await tokenFor(base, inbox);

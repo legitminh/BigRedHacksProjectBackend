@@ -12,8 +12,11 @@ import { createDriveClient, type DriveClient } from "./drive/client.ts";
 import { mintEphemeralToken, type FetchLike } from "./gemini/ephemeral.ts";
 import { handleAdmin } from "./admin.ts";
 import { coachTokenOk, handleCoach } from "./coach/ollama.ts";
+import { attachCompanionLiveUpgrade } from "./companion/liveUpgrade.ts";
 import { createMailer, type Mailer } from "./mailer.ts";
 import { handleProduct } from "./product/routes.ts";
+import { handleVoiceHealth, handleVoiceTts } from "./voice/tts.ts";
+import { aggregateStatus } from "./status/aggregate.ts";
 import {
   HttpError,
   applyCors,
@@ -89,6 +92,16 @@ async function requireUser(deps: AppDeps, req: IncomingMessage, now: Date): Prom
   return user;
 }
 
+/** Valid JWT → user; missing/invalid token → null (no 401). */
+async function optionalUser(deps: AppDeps, req: IncomingMessage, now: Date): Promise<PublicUser | null> {
+  if (!deps.config.sessionSecret) return null;
+  const token = bearerToken(req);
+  if (!token) return null;
+  const claims = verifyAccessToken(deps.config.sessionSecret, token, nowSeconds(now));
+  if (!claims) return null;
+  return (await deps.store.getUser(claims.sub)) ?? null;
+}
+
 export function createApp(deps: AppDeps): Server {
   const pending = deps.pending ?? new PendingLogins();
   const google = deps.google ?? createGoogleClient();
@@ -99,7 +112,7 @@ export function createApp(deps: AppDeps): Server {
   const drive = deps.drive ?? createDriveClient(fetchImpl);
   const calendarConnects = deps.calendarConnects ?? new CalendarConnects();
 
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
     applyCors(req, res, deps.config);
     if (req.method === "OPTIONS") {
       sendEmpty(res, 204);
@@ -121,6 +134,15 @@ export function createApp(deps: AppDeps): Server {
       },
     );
   });
+
+  // Study companion Gemini Live proxy — desktop connects here only (never to Google).
+  attachCompanionLiveUpgrade(server, {
+    config: deps.config,
+    store: deps.store,
+    now: nowFn,
+  });
+
+  return server;
 }
 
 async function handle(
@@ -139,6 +161,26 @@ async function handle(
 
   if (method === "GET" && path === "/health") {
     sendJson(res, 200, { ok: true, service: "waypoint-api", storage: deps.store.kind });
+    return;
+  }
+
+  if (method === "GET" && path === "/v1/status") {
+    const now = deps.now();
+    const user = await optionalUser(deps, req, now);
+    let googleConnected: boolean | null = null;
+    if (user) {
+      const connection = await deps.store.getCalendarConnection(user.id);
+      googleConnected = connection.connected;
+    }
+    const body = await aggregateStatus({
+      config: deps.config,
+      store: deps.store,
+      fetch: deps.fetch,
+      user,
+      googleConnected,
+      now: deps.now,
+    });
+    sendJson(res, 200, body);
     return;
   }
 
@@ -192,6 +234,18 @@ async function handle(
   ) {
     return;
   }
+  if (handleVoiceHealth(method, path, res, deps.config)) {
+    return;
+  }
+  if (
+    await handleVoiceTts(method, path, req, res, deps.config, deps.fetch, async () => {
+      // Same auth as lock-in coach — study heads-ups may use JWT or coach token.
+      if (coachTokenOk(deps.config, req)) return;
+      await requireUser(deps, req, deps.now());
+    })
+  ) {
+    return;
+  }
   if (
     await handleProduct(method, path, url, req, res, {
       config: deps.config,
@@ -217,6 +271,9 @@ async function handle(
     path === "/v1/auth/google/callback" ||
     path === "/v1/auth/google/poll" ||
     path === "/v1/session/ephemeral-token" ||
+    path === "/v1/status" ||
+    path === "/v1/voice/tts" ||
+    path === "/v1/voice/health" ||
     path === "/health"
   ) {
     throw new HttpError(405, "method_not_allowed", "Method not allowed.");
@@ -412,11 +469,25 @@ async function googleCallback(
       ),
     );
   } catch (error) {
+    const detail =
+      error instanceof Error && error.message.trim()
+        ? error.message.trim()
+        : "Sign-in could not be completed.";
+    // Keep the real Google/API reason — the desktop poll surfaces this string.
     const message =
-      error instanceof GoogleExchangeError ? "Google sign-in failed." : "Sign-in could not be completed.";
+      error instanceof GoogleExchangeError
+        ? detail
+        : `Sign-in could not be completed. (${detail})`;
     deps.pending.fail(claim.pending, { code: "google_exchange_failed", message });
-    if (!(error instanceof GoogleExchangeError) && !(error instanceof HttpError)) console.error(error);
-    sendHtml(res, 502, page("Sign-in failed", "Waypoint could not finish Google sign-in. Return to the app and try again."));
+    console.error("Google sign-in callback failed:", error);
+    sendHtml(
+      res,
+      502,
+      page(
+        "Sign-in failed",
+        "Waypoint could not finish Google sign-in. Return to the app and try again.",
+      ),
+    );
   }
 }
 

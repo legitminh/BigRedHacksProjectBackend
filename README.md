@@ -2,7 +2,11 @@
 
 Account server for the Waypoint desktop app. **Desktop login is Google OAuth only** — Google identity is upserted to a Waypoint `user.id`, then the app stores a JWT. A one-time email code path remains for API/dev tests only (not exposed in the desktop UI). The Google client secret and the Gemini key stay here. The app uses its Waypoint access token for memory, tasks, calendar/Drive, and Copilot chat.
 
-## Run
+**Deploy on any powerful server (HTTPS, Ollama, TigerData, systemd, point Mac builds at it):** see **[DEPLOY.md](./DEPLOY.md)**.
+
+Desktop companion: [BigRedHacksProject](https://github.com/legitminh/BigRedHacksProject) — set `waypoint_api_base` in `src-tauri/secrets.toml` to this API’s `PUBLIC_BASE_URL`, then `npm run app:build`.
+
+## Run (local laptop)
 
 ```bash
 cd BigRedHacksProjectBackend
@@ -16,19 +20,24 @@ There is no `.env` with real keys in the repo. Fill `.env` before trying a real 
 openssl rand -base64 32
 ```
 
-Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup. Leave the SMTP variables blank for local email login; the code is written to `data/outbox.jsonl`. Set `GEMINI_API_KEY` when the desktop app should mint Gemini Live tokens. Leave it blank and `POST /v1/session/ephemeral-token` returns `503`.
+Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup. Leave the SMTP variables blank for local email login; the code is written to `data/outbox.jsonl`. Set `GEMINI_API_KEY` for Copilot (`POST /v1/gemini/chat`). Default `LOCAL_CHAT_PROVIDER=gemini` uses Gemini first with silent Ollama fallback (`OLLAMA_CHAT_MODEL`, default `qwen2.5:7b`). Set `LOCAL_CHAT_PROVIDER=ollama` (aliases: `llama`, `local`) to force local Llama and never call Gemini for chat. Set `XAI_API_KEY` (optional `XAI_TTS_VOICE`, default `eve`) for study heads-up TTS (`POST /v1/voice/tts`); the desktop falls back to macOS `say` if unset or slow (~4s).
 
 ```bash
 npm run dev
+# or: npm start
 ```
 
-The process listens on `http://127.0.0.1:8787`. `GET /health` returns:
+The process listens on `BIND_HOST:PORT` (default `http://127.0.0.1:8787`). `GET /health` returns:
 
 ```json
 { "ok": true, "service": "waypoint-api", "storage": "file" }
 ```
 
-`storage` is `postgres` when `DATABASE_URL` is set. `npm test` covers Google sign-in and email codes. Email tests inject a mailer, so they do not send mail.
+`storage` is `postgres` when `DATABASE_URL` is set.
+
+**Connection status panel** (desktop Settings → Connection) uses `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, and Copilot chat provider. Auth is optional (JWT enriches account + Calendar/Drive). Probe results are cached ~30s. Indicator meanings: **[docs/STATUS.md](./docs/STATUS.md)**.
+
+`npm test` covers Google sign-in and email codes. Email tests inject a mailer, so they do not send mail. After any `.env` or code change, **restart** the process.
 
 ## Google Cloud client
 
@@ -52,16 +61,18 @@ Those URIs are `{PUBLIC_BASE_URL}` plus `/v1/auth/google/callback` and `/v1/goog
 
 ## Coach / Ollama proxy (desktop lock-in)
 
-Ollama runs **on this API host**, not on end-user Macs. The desktop app sets `local_llm_base = "http://127.0.0.1:8787/v1/coach"` and sends `Authorization: Bearer <COACH_API_TOKEN>`.
+Ollama runs **on this API host**, not on end-user Macs. The desktop app sets `local_llm_base` to `{PUBLIC_BASE_URL}/v1/coach` and sends a user JWT (or optional `COACH_API_TOKEN`).
 
 ```bash
 # On the API machine
 ollama serve
-ollama pull qwen2.5:0.5b
-ollama pull moondream
+ollama pull qwen2.5:0.5b    # lock-in
+ollama pull moondream       # rare vision
+ollama pull qwen2.5:7b      # Copilot fallback when Gemini is limited
 # in .env:
 # OLLAMA_BASE_URL=http://127.0.0.1:11434
-# COACH_API_TOKEN=<openssl rand -hex 24>
+# OLLAMA_CHAT_MODEL=qwen2.5:7b
+# COACH_API_TOKEN=<openssl rand -hex 24>   # optional
 ```
 
 | Method | Path | Proxies to |
@@ -192,7 +203,15 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 
 The access token itself keeps working until it expires. Drop it locally on sign-out anyway.
 
-### 6. Gemini Live token
+### 6. Study companion Live (preferred)
+
+During a lock-in, the desktop opens a **thin** WebSocket to this API only:
+
+`WS /v1/companion/live?access_token=ACCESS_TOKEN`
+
+Protocol mirrors [gemini_live_demo](https://github.com/legitminh/gemini_live_demo): `start` → mic `audio` / typed `text` / `barge` / `stop`. This server holds `GEMINI_API_KEY`, opens Gemini Live upstream, and streams transcripts + native audio back. Optional study context is sent on `start`. Typed fallback (no Live): `POST /v1/companion/chat`.
+
+### 6b. Gemini Live ephemeral token (legacy / other clients)
 
 The desktop app must not ship `GEMINI_API_KEY`. Sign in first (steps 1–2) so the app holds a Waypoint access token. Then ask this server for a Gemini credential and use that token for Gemini Live instead of a key baked into the app.
 
