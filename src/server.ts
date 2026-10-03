@@ -89,7 +89,7 @@ function nowSeconds(now: Date): number {
 
 function issueAccessToken(config: Config, user: PublicUser, now: Date): string {
   if (!config.sessionSecret) {
-    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+    throw new HttpError(503, "session_secret_missing", "Sign-in is temporarily unavailable.");
   }
   return signAccessToken(
     config.sessionSecret,
@@ -121,7 +121,7 @@ function newRefreshRecord(userId: string, now: Date, ttlSeconds: number): {
 
 async function requireUser(deps: AppDeps, req: IncomingMessage, now: Date): Promise<PublicUser> {
   if (!deps.config.sessionSecret) {
-    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+    throw new HttpError(503, "session_secret_missing", "Sign-in is temporarily unavailable.");
   }
   const token = bearerToken(req);
   if (!token) throw new HttpError(401, "unauthorized", "Sign in required.");
@@ -270,7 +270,7 @@ async function handle(
       throw new HttpError(
         404,
         "ephemeral_token_disabled",
-        "Ephemeral Gemini tokens are disabled. Use the server-side Live proxy (WS /v1/companion/live).",
+        "This feature is not available on this server.",
       );
     }
     await issueEphemeralToken(req, res, deps);
@@ -370,7 +370,7 @@ async function startEmail(
   }
   limit(deps, "email-start-email", email, "emailStartEmail");
   if (!deps.config.sessionSecret) {
-    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+    throw new HttpError(503, "session_secret_missing", "Sign-in is temporarily unavailable.");
   }
   const now = deps.now();
   const code = newEmailCode();
@@ -399,7 +399,7 @@ async function verifyEmail(
   deps: HandleDeps,
 ): Promise<void> {
   if (!deps.config.sessionSecret) {
-    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+    throw new HttpError(503, "session_secret_missing", "Sign-in is temporarily unavailable.");
   }
   limit(deps, "email-verify-ip", shieldIp(deps, req), "emailVerifyIp");
   const body = await readJson(req);
@@ -440,11 +440,11 @@ function assertLoginReady(config: Config): void {
     throw new HttpError(
       503,
       "google_not_configured",
-      "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.",
+      "Google sign-in is unavailable.",
     );
   }
   if (!config.sessionSecret) {
-    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+    throw new HttpError(503, "session_secret_missing", "Sign-in is temporarily unavailable.");
   }
 }
 
@@ -611,7 +611,7 @@ async function refresh(
   deps: Required<Pick<AppDeps, "config" | "store" | "now">>,
 ): Promise<void> {
   if (!deps.config.sessionSecret) {
-    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+    throw new HttpError(503, "session_secret_missing", "Sign-in is temporarily unavailable.");
   }
   const body = await readJson(req);
   const refreshToken =
@@ -645,7 +645,7 @@ async function issueEphemeralToken(
   await requireUser(deps, req, now);
   await readJson(req);
   if (!deps.config.geminiApiKey) {
-    throw new HttpError(503, "gemini_not_configured", "Set GEMINI_API_KEY in .env.");
+    throw new HttpError(503, "gemini_not_configured", "Cloud voice is unavailable.");
   }
   const minted = await mintEphemeralToken({
     apiKey: deps.config.geminiApiKey,

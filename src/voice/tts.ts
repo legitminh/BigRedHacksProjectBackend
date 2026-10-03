@@ -43,7 +43,7 @@ export async function synthesizeXaiTts(input: {
     throw new HttpError(
       503,
       "xai_tts_not_configured",
-      "Set XAI_API_KEY on the API server for Grok study heads-up voice.",
+      "Study voice is unavailable.",
     );
   }
 

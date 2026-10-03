@@ -82,7 +82,7 @@ async function revokeStoredGoogleGrant(deps: ProductDeps, userId: string): Promi
 
 async function requireUser(deps: ProductDeps, req: IncomingMessage, now: Date): Promise<PublicUser> {
   if (!deps.config.sessionSecret) {
-    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+    throw new HttpError(503, "session_secret_missing", "Sign-in is temporarily unavailable.");
   }
   const token = bearerToken(req);
   if (!token) throw new HttpError(401, "unauthorized", "Sign in required.");
@@ -526,7 +526,7 @@ async function chatWithLocalFallback(
       throw new HttpError(
         503,
         "local_chat_not_configured",
-        "LOCAL_CHAT_PROVIDER is ollama but OLLAMA_BASE_URL is unset. Set OLLAMA_BASE_URL + OLLAMA_CHAT_MODEL.",
+        "Local Copilot is unavailable.",
       );
     }
     if (forceLocal) {
@@ -556,7 +556,7 @@ async function chatWithLocalFallback(
     throw new HttpError(
       503,
       "gemini_not_configured",
-      "Set GEMINI_API_KEY or LOCAL_CHAT_PROVIDER=ollama with OLLAMA_BASE_URL + OLLAMA_CHAT_MODEL for Copilot.",
+      "Copilot is unavailable.",
     );
   }
 
@@ -599,7 +599,7 @@ function clampInt(value: string | null, fallback: number, min: number, max: numb
 async function startCalendar(req: IncomingMessage, res: ServerResponse, deps: ProductDeps, now: Date) {
   const user = await requireUser(deps, req, now);
   if (!googleConfigured(deps.config)) {
-    throw new HttpError(503, "google_not_configured", "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.");
+    throw new HttpError(503, "google_not_configured", "Google sign-in is unavailable.");
   }
   const state = newOpaqueToken();
   const pollToken = newOpaqueToken();
@@ -641,7 +641,7 @@ async function calendarCallback(url: URL, res: ServerResponse, deps: ProductDeps
   }
   try {
     if (!googleConfigured(deps.config)) {
-      throw new HttpError(503, "google_not_configured", "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.");
+      throw new HttpError(503, "google_not_configured", "Google sign-in is unavailable.");
     }
     const tokens = await deps.google.exchangeCode({
       code,
@@ -695,7 +695,7 @@ async function googleAccess(deps: ProductDeps, userId: string): Promise<string> 
     throw new HttpError(409, "calendar_not_connected", "Connect Google Calendar before using it.");
   }
   if (!googleConfigured(deps.config)) {
-    throw new HttpError(503, "google_not_configured", "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.");
+    throw new HttpError(503, "google_not_configured", "Google sign-in is unavailable.");
   }
   return deps.calendar.refresh({
     refreshToken: connection.refreshToken,

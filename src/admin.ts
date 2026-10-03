@@ -37,7 +37,7 @@ function cookieSecret(config: Config): string {
 
 export function mintAdminCookie(config: Config): string {
   if (!config.adminPassword) {
-    throw new HttpError(503, "admin_not_configured", "ADMIN_PASSWORD is not set.");
+    throw new HttpError(503, "admin_not_configured", "Admin is unavailable.");
   }
   return createHmac("sha256", cookieSecret(config))
     .update(`admin-v1:${config.adminPassword}`)
@@ -286,7 +286,7 @@ function loginPage(error?: string): string {
     "Waypoint Admin",
     `
     <h1>Waypoint admin</h1>
-    <p class="sub">Local operator console. Password is set via <code>ADMIN_PASSWORD</code>.</p>
+    <p class="sub">Local operator console.</p>
     <div class="panel">
       <form method="POST" action="/admin/login" autocomplete="current-password">
         <label for="password">Admin password</label>
@@ -409,10 +409,10 @@ function dashboardPage(config: Config, overview: AdminOverview): string {
       <table>
         <tbody>
           <tr><th>Google OAuth</th><td>${flag(Boolean(config.googleClientId && config.googleClientSecret))}</td></tr>
-          <tr><th>Gemini</th><td>${flag(Boolean(config.geminiApiKey), config.geminiModel, "not set")}</td></tr>
-          <tr><th>Coach / Ollama</th><td>${flag(Boolean(config.ollamaBaseUrl), `${config.ollamaModel} · chat:${config.localChatProvider}`, "disabled")}</td></tr>
-          <tr><th>Coach API token</th><td>${flag(Boolean(config.coachApiToken))}</td></tr>
-          <tr><th>Session secret</th><td>${flag(Boolean(config.sessionSecret))}</td></tr>
+          <tr><th>Gemini</th><td>${flag(Boolean(config.geminiApiKey), config.geminiModel, "unavailable")}</td></tr>
+          <tr><th>Lock-in coach</th><td>${flag(Boolean(config.ollamaBaseUrl), `${config.ollamaModel} · ${config.ollamaChatModel}`, "unavailable")}</td></tr>
+          <tr><th>Coach access</th><td>${flag(Boolean(config.coachApiToken))}</td></tr>
+          <tr><th>Sign-in sessions</th><td>${flag(Boolean(config.sessionSecret))}</td></tr>
           <tr><th>Public base</th><td><span class="pill soft">${escapeHtml(config.publicBaseUrl)}</span></td></tr>
         </tbody>
       </table>
@@ -541,12 +541,12 @@ export async function handleAdmin(
         503,
         shell(
           "Admin unavailable",
-          `<h1>Admin unavailable</h1><p class="sub">Set <code>ADMIN_PASSWORD</code> in <code>.env</code> and restart the API.</p>`,
+          `<h1>Admin unavailable</h1><p class="sub">This console is not enabled on this server.</p>`,
         ),
       );
       return true;
     }
-    throw new HttpError(503, "admin_not_configured", "ADMIN_PASSWORD is not set.");
+    throw new HttpError(503, "admin_not_configured", "Admin is unavailable.");
   }
 
   if (method === "GET" && path === "/admin") {

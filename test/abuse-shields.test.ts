@@ -489,7 +489,7 @@ test("anonymous status still reports a missing Gemini key", async () => {
       const body = (await (await fetch(`${base}/v1/status`)).json()) as StatusResponse;
       const gemini = body.services.find((s) => s.id === "gemini");
       assert.equal(gemini?.state, "err");
-      assert.match(gemini?.detail ?? "", /GEMINI_API_KEY/);
+      assert.match(gemini?.detail ?? "", /Cloud coach is not set up/i);
       assert.equal(hits.gemini, 0);
     },
     { fetch: statusFetch(hits), config: appConfig({ GEMINI_API_KEY: "" }) },

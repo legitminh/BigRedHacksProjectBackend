@@ -275,7 +275,7 @@ test("GET /v1/status reports missing Gemini key without calling Google", async (
       const body = (await response.json()) as StatusResponse;
       assert.equal(byId(body, "gemini").state, "err");
       assert.equal(byId(body, "gemini").status, "Offline");
-      assert.match(byId(body, "gemini").detail, /GEMINI_API_KEY/);
+      assert.match(byId(body, "gemini").detail, /Cloud coach is not set up/i);
       assert.equal(geminiHits, 0);
     },
     { config: appConfig({ GEMINI_API_KEY: "" }), fetchImpl },

@@ -94,7 +94,7 @@ async function probeGemini(config: Config, fetchImpl: FetchLike, nowMs: number):
     const result: ProbeResult = {
       state: "err",
       status: "Offline",
-      detail: "GEMINI_API_KEY missing on the API server",
+      detail: "Cloud coach is not set up on this server",
     };
     cacheSet(geminiCache, cacheKey, result, nowMs, ttl);
     return result;
@@ -150,7 +150,7 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
     const result: ProbeResult = {
       state: "err",
       status: "Offline",
-      detail: "OLLAMA_BASE_URL unset — lock-in coach disabled",
+      detail: "Lock-in coach is not set up on this server",
     };
     cacheSet(ollamaCache, cacheKey, result, nowMs, ttl);
     return result;
@@ -216,14 +216,14 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
 function configOnlyGemini(config: Config): ProbeResult {
   return config.geminiApiKey
     ? { state: "ok", status: "Configured", detail: "Cloud coach configured — sign in for a live check" }
-    : { state: "err", status: "Offline", detail: "GEMINI_API_KEY missing on the API server" };
+    : { state: "err", status: "Offline", detail: "Cloud coach is not set up on this server" };
 }
 
 /** Anonymous Ollama row — reflects configuration only (never calls Ollama). */
 function configOnlyOllama(config: Config): ProbeResult {
   return config.ollamaBaseUrl
     ? { state: "ok", status: "Configured", detail: "Lock-in coach configured — sign in for a live check" }
-    : { state: "err", status: "Offline", detail: "OLLAMA_BASE_URL unset — lock-in coach disabled" };
+    : { state: "err", status: "Offline", detail: "Lock-in coach is not set up on this server" };
 }
 
 function apiIndicator(store: Store): ServiceIndicator {
@@ -232,7 +232,7 @@ function apiIndicator(store: Store): ServiceIndicator {
     label: "Waypoint API",
     state: "ok",
     status: "Connected",
-    detail: `Process up · storage ${store.kind}`,
+    detail: "Waypoint API is running",
     optional: false,
   };
 }
@@ -244,9 +244,7 @@ function googleOauthIndicator(config: Config): ServiceIndicator {
     label: "Google sign-in",
     state: ready ? "ok" : "err",
     status: ready ? "Connected" : "Offline",
-    detail: ready
-      ? "OAuth client configured for Waypoint login"
-      : "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET missing",
+    detail: ready ? "Google sign-in is ready" : "Google sign-in is not set up on this server",
     optional: false,
   };
 }
@@ -321,9 +319,7 @@ function chatProviderIndicator(
       label: "Copilot chat",
       state: ollama.state,
       status: ollama.status,
-      detail: forced
-        ? `LOCAL_CHAT_PROVIDER=ollama · ${ollama.detail}`
-        : `Using Ollama chat (${config.ollamaChatModel}) · ${ollama.detail}`,
+      detail: forced ? `Local Copilot · ${ollama.detail}` : `Local Copilot (${config.ollamaChatModel}) · ${ollama.detail}`,
       optional: false,
     };
   }

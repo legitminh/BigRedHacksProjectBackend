@@ -67,12 +67,12 @@ function ollamaErrorMessage(baseUrl: string, error: unknown): string {
         : "";
   const detail = cause && !msg.includes(cause) ? `${msg} (${cause})` : msg;
   if (/abort|timeout/i.test(detail)) {
-    return `Ollama at ${baseUrl} timed out. Is \`ollama serve\` running?`;
+    return "Lock-in coach timed out.";
   }
   if (/ECONNREFUSED|fetch failed|ENOTFOUND|EHOSTUNREACH/i.test(detail)) {
-    return `Could not reach Ollama at ${baseUrl}. Start it with \`ollama serve\` or fix OLLAMA_BASE_URL.`;
+    return "Could not reach the lock-in coach.";
   }
-  return `Could not reach Ollama at ${baseUrl} (${detail}).`;
+  return "Could not reach the lock-in coach.";
 }
 
 async function proxyOllama(
@@ -87,7 +87,7 @@ async function proxyOllama(
     throw new HttpError(
       503,
       "ollama_not_configured",
-      "Set OLLAMA_BASE_URL on the API server (e.g. http://127.0.0.1:11434).",
+      "Lock-in coach is unavailable.",
     );
   }
   const url = `${config.ollamaBaseUrl.replace(/\/+$/, "")}${ollamaPath}`;
@@ -188,7 +188,7 @@ export async function handleCoach(
             ok: false,
             error: {
               code: "ollama_not_configured",
-              message: "Set OLLAMA_BASE_URL on the API server (e.g. http://127.0.0.1:11434).",
+              message: "Lock-in coach is unavailable.",
             },
           });
           return true;

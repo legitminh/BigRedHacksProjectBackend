@@ -162,7 +162,7 @@ test("coach tags returns clear error when Ollama is down", async () => {
       assert.equal(response.status, 502);
       const body = (await response.json()) as { error: { code: string; message: string } };
       assert.equal(body.error.code, "ollama_unreachable");
-      assert.match(body.error.message, /ollama serve|OLLAMA_BASE_URL|Could not reach Ollama/i);
+      assert.match(body.error.message, /Could not reach the lock-in coach/i);
     },
     {
       fetchImpl: async () => {

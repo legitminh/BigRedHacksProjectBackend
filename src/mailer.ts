@@ -42,7 +42,7 @@ export function createRefusingMailer(): Mailer {
       throw new HttpError(
         503,
         "email_not_configured",
-        "Email sign-in is unavailable: SMTP is not configured on this server.",
+        "Email sign-in is unavailable.",
       );
     },
   };
