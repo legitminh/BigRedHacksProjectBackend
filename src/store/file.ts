@@ -5,6 +5,13 @@ import { randomUUID } from "node:crypto";
 import { canonicalEmail } from "../auth/email.ts";
 import { hashesMatch } from "../auth/tokens.ts";
 import type {
+  PaceSample,
+  Proficiency,
+  SessionRecap,
+  StoredProfile,
+  TaskRecord,
+} from "../product/model.ts";
+import type {
   EmailLoginCode,
   GoogleProfile,
   PublicUser,
@@ -16,18 +23,35 @@ import type {
 type UserRecord = PublicUser & {
   google_sub: string | null;
   google_refresh_token: string | null;
+  calendar_connected?: boolean;
   created_at: string;
   last_login_at: string;
 };
+
+type Owned<T> = T & { userId: string };
 
 type FileData = {
   users: UserRecord[];
   refreshTokens: StoredRefreshToken[];
   emailCodes: EmailLoginCode[];
+  profiles: Owned<StoredProfile>[];
+  proficiencies: Owned<Proficiency & { updated_at: string }>[];
+  paceSamples: Owned<PaceSample>[];
+  tasks: Owned<TaskRecord>[];
+  sessions: Owned<SessionRecap>[];
 };
 
 function empty(): FileData {
-  return { users: [], refreshTokens: [], emailCodes: [] };
+  return {
+    users: [],
+    refreshTokens: [],
+    emailCodes: [],
+    profiles: [],
+    proficiencies: [],
+    paceSamples: [],
+    tasks: [],
+    sessions: [],
+  };
 }
 
 function toPublic(user: UserRecord): PublicUser {
@@ -60,6 +84,11 @@ export function openFileStore(path: string): Store {
         users: parsed.users ?? [],
         refreshTokens: parsed.refreshTokens ?? [],
         emailCodes: parsed.emailCodes ?? [],
+        profiles: parsed.profiles ?? [],
+        proficiencies: parsed.proficiencies ?? [],
+        paceSamples: parsed.paceSamples ?? [],
+        tasks: parsed.tasks ?? [],
+        sessions: parsed.sessions ?? [],
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
@@ -108,6 +137,7 @@ export function openFileStore(path: string): Store {
           name: profile.name,
           picture: profile.picture,
           google_refresh_token: profile.googleRefreshToken,
+          calendar_connected: false,
           created_at: now.toISOString(),
           last_login_at: now.toISOString(),
         };
@@ -137,6 +167,7 @@ export function openFileStore(path: string): Store {
           name: null,
           picture: null,
           google_refresh_token: null,
+          calendar_connected: false,
           created_at: now.toISOString(),
           last_login_at: now.toISOString(),
         };
@@ -231,6 +262,146 @@ export function openFileStore(path: string): Store {
         const data = await read();
         const user = data.users.find((item) => item.id === id);
         return user ? toPublic(user) : null;
+      });
+    },
+    async getProfile(userId) {
+      return lock(async () => {
+        const data = await read();
+        const profile = data.profiles.find((item) => item.userId === userId);
+        if (!profile) return null;
+        const { userId: _userId, ...rest } = profile;
+        return rest;
+      });
+    },
+    async saveProfile(userId, profile) {
+      await lock(async () => {
+        const data = await read();
+        data.profiles = data.profiles.filter((item) => item.userId !== userId);
+        data.profiles.push({ userId, ...profile });
+        await write(data);
+      });
+    },
+    async listProficiencies(userId) {
+      return lock(async () => {
+        const data = await read();
+        return data.proficiencies
+          .filter((item) => item.userId === userId)
+          .map(({ topic, level }) => ({ topic, level }));
+      });
+    },
+    async replaceProficiencies(userId, items, now) {
+      await lock(async () => {
+        const data = await read();
+        data.proficiencies = data.proficiencies.filter((item) => item.userId !== userId);
+        for (const item of items) {
+          data.proficiencies.push({ userId, ...item, updated_at: now.toISOString() });
+        }
+        await write(data);
+      });
+    },
+    async upsertProficiency(userId, item, now) {
+      await lock(async () => {
+        const data = await read();
+        const key = item.topic.toLowerCase();
+        data.proficiencies = data.proficiencies.filter(
+          (row) => !(row.userId === userId && row.topic.toLowerCase() === key),
+        );
+        data.proficiencies.push({ userId, ...item, updated_at: now.toISOString() });
+        await write(data);
+      });
+    },
+    async addPaceSample(userId, sample) {
+      await lock(async () => {
+        const data = await read();
+        data.paceSamples.push({ userId, ...sample });
+        await write(data);
+      });
+      return sample;
+    },
+    async listPaceSamples(userId, topic) {
+      return lock(async () => {
+        const data = await read();
+        return data.paceSamples
+          .filter((sample) => sample.userId === userId)
+          .filter((sample) => (topic ? sample.topic.toLowerCase() === topic.toLowerCase() : true))
+          .map(({ userId: _userId, ...sample }) => sample)
+          .sort((a, b) => Date.parse(b.recorded_at) - Date.parse(a.recorded_at));
+      });
+    },
+    async getCalendarConnection(userId) {
+      return lock(async () => {
+        const data = await read();
+        const user = data.users.find((item) => item.id === userId);
+        if (!user) return { connected: false, refreshToken: null };
+        return { connected: user.calendar_connected === true, refreshToken: user.google_refresh_token };
+      });
+    },
+    async setCalendarGrant(userId, refreshToken, connected) {
+      await lock(async () => {
+        const data = await read();
+        const user = data.users.find((item) => item.id === userId);
+        if (!user) return;
+        user.calendar_connected = connected;
+        if (refreshToken) user.google_refresh_token = refreshToken;
+        await write(data);
+      });
+    },
+    async createTask(userId, task, now) {
+      await lock(async () => {
+        const data = await read();
+        for (const existing of data.tasks) {
+          if (existing.userId === userId && existing.status === "active") {
+            existing.status = "dropped";
+            existing.ended_at = now.toISOString();
+          }
+        }
+        data.tasks.push({ userId, ...task });
+        await write(data);
+      });
+      return task;
+    },
+    async getActiveTask(userId) {
+      return lock(async () => {
+        const data = await read();
+        const task = data.tasks.find((item) => item.userId === userId && item.status === "active");
+        if (!task) return null;
+        const { userId: _userId, ...rest } = task;
+        return rest;
+      });
+    },
+    async getTask(userId, id) {
+      return lock(async () => {
+        const data = await read();
+        const task = data.tasks.find((item) => item.userId === userId && item.id === id);
+        if (!task) return null;
+        const { userId: _userId, ...rest } = task;
+        return rest;
+      });
+    },
+    async saveTask(userId, task) {
+      await lock(async () => {
+        const data = await read();
+        const index = data.tasks.findIndex((item) => item.userId === userId && item.id === task.id);
+        if (index < 0) return;
+        data.tasks[index] = { userId, ...task };
+        await write(data);
+      });
+    },
+    async insertSession(userId, session) {
+      await lock(async () => {
+        const data = await read();
+        data.sessions.push({ userId, ...session });
+        await write(data);
+      });
+      return session;
+    },
+    async listSessions(userId) {
+      return lock(async () => {
+        const data = await read();
+        return data.sessions
+          .filter((session) => session.userId === userId)
+          .map(({ userId: _userId, ...session }) => session)
+          .sort((a, b) => Date.parse(b.ended_at) - Date.parse(a.ended_at));
       });
     },
     async close() {},

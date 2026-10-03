@@ -7,6 +7,15 @@ import { Pool, type PoolClient } from "pg";
 
 import { canonicalEmail } from "../auth/email.ts";
 import { hashesMatch } from "../auth/tokens.ts";
+import {
+  DEFAULT_INTERACTION,
+  type Interaction,
+  type Level,
+  type PaceSample,
+  type SessionRecap,
+  type StoredProfile,
+  type TaskRecord,
+} from "../product/model.ts";
 import type {
   EmailLoginCode,
   GoogleProfile,
@@ -339,8 +348,280 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
       const row = result.rows[0];
       return row ? toPublic(row) : null;
     },
+    async getProfile(userId) {
+      const result = await pool.query<{
+        interests: string[];
+        long_term_goals: unknown;
+        priorities: unknown;
+        interaction: unknown;
+        updated_at: Date;
+      }>(
+        `SELECT interests, long_term_goals, priorities, interaction, updated_at FROM user_profiles WHERE user_id = $1`,
+        [userId],
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      return {
+        interests: row.interests ?? [],
+        long_term_goals: asStrings(row.long_term_goals),
+        priorities: asStrings(row.priorities),
+        interaction: asInteraction(row.interaction),
+        updated_at: new Date(row.updated_at).toISOString(),
+      };
+    },
+    async saveProfile(userId, profile: StoredProfile) {
+      await pool.query(
+        `INSERT INTO user_profiles (user_id, interests, long_term_goals, priorities, interaction, updated_at)
+         VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6)
+         ON CONFLICT (user_id) DO UPDATE SET
+           interests = EXCLUDED.interests,
+           long_term_goals = EXCLUDED.long_term_goals,
+           priorities = EXCLUDED.priorities,
+           interaction = EXCLUDED.interaction,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          userId,
+          profile.interests,
+          JSON.stringify(profile.long_term_goals),
+          JSON.stringify(profile.priorities),
+          JSON.stringify(profile.interaction),
+          profile.updated_at,
+        ],
+      );
+    },
+    async listProficiencies(userId) {
+      const result = await pool.query<{ topic: string; level: Level }>(
+        `SELECT topic, level FROM proficiencies WHERE user_id = $1 ORDER BY topic`,
+        [userId],
+      );
+      return result.rows;
+    },
+    async replaceProficiencies(userId, items, now) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(`DELETE FROM proficiencies WHERE user_id = $1`, [userId]);
+        for (const item of items) {
+          await client.query(
+            `INSERT INTO proficiencies (user_id, topic, level, updated_at) VALUES ($1, $2, $3, $4)`,
+            [userId, item.topic, item.level, now.toISOString()],
+          );
+        }
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    async upsertProficiency(userId, item, now) {
+      await pool.query(
+        `DELETE FROM proficiencies WHERE user_id = $1 AND lower(topic) = lower($2)`,
+        [userId, item.topic],
+      );
+      await pool.query(
+        `INSERT INTO proficiencies (user_id, topic, level, updated_at) VALUES ($1, $2, $3, $4)`,
+        [userId, item.topic, item.level, now.toISOString()],
+      );
+    },
+    async addPaceSample(userId, sample) {
+      await pool.query(
+        `INSERT INTO pace_samples (id, user_id, topic, problem, planned_minutes, actual_minutes, outcome, task_id, recorded_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          sample.id,
+          userId,
+          sample.topic,
+          sample.problem,
+          sample.planned_minutes,
+          sample.actual_minutes,
+          sample.outcome,
+          sample.task_id,
+          sample.recorded_at,
+        ],
+      );
+      return sample;
+    },
+    async listPaceSamples(userId, topic) {
+      const result = await pool.query<PaceSample>(
+        `SELECT id, topic, problem, planned_minutes, actual_minutes, outcome, task_id, recorded_at
+         FROM pace_samples
+         WHERE user_id = $1 AND ($2::text IS NULL OR lower(topic) = lower($2))
+         ORDER BY recorded_at DESC`,
+        [userId, topic],
+      );
+      return result.rows.map((row) => ({
+        ...row,
+        recorded_at: new Date(row.recorded_at).toISOString(),
+      }));
+    },
+    async getCalendarConnection(userId) {
+      const result = await pool.query<{ calendar_connected: boolean; google_refresh_token: string | null }>(
+        `SELECT calendar_connected, google_refresh_token FROM users WHERE id = $1`,
+        [userId],
+      );
+      const row = result.rows[0];
+      if (!row) return { connected: false, refreshToken: null };
+      return { connected: row.calendar_connected, refreshToken: row.google_refresh_token };
+    },
+    async setCalendarGrant(userId, refreshToken, connected) {
+      if (refreshToken) {
+        await pool.query(
+          `UPDATE users SET calendar_connected = $2, google_refresh_token = $3 WHERE id = $1`,
+          [userId, connected, refreshToken],
+        );
+        return;
+      }
+      await pool.query(`UPDATE users SET calendar_connected = $2 WHERE id = $1`, [userId, connected]);
+    },
+    async createTask(userId, task, now) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `UPDATE tasks SET status = 'dropped', ended_at = $2 WHERE user_id = $1 AND status = 'active'`,
+          [userId, now.toISOString()],
+        );
+        await client.query(
+          `INSERT INTO tasks (id, user_id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            task.id,
+            userId,
+            task.title,
+            task.mode,
+            task.status,
+            task.planned_minutes,
+            task.deadline_event_id,
+            task.outcome,
+            task.started_at,
+            task.ended_at,
+          ],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+      return task;
+    },
+    async getActiveTask(userId) {
+      const result = await pool.query<TaskRow>(
+        `SELECT id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at
+         FROM tasks WHERE user_id = $1 AND status = 'active' LIMIT 1`,
+        [userId],
+      );
+      return result.rows[0] ? mapTask(result.rows[0]) : null;
+    },
+    async getTask(userId, id) {
+      const result = await pool.query<TaskRow>(
+        `SELECT id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at
+         FROM tasks WHERE user_id = $1 AND id = $2`,
+        [userId, id],
+      );
+      return result.rows[0] ? mapTask(result.rows[0]) : null;
+    },
+    async saveTask(userId, task) {
+      await pool.query(
+        `UPDATE tasks SET title = $3, mode = $4, status = $5, planned_minutes = $6, deadline_event_id = $7,
+           outcome = $8, started_at = $9, ended_at = $10
+         WHERE user_id = $1 AND id = $2`,
+        [
+          userId,
+          task.id,
+          task.title,
+          task.mode,
+          task.status,
+          task.planned_minutes,
+          task.deadline_event_id,
+          task.outcome,
+          task.started_at,
+          task.ended_at,
+        ],
+      );
+    },
+    async insertSession(userId, session) {
+      await pool.query(
+        `INSERT INTO session_recaps (id, user_id, task_id, started_at, ended_at, break_minutes, attention, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          session.id,
+          userId,
+          session.task_id,
+          session.started_at,
+          session.ended_at,
+          session.break_minutes,
+          session.attention,
+          session.note,
+        ],
+      );
+      return session;
+    },
+    async listSessions(userId) {
+      const result = await pool.query<{
+        id: string;
+        task_id: string;
+        started_at: Date;
+        ended_at: Date;
+        break_minutes: number;
+        attention: SessionRecap["attention"];
+        note: string;
+      }>(
+        `SELECT id, task_id, started_at, ended_at, break_minutes, attention, note
+         FROM session_recaps WHERE user_id = $1 ORDER BY ended_at DESC`,
+        [userId],
+      );
+      return result.rows.map((row) => ({
+        id: row.id,
+        task_id: row.task_id,
+        started_at: new Date(row.started_at).toISOString(),
+        ended_at: new Date(row.ended_at).toISOString(),
+        break_minutes: row.break_minutes,
+        attention: row.attention,
+        note: row.note,
+      }));
+    },
     async close() {
       await pool.end();
     },
   };
+}
+
+type TaskRow = {
+  id: string;
+  title: string;
+  mode: TaskRecord["mode"];
+  status: TaskRecord["status"];
+  planned_minutes: number;
+  deadline_event_id: string | null;
+  outcome: TaskRecord["outcome"];
+  started_at: Date | string;
+  ended_at: Date | string | null;
+};
+
+function mapTask(row: TaskRow): TaskRecord {
+  return {
+    id: row.id,
+    title: row.title,
+    mode: row.mode,
+    status: row.status,
+    planned_minutes: row.planned_minutes,
+    deadline_event_id: row.deadline_event_id,
+    outcome: row.outcome,
+    started_at: new Date(row.started_at).toISOString(),
+    ended_at: row.ended_at ? new Date(row.ended_at).toISOString() : null,
+  };
+}
+
+function asStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function asInteraction(value: unknown): Interaction {
+  if (!value || typeof value !== "object") return { ...DEFAULT_INTERACTION };
+  return { ...DEFAULT_INTERACTION, ...(value as Partial<Interaction>) };
 }

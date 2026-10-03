@@ -1,8 +1,6 @@
 # Waypoint API
 
-Account server for the Waypoint desktop app. People sign in with Google or a one-time email code. The Google client secret stays here. The app receives a Waypoint access token and refresh token, then sends the access token on later requests.
-
-Calendar and Drive access still use the desktop OAuth client inside the Tauri app. This server does not replace that yet.
+Account server for the Waypoint desktop app. People sign in with Google or a one-time email code. The Google client secret and the Gemini key stay here. The app receives a Waypoint access token and uses it for memory, tasks, calendar writes, and the lock-in recap.
 
 ## Run
 
@@ -38,16 +36,17 @@ Create a **Web application** OAuth client. The desktop client already baked into
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/) and select the Waypoint project.
 2. **APIs & Services → OAuth consent screen**. App name `Waypoint`. Add the Google accounts that will sign in while the app is in testing.
-3. Scopes for this server: `openid`, `email`, `profile`.
+3. Scopes for sign-in: `openid`, `email`, `profile`. Add `https://www.googleapis.com/auth/calendar.events` for the calendar connect flow. Enable the Google Calendar API.
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
 5. Application type: **Web application**. Name: `Waypoint API`.
 6. Authorized redirect URI:
 
 ```text
 http://127.0.0.1:8787/v1/auth/google/callback
+http://127.0.0.1:8787/v1/google/calendar/callback
 ```
 
-That URI is `{PUBLIC_BASE_URL}/v1/auth/google/callback`. If you change `PUBLIC_BASE_URL`, add the new URI on the same client and restart the server.
+Those URIs are `{PUBLIC_BASE_URL}` plus `/v1/auth/google/callback` and `/v1/google/calendar/callback`. If you change `PUBLIC_BASE_URL`, add the new URIs on the same client and restart the server.
 
 7. Copy the client id and client secret into `.env`.
 
@@ -55,7 +54,7 @@ That URI is `{PUBLIC_BASE_URL}/v1/auth/google/callback`. If you change `PUBLIC_B
 
 Base URL: `http://127.0.0.1:8787`, or whatever host you deploy this process on. Call it from Rust (`reqwest` is already in the app), the same way `connect_google` opens the system browser today. The webview may also call it: `http://localhost`, `http://127.0.0.1`, and `tauri://localhost` are allowed CORS origins.
 
-Replace the placeholder `sign_in_waypoint` / `sign_out_waypoint` commands. Leave `connect_google` in place until Calendar and Drive move to the server.
+Replace the placeholder `sign_in_waypoint` / `sign_out_waypoint` commands. Calendar connect below replaces the desktop Google client secret for events Waypoint creates. The field-by-field contract is `specs.md`.
 
 Every error body looks like:
 
@@ -318,6 +317,69 @@ Save `access_token`, `refresh_token`, the expiry (`now + expires_in`), and `user
 
 For local development, leave `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `MAIL_FROM` blank. The server appends one JSON line per code to `data/outbox.jsonl` (gitignored via `data/`). That file is for local dev only. Read `code` from the last line, then call verify. Set all five SMTP variables to send the code by email instead.
 
-## What this server does not do yet
+## Memory, tasks, calendar, and session recap
 
-Memory, calendar deadlines and confirmed event writes, tasks, and session recap are specified in `specs.md`.
+Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the full contract. The client never writes Postgres. Gemini still runs in the app with the ephemeral token.
+
+### Memory
+
+`GET /v1/memory` returns the profile card. An empty card has empty arrays and interaction defaults (`advise`, `brief`, `sustained_only`, voice on, 10 minute check-in). `updated_at` is `null` until the first save.
+
+`PUT /v1/memory` replaces only the fields you send. Caps are 12 interests, 20 proficiencies, 8 goals, and 8 priorities (`400` `memory_too_large`). Topics match case-insensitively and keep the newest spelling.
+
+`POST /v1/memory/pace` appends one sample (`finished`, `partial`, or `abandoned`). Minutes are integers from 1 to 240. The card's median uses the last 8 finished samples for that topic.
+
+`POST /v1/memory/proficiency` with `{ "topic", "level" }` moves one step (`learning` → `comfortable` → `strong`, or back). A bigger jump is `409` `proficiency_step`. A direct `PUT` may jump.
+
+`GET /v1/memory/pace?topic=heaps` returns the newest samples, default 8.
+
+Load `GET /v1/memory` after sign-in and inject that card into Gemini. Call `PUT` from the profile screen and from a confirmed remember action.
+
+### Tasks
+
+`POST /v1/tasks` with `{ "title", "mode", "planned_minutes", "deadline_event_id"? }` creates an `active` task and marks any previous active task `dropped`. `mode` is `advise`, `pair`, or `ask`. `planned_minutes` is 1 to 240.
+
+`GET /v1/tasks/active` returns that task, or `404` `no_active_task`.
+
+`PATCH /v1/tasks/:id` changes `title`, `mode`, or `planned_minutes` without resetting `started_at`.
+
+`POST /v1/tasks/:id/complete` with `{ "outcome", "topic", "break_minutes"? }` sets `ended_at`, stores the outcome, and appends a pace sample. `finished` and `partial` become `done`. `abandoned` becomes `dropped`. `actual_minutes` is the rounded elapsed time minus `break_minutes` (default 0), clamped to 1–240.
+
+### Calendar
+
+Sign-in stays `openid email profile`. Calendar is a second consent.
+
+`POST /v1/google/calendar/start` returns the same `authorization_url`, `state`, `poll_token`, and `expires_in` shape as Google sign-in. Open the URL in the system browser. The redirect is `/v1/google/calendar/callback`.
+
+`GET /v1/google/calendar/poll?poll_token=` matches the login poll. `complete` is `{ "status": "complete", "calendar_connected": true }` and does not issue a new Waypoint token.
+
+`GET /v1/calendar/agenda?days=14` (`days` is 1–30) classifies primary-calendar events into `deadlines` and `blocks`. An event is a deadline when it is all-day or the title matches due, deadline, submit, exam, quiz, prelim, midterm, final, hw, pset, or assignment. `waypoint` is true when the event's private extended property `waypoint` is `1`. `409` `calendar_not_connected` until the consent flow finishes.
+
+`POST /v1/calendar/events` after the student confirms a proposal:
+
+```json
+{ "title": "Study: priority queues", "kind": "study_block", "start": "2026-10-03T19:00:00-04:00", "end": "2026-10-03T19:40:00-04:00" }
+```
+
+`kind` is `study_block` or `deadline`. A deadline is all-day on the `start` date (`end` is ignored). A study block must last 10 to 240 minutes. Title max 120 characters. The response is the agenda item plus `html_link`.
+
+`PATCH /v1/calendar/events/:id` and `DELETE /v1/calendar/events/:id` work only when `waypoint` is `1`. Otherwise `403` `not_waypoint_event`. Patch sends `start` and `end` for a study block, or `due` for a deadline.
+
+### Session recap
+
+`POST /v1/sessions` stores the lock-in recap the app speaks at the end:
+
+```json
+{
+  "task_id": "<id>",
+  "started_at": "2026-10-03T18:30:00Z",
+  "ended_at": "2026-10-03T19:00:00Z",
+  "break_minutes": 0,
+  "attention": "recovered",
+  "note": "Stuck on the priority queue, then finished push."
+}
+```
+
+`attention` is `steady`, `recovered`, or `dropped`. This log does not change the profile card. Task completion already wrote the pace sample.
+
+`GET /v1/sessions` returns `{ "sessions": [...] }` newest first.

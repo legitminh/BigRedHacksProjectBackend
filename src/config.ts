@@ -12,6 +12,7 @@ export type Config = {
   refreshTokenTtlSeconds: number;
   corsOrigins: string[];
   redirectUri: string;
+  calendarRedirectUri: string;
   smtpHost: string | null;
   smtpPort: number | null;
   smtpUser: string | null;
@@ -93,6 +94,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0),
     redirectUri: `${publicBaseUrl}/v1/auth/google/callback`,
+    calendarRedirectUri: `${publicBaseUrl}/v1/google/calendar/callback`,
     smtpHost: nonempty(env.SMTP_HOST),
     smtpPort: optionalPort(env.SMTP_PORT),
     smtpUser: nonempty(env.SMTP_USER),

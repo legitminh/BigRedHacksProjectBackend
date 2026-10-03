@@ -6,8 +6,11 @@ import { GoogleExchangeError, authorizationUrl, createGoogleClient, type GoogleC
 import { PendingLogins, type CompletedLogin } from "./auth/pending.ts";
 import { hashToken, newOpaqueToken, signAccessToken, verifyAccessToken } from "./auth/tokens.ts";
 import { emailCodeTtlSeconds, googleConfigured, pendingTtlSeconds, type Config } from "./config.ts";
+import { CalendarConnects } from "./calendar/connect.ts";
+import { createCalendarClient, type CalendarClient } from "./calendar/client.ts";
 import { mintEphemeralToken, type FetchLike } from "./gemini/ephemeral.ts";
 import { createMailer, type Mailer } from "./mailer.ts";
+import { handleProduct } from "./product/routes.ts";
 import {
   HttpError,
   applyCors,
@@ -27,6 +30,8 @@ export type AppDeps = {
   pending?: PendingLogins;
   google?: GoogleClient;
   mailer?: Mailer;
+  calendar?: CalendarClient;
+  calendarConnects?: CalendarConnects;
   now?: () => Date;
   fetch?: FetchLike;
 };
@@ -86,6 +91,8 @@ export function createApp(deps: AppDeps): Server {
   const mailer = deps.mailer ?? createMailer(deps.config);
   const nowFn = deps.now ?? (() => new Date());
   const fetchImpl = deps.fetch ?? fetch;
+  const calendar = deps.calendar ?? createCalendarClient(fetchImpl);
+  const calendarConnects = deps.calendarConnects ?? new CalendarConnects();
 
   return createServer((req, res) => {
     applyCors(req, res, deps.config);
@@ -93,7 +100,16 @@ export function createApp(deps: AppDeps): Server {
       sendEmpty(res, 204);
       return;
     }
-    void handle(req, res, { ...deps, pending, google, mailer, now: nowFn, fetch: fetchImpl }).catch(
+    void handle(req, res, {
+      ...deps,
+      pending,
+      google,
+      mailer,
+      calendar,
+      calendarConnects,
+      now: nowFn,
+      fetch: fetchImpl,
+    }).catch(
       (error: unknown) => {
         if (!res.headersSent) sendError(res, error);
       },
@@ -104,7 +120,12 @@ export function createApp(deps: AppDeps): Server {
 async function handle(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: Required<Pick<AppDeps, "config" | "store" | "pending" | "google" | "mailer" | "now" | "fetch">>,
+  deps: Required<
+    Pick<
+      AppDeps,
+      "config" | "store" | "pending" | "google" | "mailer" | "calendar" | "calendarConnects" | "now" | "fetch"
+    >
+  >,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const path = url.pathname;
@@ -150,6 +171,18 @@ async function handle(
   }
   if (method === "POST" && path === "/v1/session/ephemeral-token") {
     await issueEphemeralToken(req, res, deps);
+    return;
+  }
+  if (
+    await handleProduct(method, path, url, req, res, {
+      config: deps.config,
+      store: deps.store,
+      google: deps.google,
+      calendar: deps.calendar,
+      calendarConnects: deps.calendarConnects,
+      now: deps.now,
+    })
+  ) {
     return;
   }
 

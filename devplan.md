@@ -235,10 +235,12 @@ Documented in `README.md` with curl and a Rust sketch. The app changes are not p
 6. On `401`, `POST /v1/auth/refresh` once and retry.
 7. `POST /v1/auth/sign-out` with `all: true`, then delete the saved tokens.
 
-## Later slices (not this branch)
+## Later slices
 
-1. Email accounts and a mailer (verification or magic link), same Waypoint token format, so login stays under our control.
-2. `POST /v1/session/ephemeral-token` — short-lived Gemini credentials so the app stops embedding `GEMINI_API_KEY`.
-3. User preferences and history: read and write APIs the client calls instead of writing the database itself.
-4. Session event ingest and summaries on TigerData (time, breaks, attention).
-5. Calendar and Drive reads through the stored Google refresh token, so the desktop client secret can be removed.
+Product contract: `specs.md`. These are on `main`:
+
+1. Email code login and SMTP, with the same Waypoint token format as Google.
+2. `POST /v1/session/ephemeral-token` so the app does not embed `GEMINI_API_KEY`.
+3. Memory profile: `GET` / `PUT /v1/memory`, pace samples, and one-step proficiency.
+4. Tasks (`advise`, `pair`, `ask`) and `POST /v1/sessions` for the lock-in recap.
+5. Incremental Calendar consent, agenda classification, and create/update/delete only for events Waypoint created.
