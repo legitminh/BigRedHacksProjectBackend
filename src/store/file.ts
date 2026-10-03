@@ -12,7 +12,10 @@ import type {
   TaskRecord,
 } from "../product/model.ts";
 import type {
+  AdminBrowseResult,
+  AdminBrowseTable,
   AdminOverview,
+  AdminUserDetail,
   EmailLoginCode,
   GoogleProfile,
   PublicUser,
@@ -264,24 +267,159 @@ export function openFileStore(path: string): Store {
         const nowMs = Date.now();
         const users = [...data.users]
           .sort((a, b) => Date.parse(b.last_login_at) - Date.parse(a.last_login_at))
-          .slice(0, 50)
+          .slice(0, 100)
           .map((u) => ({
             id: u.id,
             email: u.email,
             name: u.name,
             created_at: u.created_at ?? null,
             last_login_at: u.last_login_at ?? null,
+            calendar_connected: u.calendar_connected === true,
           }));
         return {
           storage: "file",
           userCount: data.users.length,
           sessionCount: data.sessions.length,
           taskCount: data.tasks.length,
+          paceCount: data.paceSamples.length,
+          proficiencyCount: data.proficiencies.length,
+          profileCount: data.profiles.length,
+          emailCodeCount: data.emailCodes.length,
           activeRefreshTokens: data.refreshTokens.filter(
             (t) => !t.revokedAt && Date.parse(t.expiresAt) > nowMs,
           ).length,
           users,
         };
+      });
+    },
+    async adminUserDetail(userId): Promise<AdminUserDetail | null> {
+      return lock(async () => {
+        const data = await read();
+        const user = data.users.find((item) => item.id === userId);
+        if (!user) return null;
+        const nowMs = Date.now();
+        const tokens = data.refreshTokens.filter((t) => t.userId === userId);
+        const profile = data.profiles.find((item) => item.userId === userId);
+        return {
+          user: {
+            id: user.id,
+            email: user.email,
+            email_verified: user.email_verified,
+            name: user.name,
+            picture: user.picture,
+            google_sub: user.google_sub,
+            created_at: user.created_at ?? null,
+            last_login_at: user.last_login_at ?? null,
+            calendar_connected: user.calendar_connected === true,
+            has_google_refresh_token: Boolean(user.google_refresh_token),
+          },
+          profile: profile
+            ? {
+                interests: profile.interests,
+                long_term_goals: profile.long_term_goals,
+                priorities: profile.priorities,
+                interaction: profile.interaction,
+                updated_at: profile.updated_at,
+                study_memory: profile.study_memory ?? null,
+              }
+            : null,
+          proficiencies: data.proficiencies
+            .filter((item) => item.userId === userId)
+            .map(({ topic, level }) => ({ topic, level })),
+          pace: data.paceSamples
+            .filter((item) => item.userId === userId)
+            .map(({ userId: _u, ...rest }) => rest),
+          tasks: data.tasks
+            .filter((item) => item.userId === userId)
+            .map(({ userId: _u, ...rest }) => rest),
+          sessions: data.sessions
+            .filter((item) => item.userId === userId)
+            .map(({ userId: _u, ...rest }) => rest),
+          tokens: {
+            total: tokens.length,
+            active: tokens.filter((t) => !t.revokedAt && Date.parse(t.expiresAt) > nowMs).length,
+            revoked: tokens.filter((t) => Boolean(t.revokedAt)).length,
+          },
+        };
+      });
+    },
+    async adminBrowse(table: AdminBrowseTable, limit = 200): Promise<AdminBrowseResult> {
+      return lock(async () => {
+        const data = await read();
+        const cap = Math.min(500, Math.max(1, limit));
+        const nowMs = Date.now();
+        const pack = (rows: Record<string, unknown>[]): AdminBrowseResult => ({
+          table,
+          count: rows.length,
+          truncated: rows.length > cap,
+          rows: rows.slice(0, cap),
+        });
+        switch (table) {
+          case "users":
+            return pack(
+              data.users.map((u) => ({
+                id: u.id,
+                email: u.email,
+                name: u.name,
+                email_verified: u.email_verified,
+                google_sub: u.google_sub,
+                calendar_connected: u.calendar_connected === true,
+                has_google_refresh_token: Boolean(u.google_refresh_token),
+                created_at: u.created_at,
+                last_login_at: u.last_login_at,
+              })),
+            );
+          case "tasks":
+            return pack(data.tasks.map(({ userId, ...rest }) => ({ user_id: userId, ...rest })));
+          case "sessions":
+            return pack(data.sessions.map(({ userId, ...rest }) => ({ user_id: userId, ...rest })));
+          case "pace":
+            return pack(
+              data.paceSamples.map(({ userId, ...rest }) => ({ user_id: userId, ...rest })),
+            );
+          case "proficiencies":
+            return pack(
+              data.proficiencies.map(({ userId, ...rest }) => ({ user_id: userId, ...rest })),
+            );
+          case "profiles":
+            return pack(
+              data.profiles.map((p) => ({
+                user_id: p.userId,
+                interests: p.interests,
+                long_term_goals: p.long_term_goals,
+                priorities: p.priorities,
+                interaction: p.interaction,
+                has_study_memory: Boolean(p.study_memory),
+                study_memory: p.study_memory ?? null,
+                updated_at: p.updated_at,
+              })),
+            );
+          case "email_codes":
+            return pack(
+              data.emailCodes.map((c) => ({
+                id: c.id,
+                email: c.email,
+                expires_at: c.expiresAt,
+                consumed_at: c.consumedAt,
+                created_at: c.createdAt,
+                // never expose code_hash value in UI dump beyond presence
+                has_code_hash: Boolean(c.codeHash),
+              })),
+            );
+          case "refresh_tokens":
+            return pack(
+              data.refreshTokens.map((t) => ({
+                id: t.id,
+                user_id: t.userId,
+                expires_at: t.expiresAt,
+                revoked_at: t.revokedAt,
+                created_at: t.createdAt,
+                active: !t.revokedAt && Date.parse(t.expiresAt) > nowMs,
+              })),
+            );
+          default:
+            return { table, count: 0, truncated: false, rows: [] };
+        }
       });
     },
     async getUser(id) {

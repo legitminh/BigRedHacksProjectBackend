@@ -18,7 +18,10 @@ import {
   type TaskRecord,
 } from "../product/model.ts";
 import type {
+  AdminBrowseResult,
+  AdminBrowseTable,
   AdminOverview,
+  AdminUserDetail,
   EmailLoginCode,
   GoogleProfile,
   PublicUser,
@@ -364,13 +367,21 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           sessions: string;
           tasks: string;
           tokens: string;
+          pace: string;
+          proficiencies: string;
+          profiles: string;
+          email_codes: string;
         }>(
           `SELECT
              (SELECT COUNT(*)::text FROM users) AS users,
              (SELECT COUNT(*)::text FROM session_recaps) AS sessions,
              (SELECT COUNT(*)::text FROM tasks) AS tasks,
              (SELECT COUNT(*)::text FROM refresh_tokens
-               WHERE revoked_at IS NULL AND expires_at > NOW()) AS tokens`,
+               WHERE revoked_at IS NULL AND expires_at > NOW()) AS tokens,
+             (SELECT COUNT(*)::text FROM pace_samples) AS pace,
+             (SELECT COUNT(*)::text FROM proficiencies) AS proficiencies,
+             (SELECT COUNT(*)::text FROM user_profiles) AS profiles,
+             (SELECT COUNT(*)::text FROM email_login_codes) AS email_codes`,
         ),
         pool.query<{
           id: string;
@@ -378,11 +389,12 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           name: string | null;
           created_at: Date;
           last_login_at: Date;
+          calendar_connected: boolean;
         }>(
-          `SELECT id, email, name, created_at, last_login_at
+          `SELECT id, email, name, created_at, last_login_at, calendar_connected
            FROM users
            ORDER BY last_login_at DESC
-           LIMIT 50`,
+           LIMIT 100`,
         ),
       ]);
       const row = counts.rows[0];
@@ -391,6 +403,10 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         userCount: Number(row?.users ?? 0),
         sessionCount: Number(row?.sessions ?? 0),
         taskCount: Number(row?.tasks ?? 0),
+        paceCount: Number(row?.pace ?? 0),
+        proficiencyCount: Number(row?.proficiencies ?? 0),
+        profileCount: Number(row?.profiles ?? 0),
+        emailCodeCount: Number(row?.email_codes ?? 0),
         activeRefreshTokens: Number(row?.tokens ?? 0),
         users: users.rows.map((u) => ({
           id: u.id,
@@ -398,8 +414,247 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           name: u.name,
           created_at: new Date(u.created_at).toISOString(),
           last_login_at: new Date(u.last_login_at).toISOString(),
+          calendar_connected: u.calendar_connected,
         })),
       };
+    },
+    async adminUserDetail(userId): Promise<AdminUserDetail | null> {
+      const userResult = await pool.query<{
+        id: string;
+        email: string | null;
+        email_verified: boolean;
+        name: string | null;
+        picture: string | null;
+        google_sub: string | null;
+        created_at: Date;
+        last_login_at: Date;
+        calendar_connected: boolean;
+        has_refresh: boolean;
+      }>(
+        `SELECT id, email, email_verified, name, picture, google_sub,
+                created_at, last_login_at, calendar_connected,
+                (google_refresh_token IS NOT NULL) AS has_refresh
+         FROM users WHERE id = $1`,
+        [userId],
+      );
+      const u = userResult.rows[0];
+      if (!u) return null;
+      const [profile, proficiencies, pace, tasks, sessions, tokens] = await Promise.all([
+        this.getProfile(userId),
+        this.listProficiencies(userId),
+        this.listPaceSamples(userId, null),
+        pool.query(
+          `SELECT id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at
+           FROM tasks WHERE user_id = $1 ORDER BY started_at DESC LIMIT 200`,
+          [userId],
+        ),
+        this.listSessions(userId),
+        pool.query<{ total: string; active: string; revoked: string }>(
+          `SELECT
+             COUNT(*)::text AS total,
+             COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at > NOW())::text AS active,
+             COUNT(*) FILTER (WHERE revoked_at IS NOT NULL)::text AS revoked
+           FROM refresh_tokens WHERE user_id = $1`,
+          [userId],
+        ),
+      ]);
+      const tokenRow = tokens.rows[0];
+      return {
+        user: {
+          id: u.id,
+          email: u.email,
+          email_verified: u.email_verified,
+          name: u.name,
+          picture: u.picture,
+          google_sub: u.google_sub,
+          created_at: new Date(u.created_at).toISOString(),
+          last_login_at: new Date(u.last_login_at).toISOString(),
+          calendar_connected: u.calendar_connected,
+          has_google_refresh_token: u.has_refresh,
+        },
+        profile,
+        proficiencies,
+        pace,
+        tasks: tasks.rows.map((row) => ({
+          id: String(row.id),
+          title: String(row.title),
+          mode: row.mode as TaskRecord["mode"],
+          status: row.status as TaskRecord["status"],
+          planned_minutes: Number(row.planned_minutes),
+          deadline_event_id: (row.deadline_event_id as string | null) ?? null,
+          outcome: (row.outcome as TaskRecord["outcome"]) ?? null,
+          started_at: new Date(row.started_at as Date).toISOString(),
+          ended_at: row.ended_at ? new Date(row.ended_at as Date).toISOString() : null,
+        })),
+        sessions,
+        tokens: {
+          total: Number(tokenRow?.total ?? 0),
+          active: Number(tokenRow?.active ?? 0),
+          revoked: Number(tokenRow?.revoked ?? 0),
+        },
+      };
+    },
+    async adminBrowse(table: AdminBrowseTable, limit = 200): Promise<AdminBrowseResult> {
+      const cap = Math.min(500, Math.max(1, limit));
+      const pack = (count: number, rows: Record<string, unknown>[]): AdminBrowseResult => ({
+        table,
+        count,
+        truncated: count > rows.length,
+        rows,
+      });
+      switch (table) {
+        case "users": {
+          const result = await pool.query(
+            `SELECT id, email, name, email_verified, google_sub, calendar_connected,
+                    (google_refresh_token IS NOT NULL) AS has_google_refresh_token,
+                    created_at, last_login_at
+             FROM users ORDER BY last_login_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM users`);
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              ...r,
+              created_at: new Date(r.created_at as Date).toISOString(),
+              last_login_at: new Date(r.last_login_at as Date).toISOString(),
+            })),
+          );
+        }
+        case "tasks": {
+          const result = await pool.query(
+            `SELECT id, user_id, title, mode, status, planned_minutes, deadline_event_id,
+                    outcome, started_at, ended_at
+             FROM tasks ORDER BY started_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(`SELECT COUNT(*)::text AS n FROM tasks`);
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              ...r,
+              started_at: new Date(r.started_at as Date).toISOString(),
+              ended_at: r.ended_at ? new Date(r.ended_at as Date).toISOString() : null,
+            })),
+          );
+        }
+        case "sessions": {
+          const result = await pool.query(
+            `SELECT id, user_id, task_id, started_at, ended_at, break_minutes, attention, note
+             FROM session_recaps ORDER BY ended_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM session_recaps`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              ...r,
+              started_at: new Date(r.started_at as Date).toISOString(),
+              ended_at: new Date(r.ended_at as Date).toISOString(),
+            })),
+          );
+        }
+        case "pace": {
+          const result = await pool.query(
+            `SELECT id, user_id, topic, problem, planned_minutes, actual_minutes, outcome, task_id, recorded_at
+             FROM pace_samples ORDER BY recorded_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM pace_samples`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              ...r,
+              recorded_at: new Date(r.recorded_at as Date).toISOString(),
+            })),
+          );
+        }
+        case "proficiencies": {
+          const result = await pool.query(
+            `SELECT user_id, topic, level, updated_at FROM proficiencies
+             ORDER BY updated_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM proficiencies`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              ...r,
+              updated_at: new Date(r.updated_at as Date).toISOString(),
+            })),
+          );
+        }
+        case "profiles": {
+          const result = await pool.query(
+            `SELECT user_id, interests, long_term_goals, priorities, interaction,
+                    study_memory, (study_memory IS NOT NULL) AS has_study_memory, updated_at
+             FROM user_profiles ORDER BY updated_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM user_profiles`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              ...r,
+              updated_at: new Date(r.updated_at as Date).toISOString(),
+            })),
+          );
+        }
+        case "email_codes": {
+          const result = await pool.query(
+            `SELECT id, email, expires_at, consumed_at, created_at,
+                    (code_hash IS NOT NULL) AS has_code_hash
+             FROM email_login_codes ORDER BY created_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM email_login_codes`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              id: r.id,
+              email: r.email,
+              expires_at: new Date(r.expires_at as Date).toISOString(),
+              consumed_at: r.consumed_at ? new Date(r.consumed_at as Date).toISOString() : null,
+              created_at: new Date(r.created_at as Date).toISOString(),
+              has_code_hash: r.has_code_hash,
+            })),
+          );
+        }
+        case "refresh_tokens": {
+          const result = await pool.query(
+            `SELECT id, user_id, expires_at, revoked_at, created_at,
+                    (revoked_at IS NULL AND expires_at > NOW()) AS active
+             FROM refresh_tokens ORDER BY created_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM refresh_tokens`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              id: r.id,
+              user_id: r.user_id,
+              expires_at: new Date(r.expires_at as Date).toISOString(),
+              revoked_at: r.revoked_at ? new Date(r.revoked_at as Date).toISOString() : null,
+              created_at: new Date(r.created_at as Date).toISOString(),
+              active: r.active,
+            })),
+          );
+        }
+        default:
+          return { table, count: 0, truncated: false, rows: [] };
+      }
     },
     async getUser(id) {
       const result = await pool.query<UserRow>(

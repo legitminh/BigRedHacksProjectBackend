@@ -54,6 +54,7 @@ export type AdminUserRow = {
   name: string | null;
   created_at: string | null;
   last_login_at: string | null;
+  calendar_connected?: boolean;
 };
 
 export type AdminOverview = {
@@ -61,13 +62,57 @@ export type AdminOverview = {
   userCount: number;
   sessionCount: number;
   taskCount: number;
+  paceCount: number;
+  proficiencyCount: number;
+  profileCount: number;
+  emailCodeCount: number;
   activeRefreshTokens: number;
   users: AdminUserRow[];
+};
+
+export type AdminUserDetail = {
+  user: {
+    id: string;
+    email: string | null;
+    email_verified: boolean;
+    name: string | null;
+    picture: string | null;
+    google_sub: string | null;
+    created_at: string | null;
+    last_login_at: string | null;
+    calendar_connected: boolean;
+    has_google_refresh_token: boolean;
+  };
+  profile: import("../product/model.ts").StoredProfile | null;
+  proficiencies: import("../product/model.ts").Proficiency[];
+  pace: import("../product/model.ts").PaceSample[];
+  tasks: import("../product/model.ts").TaskRecord[];
+  sessions: import("../product/model.ts").SessionRecap[];
+  tokens: { active: number; total: number; revoked: number };
+};
+
+export type AdminBrowseTable =
+  | "users"
+  | "tasks"
+  | "sessions"
+  | "pace"
+  | "proficiencies"
+  | "profiles"
+  | "email_codes"
+  | "refresh_tokens";
+
+export type AdminBrowseResult = {
+  table: AdminBrowseTable;
+  count: number;
+  truncated: boolean;
+  rows: Record<string, unknown>[];
 };
 
 export type Store = {
   kind: "file" | "postgres";
   adminOverview(): Promise<AdminOverview>;
+  adminUserDetail(userId: string): Promise<AdminUserDetail | null>;
+  adminBrowse(table: AdminBrowseTable, limit?: number): Promise<AdminBrowseResult>;
   upsertGoogleUser(profile: GoogleProfile, now: Date): Promise<PublicUser>;
   findOrCreateUserByEmail(email: string, now: Date): Promise<PublicUser>;
   replaceEmailLoginCode(code: EmailLoginCode): Promise<void>;

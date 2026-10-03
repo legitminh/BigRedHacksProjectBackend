@@ -90,7 +90,8 @@ test("correct password sets cookie and opens dashboard", async () => {
     const html = await dash.text();
     assert.match(html, /Waypoint admin/);
     assert.match(html, /Integrations/);
-    assert.match(html, /Recent users/);
+    assert.match(html, /Users/);
+    assert.match(html, /Pace samples/);
   });
 });
 
@@ -98,5 +99,42 @@ test("admin API requires cookie", async () => {
   await withApp(async (base) => {
     const res = await fetch(`${base}/admin/api/overview`);
     assert.equal(res.status, 401);
+  });
+});
+
+test("admin data browse and user detail work after login", async () => {
+  await withApp(async (base) => {
+    const login = await fetch(`${base}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `password=${encodeURIComponent(ADMIN_PASSWORD)}`,
+      redirect: "manual",
+    });
+    const setCookie = login.headers.getSetCookie?.() ?? [];
+    const cookieHeader =
+      setCookie.find((c) => c.startsWith("wp_admin=")) ??
+      login.headers.get("set-cookie") ??
+      "";
+    const cookie = cookieHeader.split(";")[0];
+
+    const usersPage = await fetch(`${base}/admin/data/users`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(usersPage.status, 200);
+    assert.match(await usersPage.text(), /Users/);
+
+    const api = await fetch(`${base}/admin/api/data/tasks`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(api.status, 200);
+    const body = (await api.json()) as { table: string; rows: unknown[] };
+    assert.equal(body.table, "tasks");
+    assert.ok(Array.isArray(body.rows));
+
+    const missing = await fetch(
+      `${base}/admin/users/00000000-0000-4000-8000-000000000000`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(missing.status, 404);
   });
 });
