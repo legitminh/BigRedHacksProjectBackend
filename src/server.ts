@@ -16,6 +16,8 @@ import {
   sendHtml,
   sendJson,
 } from "./http.ts";
+import { parseCreateSession, parseSessionEvent } from "./sessions/validate.ts";
+import { summarizeSession } from "./sessions/summary.ts";
 import type { PublicUser, Store, StoredRefreshToken } from "./store/types.ts";
 
 export type AppDeps = {
@@ -129,6 +131,39 @@ async function handle(
   if (method === "GET" && path === "/v1/me") {
     const user = await requireUser(deps, req, deps.now());
     sendJson(res, 200, user);
+    return;
+  }
+
+  if (path === "/v1/sessions") {
+    if (method === "POST") {
+      await createStudySession(req, res, deps);
+      return;
+    }
+    if (method === "GET") {
+      await listStudySessions(req, res, deps);
+      return;
+    }
+    throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+  }
+
+  const sessionEventsMatch = /^\/v1\/sessions\/([^/]+)\/events$/.exec(path);
+  if (sessionEventsMatch?.[1]) {
+    if (method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+    await appendStudySessionEvent(req, res, deps, decodeURIComponent(sessionEventsMatch[1]));
+    return;
+  }
+
+  const sessionSummaryMatch = /^\/v1\/sessions\/([^/]+)\/summary$/.exec(path);
+  if (sessionSummaryMatch?.[1]) {
+    if (method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+    await studySessionSummary(req, res, deps, decodeURIComponent(sessionSummaryMatch[1]));
+    return;
+  }
+
+  const sessionMatch = /^\/v1\/sessions\/([^/]+)$/.exec(path);
+  if (sessionMatch?.[1]) {
+    if (method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+    await getStudySession(req, res, deps, decodeURIComponent(sessionMatch[1]));
     return;
   }
 
@@ -342,4 +377,113 @@ async function signOut(
   const revoked = await deps.store.revokeRefreshToken(hashToken(refreshToken), user.id, now);
   if (!revoked) throw new HttpError(401, "invalid_refresh", "Refresh token is invalid.");
   sendEmpty(res, 204);
+}
+
+type SessionDeps = Required<Pick<AppDeps, "config" | "store" | "now">>;
+
+async function createStudySession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: SessionDeps,
+): Promise<void> {
+  const now = deps.now();
+  const user = await requireUser(deps, req, now);
+  const parsed = parseCreateSession(await readJson(req));
+  if (!parsed.ok) throw new HttpError(400, "invalid_session", parsed.message);
+  const session = await deps.store.createStudySession({
+    userId: user.id,
+    goals: parsed.value.goals,
+    durationSecs: parsed.value.durationSecs,
+    modality: parsed.value.modality,
+    startedAt: now.toISOString(),
+  });
+  sendJson(res, 201, {
+    id: session.id,
+    goals: session.goals,
+    duration_secs: session.duration_secs,
+    modality: session.modality,
+    started_at: session.started_at,
+  });
+}
+
+async function appendStudySessionEvent(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: SessionDeps,
+  sessionId: string,
+): Promise<void> {
+  const now = deps.now();
+  const user = await requireUser(deps, req, now);
+  const parsed = parseSessionEvent(await readJson(req), now);
+  if (!parsed.ok) throw new HttpError(400, "invalid_event", parsed.message);
+  const event = await deps.store.appendSessionEvent({
+    sessionId,
+    userId: user.id,
+    type: parsed.value.type,
+    at: parsed.value.at,
+    payload: parsed.value.payload,
+  });
+  if (!event) throw new HttpError(404, "session_not_found", "Session not found.");
+  sendJson(res, 201, { id: event.id, type: event.type, at: event.at });
+}
+
+async function getStudySession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: SessionDeps,
+  sessionId: string,
+): Promise<void> {
+  const user = await requireUser(deps, req, deps.now());
+  const session = await deps.store.getStudySession(sessionId, user.id);
+  if (!session) throw new HttpError(404, "session_not_found", "Session not found.");
+  const events = await deps.store.listSessionEvents(session.id, user.id);
+  sendJson(res, 200, {
+    id: session.id,
+    goals: session.goals,
+    duration_secs: session.duration_secs,
+    modality: session.modality,
+    started_at: session.started_at,
+    ended_at: session.ended_at,
+    events: events.map((event) => ({
+      id: event.id,
+      type: event.type,
+      at: event.at,
+      payload: event.payload,
+    })),
+  });
+}
+
+async function studySessionSummary(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: SessionDeps,
+  sessionId: string,
+): Promise<void> {
+  const now = deps.now();
+  const user = await requireUser(deps, req, now);
+  const session = await deps.store.getStudySession(sessionId, user.id);
+  if (!session) throw new HttpError(404, "session_not_found", "Session not found.");
+  const events = await deps.store.listSessionEvents(session.id, user.id);
+  sendJson(res, 200, summarizeSession(session, events, now));
+}
+
+async function listStudySessions(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: SessionDeps,
+): Promise<void> {
+  const now = deps.now();
+  const user = await requireUser(deps, req, now);
+  const sessions = await deps.store.listStudySessions(user.id);
+  const ordered = [...sessions].sort((a, b) => b.started_at.localeCompare(a.started_at));
+  const summaries = [];
+  for (const session of ordered) {
+    const events = await deps.store.listSessionEvents(session.id, user.id);
+    summaries.push({
+      id: session.id,
+      started_at: session.started_at,
+      ...summarizeSession(session, events, now),
+    });
+  }
+  sendJson(res, 200, { sessions: summaries });
 }

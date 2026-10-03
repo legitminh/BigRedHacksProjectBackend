@@ -19,3 +19,22 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   replaced_by UUID,
   created_at TIMESTAMPTZ NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS study_sessions (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users (id),
+  goals TEXT NOT NULL,
+  duration_secs DOUBLE PRECISION NOT NULL,
+  modality TEXT NOT NULL,
+  started_at TIMESTAMPTZ NOT NULL,
+  ended_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS session_events (
+  id UUID PRIMARY KEY,
+  session_id UUID NOT NULL REFERENCES study_sessions (id),
+  user_id UUID NOT NULL REFERENCES users (id),
+  type TEXT NOT NULL,
+  at TIMESTAMPTZ NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);

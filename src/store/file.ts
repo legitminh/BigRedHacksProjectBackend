@@ -4,10 +4,14 @@ import { randomUUID } from "node:crypto";
 
 import type {
   GoogleProfile,
+  NewSessionEvent,
+  NewStudySession,
   PublicUser,
   RotateResult,
+  SessionEventRecord,
   Store,
   StoredRefreshToken,
+  StudySessionRecord,
 } from "./types.ts";
 
 type UserRecord = PublicUser & {
@@ -20,10 +24,12 @@ type UserRecord = PublicUser & {
 type FileData = {
   users: UserRecord[];
   refreshTokens: StoredRefreshToken[];
+  studySessions: StudySessionRecord[];
+  sessionEvents: SessionEventRecord[];
 };
 
 function empty(): FileData {
-  return { users: [], refreshTokens: [] };
+  return { users: [], refreshTokens: [], studySessions: [], sessionEvents: [] };
 }
 
 function toPublic(user: UserRecord): PublicUser {
@@ -55,6 +61,8 @@ export function openFileStore(path: string): Store {
       return {
         users: parsed.users ?? [],
         refreshTokens: parsed.refreshTokens ?? [],
+        studySessions: parsed.studySessions ?? [],
+        sessionEvents: parsed.sessionEvents ?? [],
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
@@ -163,6 +171,69 @@ export function openFileStore(path: string): Store {
         const data = await read();
         const user = data.users.find((item) => item.id === id);
         return user ? toPublic(user) : null;
+      });
+    },
+    async createStudySession(input: NewStudySession) {
+      return lock(async () => {
+        const data = await read();
+        const session: StudySessionRecord = {
+          id: randomUUID(),
+          user_id: input.userId,
+          goals: input.goals,
+          duration_secs: input.durationSecs,
+          modality: input.modality,
+          started_at: input.startedAt,
+          ended_at: null,
+        };
+        data.studySessions.push(session);
+        await write(data);
+        return session;
+      });
+    },
+    async getStudySession(sessionId, userId) {
+      return lock(async () => {
+        const data = await read();
+        return (
+          data.studySessions.find((session) => session.id === sessionId && session.user_id === userId) ??
+          null
+        );
+      });
+    },
+    async listStudySessions(userId) {
+      return lock(async () => {
+        const data = await read();
+        return data.studySessions.filter((session) => session.user_id === userId);
+      });
+    },
+    async listSessionEvents(sessionId, userId) {
+      return lock(async () => {
+        const data = await read();
+        return data.sessionEvents
+          .filter((event) => event.session_id === sessionId && event.user_id === userId)
+          .sort((a, b) => a.at.localeCompare(b.at));
+      });
+    },
+    async appendSessionEvent(input: NewSessionEvent) {
+      return lock(async () => {
+        const data = await read();
+        const session = data.studySessions.find(
+          (item) => item.id === input.sessionId && item.user_id === input.userId,
+        );
+        if (!session) return null;
+        const event: SessionEventRecord = {
+          id: randomUUID(),
+          session_id: input.sessionId,
+          user_id: input.userId,
+          type: input.type,
+          at: input.at,
+          payload: input.payload,
+        };
+        data.sessionEvents.push(event);
+        if (input.type === "session_ended" && (!session.ended_at || input.at < session.ended_at)) {
+          session.ended_at = input.at;
+        }
+        await write(data);
+        return event;
       });
     },
     async close() {},

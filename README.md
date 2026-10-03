@@ -30,7 +30,7 @@ The process listens on `http://127.0.0.1:8787`. `GET /health` returns:
 { "ok": true, "service": "waypoint-api", "storage": "file" }
 ```
 
-`storage` is `postgres` when `DATABASE_URL` is set. `npm test` covers the login flow with Google mocked.
+`storage` is `postgres` when `DATABASE_URL` is set. `npm test` covers the login flow and study-session summaries with Google mocked.
 
 ## Google Cloud client
 
@@ -171,6 +171,105 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 
 The access token itself keeps working until it expires. Drop it locally on sign-out anyway.
 
+### 6. Study sessions
+
+After lock-in starts, create a session. During the session, append events for focus samples, breaks, speech, and distractions. This server stores the log and computes the official summary. The client displays that summary; it does not calculate time spent, break time, or attention itself.
+
+Every session route needs `Authorization: Bearer ACCESS_TOKEN`. You only see your own sessions. An unknown id, including another user's session, is `404` `session_not_found`.
+
+Events are kept in `data/store.json` when `DATABASE_URL` is empty. When it is set, they are rows in Postgres (`study_sessions` and `session_events`). Each event's `at` is a `timestamptz`, so the table is an append-only history.
+
+Start the session:
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/sessions \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"goals":"Finish the problem set","duration_secs":1500,"modality":"pomodoro"}'
+```
+
+`201`:
+
+```json
+{
+  "id": "3f1c0b2a-7e4d-4c9a-8b11-2d6e5f708192",
+  "goals": "Finish the problem set",
+  "duration_secs": 1500,
+  "modality": "pomodoro",
+  "started_at": "2026-10-03T18:30:00.000Z"
+}
+```
+
+`400` `invalid_session` means `goals` is empty or `duration_secs` is missing or not a positive number.
+
+While the session is running, `POST /v1/sessions/SESSION_ID/events`. `type` is one of `focus_sample`, `break_started`, `break_ended`, `coach_spoke`, `user_spoke`, `distraction`, or `session_ended`. `at` is an optional ISO timestamp and defaults to the server clock. `payload` is an optional object. A `focus_sample` must include `payload.focus` as a number from 0 to 1.
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/sessions/SESSION_ID/events \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"focus_sample","payload":{"focus":0.8}}'
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/sessions/SESSION_ID/events \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"break_started"}'
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/sessions/SESSION_ID/events \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"break_ended"}'
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/sessions/SESSION_ID/events \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"distraction","payload":{"source":"phone"}}'
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/sessions/SESSION_ID/events \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"session_ended"}'
+```
+
+`201` is `{ "id", "type", "at" }`. `400` `invalid_event` means the type is unknown, `focus` is outside 0 to 1, or `at` is not a timestamp.
+
+`GET /v1/sessions/SESSION_ID` returns the session plus `events`, oldest first.
+
+At the end, after `session_ended`, read the summary and show time spent, break time, and attention:
+
+```bash
+curl -s http://127.0.0.1:8787/v1/sessions/SESSION_ID/summary \
+  -H "Authorization: Bearer ACCESS_TOKEN"
+```
+
+```json
+{
+  "session_id": "3f1c0b2a-7e4d-4c9a-8b11-2d6e5f708192",
+  "goals": "Finish the problem set",
+  "time_spent_secs": 540,
+  "break_secs": 60,
+  "attention_level": 0.6,
+  "event_count": 5
+}
+```
+
+`break_secs` sums each `break_started` with the next `break_ended`. A break that is still open runs until `session_ended`, or until now if the session has not ended. `time_spent_secs` is the seconds from `started_at` to that same end, minus `break_secs`. `attention_level` is the average of `focus_sample` values, or `null` when there are no samples.
+
+`GET /v1/sessions` lists this user's summaries, newest first, each with `id` and `started_at` as well:
+
+```bash
+curl -s http://127.0.0.1:8787/v1/sessions \
+  -H "Authorization: Bearer ACCESS_TOKEN"
+```
+
 ## Rust sketch
 
 This is the shape of a Tauri command that replaces `sign_in_waypoint`. It is not wired into the app in this branch.
@@ -245,4 +344,4 @@ Persist `access_token` and `refresh_token` from the `complete` poll the same way
 
 ## What this server does not do yet
 
-Email login, mail delivery, Gemini ephemeral tokens, preference and history APIs, and session summaries are later slices. See `devplan.md`.
+Email login, mail delivery, Gemini ephemeral tokens, and preference and history APIs are later slices. See `devplan.md`.
