@@ -569,23 +569,23 @@ export function openFileStore(path: string): Store {
           .sort((a, b) => Date.parse(b.ended_at) - Date.parse(a.ended_at));
       });
     },
-    async clearUserData(userId, now) {
+    async clearUserData(userId, _now) {
       await lock(async () => {
         const data = await read();
+        const user = data.users.find((item) => item.id === userId);
+        const email = user?.email ? user.email.trim().toLowerCase() : null;
         data.profiles = data.profiles.filter((item) => item.userId !== userId);
         data.proficiencies = data.proficiencies.filter((item) => item.userId !== userId);
         data.paceSamples = data.paceSamples.filter((item) => item.userId !== userId);
         data.tasks = data.tasks.filter((item) => item.userId !== userId);
         data.sessions = data.sessions.filter((item) => item.userId !== userId);
-        const user = data.users.find((item) => item.id === userId);
-        if (user) {
-          user.google_refresh_token = null;
-          user.calendar_connected = false;
+        data.refreshTokens = data.refreshTokens.filter((item) => item.userId !== userId);
+        if (email) {
+          data.emailCodes = data.emailCodes.filter(
+            (item) => item.email.trim().toLowerCase() !== email,
+          );
         }
-        const revokedAt = now.toISOString();
-        for (const token of data.refreshTokens) {
-          if (token.userId === userId && !token.revokedAt) token.revokedAt = revokedAt;
-        }
+        data.users = data.users.filter((item) => item.id !== userId);
         await write(data);
       });
     },

@@ -485,6 +485,14 @@ function userDetailPage(detail: AdminUserDetail): string {
         <a class="btn ghost" href="/admin/api/users/${escapeHtml(u.id)}">JSON API</a>
       </div>
     </div>
+
+    <div class="panel">
+      <h2>Danger zone</h2>
+      <p class="sub">Permanently deletes this user row and all synced data (same as the app’s Delete everything forever).</p>
+      <form method="post" action="/admin/users/${escapeHtml(u.id)}/delete" onsubmit="return confirm('Delete this user forever from the server?');">
+        <button class="btn" type="submit" style="background:#8b1e1e;border-color:#8b1e1e">Delete user forever</button>
+      </form>
+    </div>
     `,
   );
 }
@@ -575,6 +583,21 @@ export async function handleAdmin(
     const detail = await deps.store.adminUserDetail(id);
     if (!detail) throw new HttpError(404, "user_not_found", "No user with that id.");
     sendHtml(res, 200, userDetailPage(detail));
+    return true;
+  }
+
+  const userDeleteMatch = path.match(/^\/admin\/users\/([^/]+)\/delete$/);
+  if (method === "POST" && userDeleteMatch) {
+    requireAdmin(req, deps.config);
+    const id = decodeURIComponent(userDeleteMatch[1] ?? "");
+    if (!UUID_RE.test(id)) {
+      throw new HttpError(400, "invalid_user_id", "User id must be a UUID.");
+    }
+    const detail = await deps.store.adminUserDetail(id);
+    if (!detail) throw new HttpError(404, "user_not_found", "No user with that id.");
+    await deps.store.clearUserData(id, new Date());
+    res.writeHead(303, { Location: "/admin", "Cache-Control": "no-store" });
+    res.end();
     return true;
   }
 

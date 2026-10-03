@@ -221,6 +221,53 @@ test("tasks replace the active one and completion records pace", async () => {
   });
 });
 
+test("DELETE /v1/me/data removes the user account entirely", async () => {
+  await withApp(async (base, inbox) => {
+    const token = await tokenFor(base, inbox);
+    const auth = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+    const mem = await fetch(`${base}/v1/study-memory`, {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({
+        narrative: "focus notes",
+        stats: { total_sessions: 1 },
+        updated_at: "2026-10-03T18:00:00.000Z",
+      }),
+    });
+    assert.equal(mem.status, 200);
+
+    const wiped = await fetch(`${base}/v1/me/data`, { method: "DELETE", headers: auth });
+    assert.equal(wiped.status, 204);
+
+    const me = await fetch(`${base}/v1/me`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(me.status, 401);
+
+    // Fresh sign-in must create a new empty account (old row gone).
+    const inbox2: { code: string }[] = inbox;
+    const start = await fetch(`${base}/v1/auth/email/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "student@cornell.edu" }),
+    });
+    assert.equal(start.status, 200);
+    const code = inbox2.at(-1)?.code;
+    assert.ok(code);
+    const verify = await fetch(`${base}/v1/auth/email/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "student@cornell.edu", code }),
+    });
+    assert.equal(verify.status, 200);
+    const next = (await verify.json()) as { access_token: string; user: { id: string } };
+    const emptyMem = await fetch(`${base}/v1/study-memory`, {
+      headers: { Authorization: `Bearer ${next.access_token}` },
+    });
+    assert.equal(emptyMem.status, 200);
+    const body = (await emptyMem.json()) as { study_memory: unknown };
+    assert.equal(body.study_memory, null);
+  });
+});
+
 test("session recap is stored for the signed-in user", async () => {
   await withApp(async (base, inbox) => {
     const token = await tokenFor(base, inbox);

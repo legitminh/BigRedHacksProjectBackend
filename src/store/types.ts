@@ -141,7 +141,7 @@ export type Store = {
   saveTask(userId: string, task: TaskRecord): Promise<void>;
   insertSession(userId: string, session: SessionRecap): Promise<SessionRecap>;
   listSessions(userId: string): Promise<SessionRecap[]>;
-  /** Wipe synced product data for a user (memory, sessions, tasks, Google grant). */
+  /** Permanently delete the user account and all synced data (admin row gone). */
   clearUserData(userId: string, now: Date): Promise<void>;
   close(): Promise<void>;
 };

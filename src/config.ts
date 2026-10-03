@@ -3,6 +3,8 @@ import { resolve } from "node:path";
 
 export type Config = {
   port: number;
+  /** Interface to bind. Use 127.0.0.1 for local-only; 0.0.0.0 behind a reverse proxy on the website host. */
+  bindHost: string;
   publicBaseUrl: string;
   googleClientId: string | null;
   googleClientSecret: string | null;
@@ -93,8 +95,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     "",
   );
   const sessionSecret = nonempty(env.SESSION_SECRET);
+  const bindHost = nonempty(env.BIND_HOST) ?? "127.0.0.1";
   return {
     port,
+    bindHost,
     publicBaseUrl,
     googleClientId: nonempty(env.GOOGLE_CLIENT_ID),
     googleClientSecret: nonempty(env.GOOGLE_CLIENT_SECRET),

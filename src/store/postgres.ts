@@ -905,23 +905,25 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         note: row.note,
       }));
     },
-    async clearUserData(userId, now) {
+    async clearUserData(userId, _now) {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
+        const emailRow = await client.query<{ email: string | null }>(
+          `SELECT email FROM users WHERE id = $1`,
+          [userId],
+        );
+        const email = emailRow.rows[0]?.email?.trim().toLowerCase() ?? null;
         await client.query(`DELETE FROM session_recaps WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM tasks WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM pace_samples WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM proficiencies WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM user_profiles WHERE user_id = $1`, [userId]);
-        await client.query(
-          `UPDATE users SET google_refresh_token = NULL, calendar_connected = FALSE WHERE id = $1`,
-          [userId],
-        );
-        await client.query(
-          `UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, $2) WHERE user_id = $1`,
-          [userId, now.toISOString()],
-        );
+        await client.query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [userId]);
+        if (email) {
+          await client.query(`DELETE FROM email_login_codes WHERE lower(email) = $1`, [email]);
+        }
+        await client.query(`DELETE FROM users WHERE id = $1`, [userId]);
         await client.query("COMMIT");
       } catch (error) {
         await client.query("ROLLBACK");

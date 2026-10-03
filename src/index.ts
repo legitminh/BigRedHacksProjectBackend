@@ -7,6 +7,8 @@ const config = loadConfig();
 const store = await openStore(config);
 const server = createApp({ config, store });
 
-server.listen(config.port, "127.0.0.1", () => {
-  console.log(`Waypoint API listening on ${config.publicBaseUrl} (${store.kind} storage)`);
+server.listen(config.port, config.bindHost, () => {
+  console.log(
+    `Waypoint API listening on ${config.bindHost}:${config.port} → ${config.publicBaseUrl} (${store.kind} storage)`,
+  );
 });
