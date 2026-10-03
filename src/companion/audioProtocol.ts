@@ -83,8 +83,9 @@ export class DownlinkAudioBatcher {
     this.flush = flush;
   }
 
+  /** Drop pending audio and advance epoch — used on barge/interrupt (never flush stale PCM). */
   setEpoch(epoch: number) {
-    this.forceFlush();
+    this.reset();
     this.epoch = epoch;
     this.seq = 0;
   }
