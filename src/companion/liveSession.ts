@@ -14,21 +14,34 @@ import {
   errorMessage,
   liveWsUrl,
   sampleRateFromMime,
+  screencapToolResponse,
+  SCREENCAP_TOOL,
   setupMessage,
   signalsFromMessage,
   textTurnMessage,
+  toolCallsFromMessage,
   type LiveSignal,
+  type ToolCall,
 } from "./geminiLive.ts";
 
 const MAX_PCM_BYTES = 64 * 1024;
+const MAX_JPEG_B64_CHARS = 3_500_000;
 const SETUP_TIMEOUT_MS = 20_000;
+const SCREENCAP_CLIENT_TIMEOUT_MS = 12_000;
 
 type Inbound =
   | { type: "start"; context?: Record<string, unknown> | null }
   | { type: "audio"; pcm: string }
   | { type: "text"; text: string }
   | { type: "barge" }
-  | { type: "stop" };
+  | { type: "stop" }
+  | {
+      type: "screencap";
+      id: string;
+      jpeg_base64?: string;
+      ok?: boolean;
+      error?: string;
+    };
 
 type Outbound =
   | { type: "status"; phase: string }
@@ -38,6 +51,7 @@ type Outbound =
   | { type: "audio"; pcm: string; sample_rate: number; epoch: number }
   | { type: "audio_end"; epoch: number }
   | { type: "clear_audio"; epoch: number }
+  | { type: "screencap_request"; id: string; name: string }
   | { type: "error"; message: string };
 
 class TurnBridge {
@@ -211,6 +225,20 @@ function parseInbound(raw: string): Inbound | null {
     }
     if (type === "barge") return { type: "barge" };
     if (type === "stop") return { type: "stop" };
+    if (type === "screencap" && typeof value.id === "string") {
+      return {
+        type: "screencap",
+        id: value.id,
+        jpeg_base64:
+          typeof value.jpeg_base64 === "string"
+            ? value.jpeg_base64
+            : typeof value.jpegBase64 === "string"
+              ? value.jpegBase64
+              : undefined,
+        ok: typeof value.ok === "boolean" ? value.ok : undefined,
+        error: typeof value.error === "string" ? value.error : undefined,
+      };
+    }
     return null;
   } catch {
     return null;
@@ -278,12 +306,53 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   let epoch = 1;
   let geminiGenerating = false;
   let announcedReply = false;
+  let lastScreencapAt = 0;
+  const pendingScreencaps = new Map<
+    string,
+    { call: ToolCall; timer: ReturnType<typeof setTimeout> }
+  >();
   const bridge = new TurnBridge();
   const model = config.geminiLiveModel;
+
+  const clearPendingScreencaps = () => {
+    for (const pending of pendingScreencaps.values()) clearTimeout(pending.timer);
+    pendingScreencaps.clear();
+  };
+
+  const fulfillScreencap = (call: ToolCall, jpegBase64: string | null, error?: string) => {
+    if (!gemini || gemini.readyState !== WebSocket.OPEN) return;
+    const ok = Boolean(jpegBase64) && !error;
+    for (const message of screencapToolResponse(call, jpegBase64 ?? "", ok, error)) {
+      gemini.send(JSON.stringify(message));
+    }
+    send(client, { type: "status", phase: "thinking" });
+  };
+
+  const requestScreencap = (call: ToolCall) => {
+    if (call.name !== SCREENCAP_TOOL) {
+      fulfillScreencap(call, null, `Unknown tool: ${call.name}`);
+      return;
+    }
+    const now = Date.now();
+    if (now - lastScreencapAt < 4_000) {
+      fulfillScreencap(call, null, "Screenshot rate-limited; ask again in a few seconds.");
+      return;
+    }
+    if (pendingScreencaps.has(call.id)) return;
+    lastScreencapAt = now;
+    send(client, { type: "status", phase: "thinking" });
+    send(client, { type: "screencap_request", id: call.id, name: call.name });
+    const timer = setTimeout(() => {
+      pendingScreencaps.delete(call.id);
+      fulfillScreencap(call, null, "Timed out waiting for desktop screenshot.");
+    }, SCREENCAP_CLIENT_TIMEOUT_MS);
+    pendingScreencaps.set(call.id, { call, timer });
+  };
 
   const cleanup = () => {
     if (closed) return;
     closed = true;
+    clearPendingScreencaps();
     if (gemini && gemini.readyState === WebSocket.OPEN) {
       try {
         gemini.send(JSON.stringify(audioStreamEndMessage()));
@@ -346,6 +415,10 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
       cleanup();
       client.close();
       return;
+    }
+
+    for (const call of toolCallsFromMessage(payload)) {
+      requestScreencap(call);
     }
 
     const signals = signalsFromMessage(payload);
@@ -438,6 +511,27 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
         // Gemini activityHandling already interrupts on speech; clear local playback.
       }
       send(client, { type: "status", phase: "listening" });
+      return;
+    }
+    if (inbound.type === "screencap") {
+      const pending = pendingScreencaps.get(inbound.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingScreencaps.delete(inbound.id);
+      const jpeg = inbound.jpeg_base64?.trim() ?? "";
+      if (inbound.ok === false || !jpeg) {
+        fulfillScreencap(
+          pending.call,
+          null,
+          inbound.error?.slice(0, 240) || "Desktop could not capture the screen.",
+        );
+        return;
+      }
+      if (jpeg.length > MAX_JPEG_B64_CHARS) {
+        fulfillScreencap(pending.call, null, "Screenshot too large.");
+        return;
+      }
+      fulfillScreencap(pending.call, jpeg);
     }
   });
 }

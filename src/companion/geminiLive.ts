@@ -5,13 +5,17 @@
 
 export const INPUT_MIME = "audio/pcm;rate=16000";
 export const OUTPUT_SAMPLE_RATE = 24_000;
+export const SCREENCAP_TOOL = "request_screencap";
 
 export const DEFAULT_LIVE_SYSTEM = `\
 You are Waypoint Companion — a live study conversation partner during a lock-in. \
 The student is talking to you in real time. Reply in short, natural spoken sentences. \
 Do not use markdown, lists, code, emoji, or stage directions. \
 Keep most replies to one or two sentences unless they ask for more detail. \
-Stay focused on their current study material and timer context.`;
+Stay focused on their current study material and timer context. \
+When you need to see what is on their screen to help (code, problem set, webpage, error), \
+call the request_screencap tool, wait for the screenshot, then answer from what you see. \
+Do not call request_screencap on every turn — only when the screen would change your advice.`;
 
 export type LiveSignal =
   | { kind: "interim_user"; text: string }
@@ -21,6 +25,11 @@ export type LiveSignal =
   | { kind: "turn_complete" }
   | { kind: "interrupted" }
   | { kind: "audio"; pcmBase64: string; mimeType: string };
+
+export type ToolCall = {
+  id: string;
+  name: string;
+};
 
 export function setupMessage(model: string, systemInstruction: string): unknown {
   const modelName = model.startsWith("models/") ? model : `models/${model}`;
@@ -33,6 +42,26 @@ export function setupMessage(model: string, systemInstruction: string): unknown 
       systemInstruction: {
         parts: [{ text: systemInstruction }],
       },
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: SCREENCAP_TOOL,
+              description:
+                "Capture the student's current desktop so you can see their work and respond accurately.",
+              parameters: {
+                type: "OBJECT",
+                properties: {
+                  reason: {
+                    type: "STRING",
+                    description: "Brief why you need the screen (for logs).",
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
       inputAudioTranscription: {},
       outputAudioTranscription: {},
       realtimeInputConfig: {
@@ -70,6 +99,54 @@ export function textTurnMessage(text: string): unknown {
   };
 }
 
+/** Tool ack + desktop JPEG so Gemini can see the student's screen. */
+export function screencapToolResponse(
+  call: ToolCall,
+  jpegBase64: string,
+  ok: boolean,
+  detail?: string,
+): unknown[] {
+  const messages: unknown[] = [
+    {
+      toolResponse: {
+        functionResponses: [
+          {
+            id: call.id,
+            name: call.name,
+            response: ok
+              ? { ok: true, note: detail ?? "Screenshot attached as the next user turn." }
+              : { ok: false, error: detail ?? "Screenshot failed." },
+          },
+        ],
+      },
+    },
+  ];
+  if (ok && jpegBase64) {
+    messages.push({
+      clientContent: {
+        turns: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: "Here is my current screen. Please use it for your next reply.",
+              },
+              {
+                inlineData: {
+                  mimeType: "image/jpeg",
+                  data: jpegBase64,
+                },
+              },
+            ],
+          },
+        ],
+        turnComplete: true,
+      },
+    });
+  }
+  return messages;
+}
+
 export function audioStreamEndMessage(): unknown {
   return { realtimeInput: { audioStreamEnd: true } };
 }
@@ -88,6 +165,27 @@ export function errorMessage(value: unknown): string | null {
     if (typeof message === "string") return message;
   }
   return "Gemini Live error";
+}
+
+export function toolCallsFromMessage(value: unknown): ToolCall[] {
+  if (!value || typeof value !== "object") return [];
+  const root = value as Record<string, unknown>;
+  const toolCall = (root.toolCall ?? root.tool_call) as Record<string, unknown> | undefined;
+  if (!toolCall) return [];
+  const calls =
+    (toolCall.functionCalls as unknown[] | undefined) ??
+    (toolCall.function_calls as unknown[] | undefined);
+  if (!Array.isArray(calls)) return [];
+  const out: ToolCall[] = [];
+  for (const call of calls) {
+    if (!call || typeof call !== "object") continue;
+    const name = (call as { name?: unknown }).name;
+    const id = (call as { id?: unknown }).id;
+    if (typeof name === "string" && typeof id === "string" && name && id) {
+      out.push({ id, name });
+    }
+  }
+  return out;
 }
 
 export function signalsFromMessage(value: unknown): LiveSignal[] {
