@@ -9,6 +9,7 @@ import { emailCodeTtlSeconds, googleConfigured, pendingTtlSeconds, type Config }
 import { CalendarConnects } from "./calendar/connect.ts";
 import { createCalendarClient, type CalendarClient } from "./calendar/client.ts";
 import { mintEphemeralToken, type FetchLike } from "./gemini/ephemeral.ts";
+import { coachTokenOk, handleCoach } from "./coach/ollama.ts";
 import { createMailer, type Mailer } from "./mailer.ts";
 import { handleProduct } from "./product/routes.ts";
 import {
@@ -171,6 +172,15 @@ async function handle(
   }
   if (method === "POST" && path === "/v1/session/ephemeral-token") {
     await issueEphemeralToken(req, res, deps);
+    return;
+  }
+  if (
+    await handleCoach(method, path, req, res, deps.config, deps.fetch, async () => {
+      // Baked desktop coach token OR signed-in Waypoint JWT.
+      if (coachTokenOk(deps.config, req)) return;
+      await requireUser(deps, req, deps.now());
+    })
+  ) {
     return;
   }
   if (

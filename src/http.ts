@@ -56,12 +56,15 @@ export function applyCors(req: IncomingMessage, res: ServerResponse, config: Con
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 }
 
-function originAllowed(origin: string, extra: string[]): boolean {
+/** Tauri webview + local Vite origins are always allowed; extras come from WAYPOINT_CORS_ORIGINS. */
+export function originAllowed(origin: string, extra: string[]): boolean {
   if (extra.includes(origin)) return true;
   if (
     origin === "tauri://localhost" ||
     origin === "http://tauri.localhost" ||
-    origin === "https://tauri.localhost"
+    origin === "https://tauri.localhost" ||
+    origin === "https://asset.localhost" ||
+    origin === "http://asset.localhost"
   ) {
     return true;
   }

@@ -50,6 +50,28 @@ Those URIs are `{PUBLIC_BASE_URL}` plus `/v1/auth/google/callback` and `/v1/goog
 
 7. Copy the client id and client secret into `.env`.
 
+## Coach / Ollama proxy (desktop lock-in)
+
+Ollama runs **on this API host**, not on end-user Macs. The desktop app sets `local_llm_base = "http://127.0.0.1:8787/v1/coach"` and sends `Authorization: Bearer <COACH_API_TOKEN>`.
+
+```bash
+# On the API machine
+ollama serve
+ollama pull qwen2.5:0.5b
+ollama pull moondream
+# in .env:
+# OLLAMA_BASE_URL=http://127.0.0.1:11434
+# COACH_API_TOKEN=<openssl rand -hex 24>
+```
+
+| Method | Path | Proxies to |
+|---|---|---|
+| `GET` | `/v1/coach/api/tags` | `GET {OLLAMA_BASE_URL}/api/tags` |
+| `POST` | `/v1/coach/api/generate` | `POST {OLLAMA_BASE_URL}/api/generate` |
+| `GET` | `/v1/coach/health` | tags probe + `{ ok, ollama }` |
+
+Auth: matching `COACH_API_TOKEN`, **or** a signed-in Waypoint access token. Generate bodies are capped at 4 MiB. CORS allows `tauri://localhost`, `http(s)://tauri.localhost`, and `http(s)://localhost` / `127.0.0.1`. Errors: `503 ollama_not_configured` if `OLLAMA_BASE_URL` is blank; `502 ollama_unreachable` if Ollama is down or times out.
+
 ## Calling the API from Waypoint
 
 Base URL: `http://127.0.0.1:8787`, or whatever host you deploy this process on. Call it from Rust (`reqwest` is already in the app), the same way `connect_google` opens the system browser today. The webview may also call it: `http://localhost`, `http://127.0.0.1`, and `tauri://localhost` are allowed CORS origins.

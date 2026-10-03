@@ -1,0 +1,200 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+import type { Config } from "../config.ts";
+import { HttpError, bearerToken, sendError, sendJson } from "../http.ts";
+import type { FetchLike } from "../gemini/ephemeral.ts";
+
+/** Max body for Ollama generate (text + rare small images). */
+export const COACH_BODY_MAX = 4 * 1024 * 1024;
+
+const TAGS_TIMEOUT_MS = 5_000;
+const GENERATE_TIMEOUT_MS = 120_000;
+
+export function ollamaConfigured(config: Config): boolean {
+  return Boolean(config.ollamaBaseUrl);
+}
+
+/** Constant-time compare so COACH_API_TOKEN is not leaked via response timing. */
+export function tokensEqual(a: string, b: string): boolean {
+  const ha = createHash("sha256").update(a, "utf8").digest();
+  const hb = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(ha, hb);
+}
+
+export function coachTokenOk(config: Config, req: IncomingMessage): boolean {
+  const token = bearerToken(req);
+  if (!token || !config.coachApiToken) return false;
+  return tokensEqual(token, config.coachApiToken);
+}
+
+export async function readCoachJson(req: IncomingMessage): Promise<unknown> {
+  const declared = req.headers["content-length"];
+  if (typeof declared === "string") {
+    const n = Number.parseInt(declared, 10);
+    if (Number.isFinite(n) && n > COACH_BODY_MAX) {
+      throw new HttpError(413, "body_too_large", "Coach request body is too large.");
+    }
+  }
+
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    size += buf.length;
+    if (size > COACH_BODY_MAX) {
+      throw new HttpError(413, "body_too_large", "Coach request body is too large.");
+    }
+    chunks.push(buf);
+  }
+  if (chunks.length === 0) return {};
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new HttpError(400, "invalid_json", "Request body is not valid JSON.");
+  }
+}
+
+function ollamaErrorMessage(baseUrl: string, error: unknown): string {
+  const msg = error instanceof Error ? error.message : String(error);
+  const cause =
+    error instanceof Error && error.cause instanceof Error
+      ? error.cause.message
+      : error instanceof Error && error.cause && typeof error.cause === "object" && "code" in error.cause
+        ? String((error.cause as { code: unknown }).code)
+        : "";
+  const detail = cause && !msg.includes(cause) ? `${msg} (${cause})` : msg;
+  if (/abort|timeout/i.test(detail)) {
+    return `Ollama at ${baseUrl} timed out. Is \`ollama serve\` running?`;
+  }
+  if (/ECONNREFUSED|fetch failed|ENOTFOUND|EHOSTUNREACH/i.test(detail)) {
+    return `Could not reach Ollama at ${baseUrl}. Start it with \`ollama serve\` or fix OLLAMA_BASE_URL.`;
+  }
+  return `Could not reach Ollama at ${baseUrl} (${detail}).`;
+}
+
+async function proxyOllama(
+  config: Config,
+  fetchImpl: FetchLike,
+  method: string,
+  ollamaPath: string,
+  body?: unknown,
+  timeoutMs = TAGS_TIMEOUT_MS,
+): Promise<{ status: number; json: unknown }> {
+  if (!config.ollamaBaseUrl) {
+    throw new HttpError(
+      503,
+      "ollama_not_configured",
+      "Set OLLAMA_BASE_URL on the API server (e.g. http://127.0.0.1:11434).",
+    );
+  }
+  const url = `${config.ollamaBaseUrl.replace(/\/+$/, "")}${ollamaPath}`;
+  const init: RequestInit = {
+    method,
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    signal: AbortSignal.timeout(timeoutMs),
+  };
+  if (body !== undefined) {
+    init.body = JSON.stringify(body);
+  }
+  let res: Response;
+  try {
+    res = await fetchImpl(url, init);
+  } catch (e) {
+    throw new HttpError(502, "ollama_unreachable", ollamaErrorMessage(config.ollamaBaseUrl, e));
+  }
+  const text = await res.text();
+  let json: unknown = {};
+  if (text) {
+    try {
+      json = JSON.parse(text) as unknown;
+    } catch {
+      json = { error: text.slice(0, 500) };
+    }
+  }
+  return { status: res.status, json };
+}
+
+function normalizeGenerateBody(body: unknown): Record<string, unknown> {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "invalid_body", "Generate body must be a JSON object.");
+  }
+  // Proxy always returns a single JSON object; streaming NDJSON is not supported.
+  return { ...(body as Record<string, unknown>), stream: false };
+}
+
+/** Ollama-compatible surface under /v1/coach so the desktop can set base to …/v1/coach */
+export async function handleCoach(
+  method: string,
+  path: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+  config: Config,
+  fetchImpl: FetchLike,
+  authorize: () => Promise<void>,
+): Promise<boolean> {
+  if (!path.startsWith("/v1/coach")) return false;
+
+  try {
+    await authorize();
+
+    if (method === "GET" && (path === "/v1/coach/api/tags" || path === "/v1/coach/health")) {
+      if (path === "/v1/coach/health") {
+        if (!ollamaConfigured(config)) {
+          sendJson(res, 503, {
+            ok: false,
+            error: {
+              code: "ollama_not_configured",
+              message: "Set OLLAMA_BASE_URL on the API server (e.g. http://127.0.0.1:11434).",
+            },
+          });
+          return true;
+        }
+        try {
+          const { status, json } = await proxyOllama(config, fetchImpl, "GET", "/api/tags");
+          sendJson(res, status === 200 ? 200 : status, {
+            ok: status === 200,
+            ollama: json,
+          });
+        } catch (error) {
+          if (error instanceof HttpError && error.code === "ollama_unreachable") {
+            sendJson(res, 502, {
+              ok: false,
+              error: { code: error.code, message: error.message },
+            });
+            return true;
+          }
+          throw error;
+        }
+        return true;
+      }
+      const { status, json } = await proxyOllama(config, fetchImpl, "GET", "/api/tags");
+      sendJson(res, status, json);
+      return true;
+    }
+
+    if (method === "POST" && path === "/v1/coach/api/generate") {
+      const body = normalizeGenerateBody(await readCoachJson(req));
+      const { status, json } = await proxyOllama(
+        config,
+        fetchImpl,
+        "POST",
+        "/api/generate",
+        body,
+        GENERATE_TIMEOUT_MS,
+      );
+      sendJson(res, status, json);
+      return true;
+    }
+
+    if (path === "/v1/coach/api/tags" || path === "/v1/coach/api/generate" || path === "/v1/coach/health") {
+      throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+    }
+    throw new HttpError(404, "not_found", "No coach route for that path.");
+  } catch (error) {
+    if (!res.headersSent) sendError(res, error);
+    return true;
+  }
+}

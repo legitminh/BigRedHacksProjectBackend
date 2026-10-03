@@ -20,6 +20,12 @@ export type Config = {
   mailFrom: string | null;
   geminiApiKey: string | null;
   geminiModel: string;
+  /** Ollama base on the API host (not the end-user machine), e.g. http://127.0.0.1:11434 */
+  ollamaBaseUrl: string | null;
+  /** Shared secret the desktop app sends as Bearer for /v1/coach/* (optional if using user JWT). */
+  coachApiToken: string | null;
+  ollamaModel: string;
+  ollamaVisionModel: string;
 };
 
 const PENDING_TTL_SECONDS = 600;
@@ -102,6 +108,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mailFrom: nonempty(env.MAIL_FROM),
     geminiApiKey: nonempty(env.GEMINI_API_KEY),
     geminiModel: nonempty(env.GEMINI_MODEL) ?? "gemini-flash-latest",
+    // Default local Ollama when unset. Set OLLAMA_BASE_URL= (empty) to disable the proxy.
+    ollamaBaseUrl:
+      env.OLLAMA_BASE_URL === undefined
+        ? "http://127.0.0.1:11434"
+        : nonempty(env.OLLAMA_BASE_URL),
+    coachApiToken: nonempty(env.COACH_API_TOKEN),
+    ollamaModel: nonempty(env.OLLAMA_MODEL) ?? "qwen2.5:0.5b",
+    ollamaVisionModel: nonempty(env.OLLAMA_VISION_MODEL) ?? "moondream",
   };
 }
 
