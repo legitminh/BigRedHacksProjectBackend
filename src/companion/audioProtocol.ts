@@ -23,10 +23,10 @@ const MAGIC1 = 0x50; // P
 const VERSION = 1;
 const HEADER_BYTES = 16;
 
-/** Target ~100ms at 24 kHz s16le before flushing a downlink frame. */
-export const DOWNLINK_TARGET_BYTES = 4800;
+/** Target ~160ms at 24 kHz s16le before flushing a downlink frame. */
+export const DOWNLINK_TARGET_BYTES = 7680;
 /** Flush partial batch if idle this long (ms). */
-export const DOWNLINK_MAX_HOLD_MS = 40;
+export const DOWNLINK_MAX_HOLD_MS = 60;
 
 export type DecodedPcmFrame = {
   kind: number;

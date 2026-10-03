@@ -3,3 +3,7 @@ dist/
 .env
 data/
 *.log
+
+# Local agent audit reports (never commit)
+*.local.md
+AUDIT-*.local.md
