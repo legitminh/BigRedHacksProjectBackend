@@ -35,7 +35,7 @@ const MAX_JPEG_B64_CHARS = 3_500_000;
 const SETUP_TIMEOUT_MS = 20_000;
 const SCREENCAP_CLIENT_TIMEOUT_MS = 12_000;
 
-type Inbound =
+export type Inbound =
   | {
       type: "start";
       context?: Record<string, unknown> | null;
@@ -261,51 +261,105 @@ function parseInbound(raw: string): Inbound | null {
   }
 }
 
-async function connectGemini(apiKey: string, model: string, system: string): Promise<WebSocket> {
-  const gemini = new WebSocket(liveWsUrl(apiKey));
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timed out connecting to Gemini Live")), SETUP_TIMEOUT_MS);
-    gemini.once("open", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-    gemini.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-  });
+function closeQuietly(socket: WebSocket | null | undefined): void {
+  if (!socket) return;
+  try {
+    if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+    else if (socket.readyState === WebSocket.OPEN) socket.close();
+  } catch {
+    /* ignore */
+  }
+}
 
-  gemini.send(JSON.stringify(setupMessage(model, system)));
+export type ConnectGeminiOptions = {
+  /** Override the upstream URL (tests). */
+  url?: string;
+  timeoutMs?: number;
+  /**
+   * Called synchronously with the socket *before* any await, so the caller can close it
+   * (e.g. client disconnects mid-setup).
+   */
+  onSocket?: (socket: WebSocket) => void;
+};
 
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timed out waiting for Gemini setup")), SETUP_TIMEOUT_MS);
-    const onMessage = (data: WebSocket.RawData) => {
-      let payload: unknown;
-      try {
-        payload = JSON.parse(String(data));
-      } catch {
-        return;
-      }
-      const record = payload as Record<string, unknown>;
-      if (record.setupComplete != null || record.setup_complete != null) {
+export async function connectGemini(
+  apiKey: string,
+  model: string,
+  system: string,
+  options: ConnectGeminiOptions = {},
+): Promise<WebSocket> {
+  const timeoutMs = options.timeoutMs ?? SETUP_TIMEOUT_MS;
+  const gemini = new WebSocket(options.url ?? liveWsUrl(apiKey));
+  options.onSocket?.(gemini);
+  // Persistent handler: a late 'error' (e.g. after abort/terminate) must never be unhandled.
+  gemini.on("error", () => {});
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("timed out connecting to Gemini Live")),
+        timeoutMs,
+      );
+      const onClose = () => {
         clearTimeout(timer);
-        gemini.off("message", onMessage);
+        reject(new Error("Gemini closed before connecting"));
+      };
+      gemini.once("open", () => {
+        clearTimeout(timer);
+        gemini.off("close", onClose);
         resolve();
-        return;
-      }
-      const err = errorMessage(payload);
-      if (err) {
+      });
+      gemini.once("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      gemini.once("close", onClose);
+    });
+
+    gemini.send(JSON.stringify(setupMessage(model, system)));
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         gemini.off("message", onMessage);
-        reject(new Error(`Gemini rejected the session: ${err}`));
-      }
-    };
-    gemini.on("message", onMessage);
-    gemini.once("close", () => {
-      clearTimeout(timer);
-      reject(new Error("Gemini closed during setup"));
+        gemini.off("close", onClose);
+        gemini.off("error", onError);
+        if (error) reject(error);
+        else resolve();
+      };
+      const timer = setTimeout(
+        () => finish(new Error("timed out waiting for Gemini setup")),
+        timeoutMs,
+      );
+      const onMessage = (data: WebSocket.RawData) => {
+        let payload: unknown;
+        try {
+          payload = JSON.parse(String(data));
+        } catch {
+          return;
+        }
+        const record = payload as Record<string, unknown>;
+        if (record.setupComplete != null || record.setup_complete != null) {
+          finish();
+          return;
+        }
+        const err = errorMessage(payload);
+        if (err) finish(new Error(`Gemini rejected the session: ${err}`));
+      };
+      const onClose = () => finish(new Error("Gemini closed during setup"));
+      const onError = (error: Error) => finish(error);
+      gemini.on("message", onMessage);
+      gemini.once("close", onClose);
+      gemini.once("error", onError);
     });
-  });
+  } catch (error) {
+    // Setup timeout / rejection / failure: don't leak the upstream socket.
+    closeQuietly(gemini);
+    throw error;
+  }
 
   return gemini;
 }
@@ -375,14 +429,15 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     closed = true;
     clearPendingScreencaps();
     downlink.reset();
-    if (gemini && gemini.readyState === WebSocket.OPEN) {
+    const upstream = gemini;
+    if (upstream && upstream.readyState === WebSocket.OPEN) {
       try {
-        gemini.send(JSON.stringify(audioStreamEndMessage()));
+        upstream.send(JSON.stringify(audioStreamEndMessage()));
       } catch {
         /* ignore */
       }
-      gemini.close();
     }
+    closeQuietly(upstream);
     gemini = null;
   };
 
@@ -418,7 +473,18 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   send(client, { type: "status", phase: "connecting" });
   const system = buildCompanionSystem(first.context);
   try {
-    gemini = await connectGemini(config.geminiApiKey, model, system);
+    const upstream = await connectGemini(config.geminiApiKey, model, system, {
+      // Assign before awaiting so cleanup() can close the socket mid-setup.
+      onSocket: (socket) => {
+        gemini = socket;
+      },
+    });
+    if (closed) {
+      // Client left while Gemini was connecting.
+      closeQuietly(upstream);
+      return;
+    }
+    gemini = upstream;
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Could not start live voice.";
@@ -594,23 +660,30 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   });
 }
 
-function waitForStart(client: WebSocket): Promise<Inbound | null> {
+export function waitForStart(client: WebSocket, timeoutMs = 15_000): Promise<Inbound | null> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      sendError(client, "Timed out waiting for start.");
-      resolve(null);
-    }, 15_000);
-    const onMessage = (data: WebSocket.RawData) => {
-      const inbound = parseInbound(String(data));
-      if (!inbound) return;
+    let settled = false;
+    const finish = (result: Inbound | null) => {
+      if (settled) return;
+      settled = true;
+      // Always detach every listener we added, whatever the outcome.
       clearTimeout(timer);
       client.off("message", onMessage);
-      resolve(inbound);
+      client.off("close", onClose);
+      resolve(result);
     };
+    const timer = setTimeout(() => {
+      sendError(client, "Timed out waiting for start.");
+      finish(null);
+    }, timeoutMs);
+    const onMessage = (data: WebSocket.RawData, isBinary?: boolean) => {
+      if (isBinary) return;
+      const inbound = parseInbound(String(data));
+      if (!inbound) return;
+      finish(inbound);
+    };
+    const onClose = () => finish(null);
     client.on("message", onMessage);
-    client.once("close", () => {
-      clearTimeout(timer);
-      resolve(null);
-    });
+    client.once("close", onClose);
   });
 }

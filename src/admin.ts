@@ -103,18 +103,23 @@ async function readPassword(req: IncomingMessage): Promise<string> {
   return params.get("password") ?? "";
 }
 
+/** Add `; Secure` when the public origin is https (TLS terminated at the proxy). */
+function secureCookieSuffix(config: Config): string {
+  return config.publicBaseUrl.toLowerCase().startsWith("https://") ? "; Secure" : "";
+}
+
 function setAdminCookie(res: ServerResponse, config: Config): void {
   const value = mintAdminCookie(config);
   res.setHeader(
     "Set-Cookie",
-    `${COOKIE}=${value}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=86400`,
+    `${COOKIE}=${value}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=86400${secureCookieSuffix(config)}`,
   );
 }
 
-function clearAdminCookie(res: ServerResponse): void {
+function clearAdminCookie(res: ServerResponse, config: Config): void {
   res.setHeader(
     "Set-Cookie",
-    `${COOKIE}=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0`,
+    `${COOKIE}=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0${secureCookieSuffix(config)}`,
   );
 }
 
@@ -567,7 +572,7 @@ export async function handleAdmin(
   }
 
   if (method === "POST" && path === "/admin/logout") {
-    clearAdminCookie(res);
+    clearAdminCookie(res, deps.config);
     res.writeHead(303, { Location: "/admin", "Cache-Control": "no-store" });
     res.end();
     return true;
@@ -595,6 +600,20 @@ export async function handleAdmin(
     }
     const detail = await deps.store.adminUserDetail(id);
     if (!detail) throw new HttpError(404, "user_not_found", "No user with that id.");
+    // Best-effort Google revoke before wipe (same posture as DELETE /v1/me/data).
+    try {
+      const { refreshToken } = await deps.store.getCalendarConnection(id);
+      if (refreshToken) {
+        await fetch("https://oauth2.googleapis.com/revoke", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ token: refreshToken }),
+          signal: AbortSignal.timeout(5000),
+        });
+      }
+    } catch {
+      // Local clear must still succeed if Google is unreachable.
+    }
     await deps.store.clearUserData(id, new Date());
     res.writeHead(303, { Location: "/admin", "Cache-Control": "no-store" });
     res.end();

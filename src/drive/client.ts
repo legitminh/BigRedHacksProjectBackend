@@ -1,3 +1,5 @@
+import { HttpError } from "../http.ts";
+
 export type DriveFile = {
   id: string;
   name: string;
@@ -27,6 +29,10 @@ function asFiles(payload: unknown): DriveFile[] {
   return out;
 }
 
+function failed(status: number): HttpError {
+  return new HttpError(502, "drive_unavailable", `Drive request failed (${status}).`);
+}
+
 function escapeDriveQuery(term: string): string {
   return term.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 }
@@ -49,7 +55,7 @@ export function createDriveClient(fetchImpl: typeof fetch = fetch): DriveClient 
         headers: { Authorization: `Bearer ${accessToken}` },
       });
       if (!response.ok) {
-        throw new Error(`Drive list failed: HTTP ${response.status}`);
+        throw failed(response.status);
       }
       return asFiles(await response.json());
     },
@@ -79,7 +85,7 @@ export function createDriveClient(fetchImpl: typeof fetch = fetch): DriveClient 
         headers: { Authorization: `Bearer ${accessToken}` },
       });
       if (!response.ok) {
-        throw new Error(`Drive search failed: HTTP ${response.status}`);
+        throw failed(response.status);
       }
       return asFiles(await response.json());
     },

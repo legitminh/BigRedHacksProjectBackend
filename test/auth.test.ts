@@ -141,7 +141,7 @@ test("start refuses missing Google credentials and a short session secret", asyn
   );
 });
 
-test("authorization URL carries PKCE, state, and identity scopes only", async () => {
+test("authorization URL carries PKCE, state, and bundled sign-in + Calendar + Drive scopes", async () => {
   const capture = { verifier: "" };
   await withApp(
     async (base) => {

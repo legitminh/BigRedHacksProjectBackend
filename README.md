@@ -37,6 +37,10 @@ The process listens on `BIND_HOST:PORT` (default `http://127.0.0.1:8787`). `GET 
 
 **Connection status panel** (desktop Settings → Connection) uses `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, and Copilot chat provider. Auth is optional (JWT enriches account + Calendar/Drive). Probe results are cached ~30s. Indicator meanings: **[docs/STATUS.md](./docs/STATUS.md)**.
 
+**Restart limitations (single process):** in-flight Google sign-in polls and **calendar-connect** polls (`/v1/google/calendar/start` → `/poll`) live in process memory. A restart drops them; the app simply starts the connect flow again. Already-completed grants and tokens are stored durably. Run one API process (no horizontal scaling) unless these are moved to shared storage.
+
+**Admin console:** the `wp_admin` cookie is `HttpOnly; SameSite=Strict` and gets `Secure` automatically when `PUBLIC_BASE_URL` starts with `https://`.
+
 `npm test` covers Google sign-in and email codes. Email tests inject a mailer, so they do not send mail. After any `.env` or code change, **restart** the process.
 
 ## Google Cloud client
@@ -45,7 +49,7 @@ Create a **Web application** OAuth client. The desktop client already baked into
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/) and select the Waypoint project.
 2. **APIs & Services → OAuth consent screen**. App name `Waypoint`. Add the Google accounts that will sign in while the app is in testing.
-3. Scopes for sign-in: `openid`, `email`, `profile`. Add `https://www.googleapis.com/auth/calendar.events` for the calendar connect flow. Enable the Google Calendar API.
+3. Scopes: the desktop **sign-in is one bundled consent**: `openid email profile` + `https://www.googleapis.com/auth/calendar.events` + `https://www.googleapis.com/auth/drive.readonly`. Add all of them on the consent screen and enable the Google Calendar and Drive APIs. The separate calendar connect flow (`/v1/google/calendar/start`) re-requests Calendar + Drive as a second consent (re-connect / incremental) with the same data scopes.
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
 5. Application type: **Web application**. Name: `Waypoint API`.
 6. Authorized redirect URI:
@@ -213,6 +217,8 @@ Protocol mirrors [gemini_live_demo](https://github.com/legitminh/gemini_live_dem
 
 ### 6b. Gemini Live ephemeral token (legacy / other clients)
 
+> **Legacy and disabled by default.** The desktop uses the server-side Live proxy in step 6. `POST /v1/session/ephemeral-token` returns `404` `ephemeral_token_disabled` unless the server sets `ENABLE_EPHEMERAL_TOKEN=1` (also `true`, `yes`, `on`). Enable it only for older or third-party clients that talk to Gemini Live directly.
+
 The desktop app must not ship `GEMINI_API_KEY`. Sign in first (steps 1–2) so the app holds a Waypoint access token. Then ask this server for a Gemini credential and use that token for Gemini Live instead of a key baked into the app.
 
 `POST /v1/session/ephemeral-token`
@@ -360,7 +366,7 @@ For local development, leave `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`,
 
 ## Memory, tasks, calendar, and session recap
 
-Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the full contract. The client never writes Postgres. Gemini still runs in the app with the ephemeral token.
+Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the full contract. The client never writes Postgres. Live Gemini runs through the server-side proxy (`WS /v1/companion/live`); the ephemeral token route is legacy and off by default (see 6b).
 
 ### Memory
 

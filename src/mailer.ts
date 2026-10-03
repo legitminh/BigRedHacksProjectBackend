@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 
 import type { Config } from "./config.ts";
+import { HttpError } from "./http.ts";
 
 export type LoginCodeMessage = {
   to: string;
@@ -28,7 +29,23 @@ type Conn = Socket | TLSSocket;
 export function createMailer(config: Config, outboxPath = resolve("data/outbox.jsonl")): Mailer {
   const smtp = smtpSettings(config);
   if (smtp) return createSmtpMailer(smtp);
+  // The file outbox writes login codes to disk in plaintext — dev only. In production
+  // without SMTP, refuse rather than silently "sending" codes nobody receives (or
+  // leaving them readable on disk).
+  if (config.production) return createRefusingMailer();
   return createOutboxMailer(outboxPath);
+}
+
+export function createRefusingMailer(): Mailer {
+  return {
+    async sendLoginCode() {
+      throw new HttpError(
+        503,
+        "email_not_configured",
+        "Email sign-in is unavailable: SMTP is not configured on this server.",
+      );
+    },
+  };
 }
 
 function smtpSettings(config: Config): SmtpSettings | null {

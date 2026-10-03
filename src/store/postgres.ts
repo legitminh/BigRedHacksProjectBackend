@@ -794,6 +794,13 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         );
         return;
       }
+      if (!connected) {
+        await pool.query(
+          `UPDATE users SET calendar_connected = false, google_refresh_token = NULL WHERE id = $1`,
+          [userId],
+        );
+        return;
+      }
       await pool.query(`UPDATE users SET calendar_connected = $2 WHERE id = $1`, [userId, connected]);
     },
     async createTask(userId, task, now) {

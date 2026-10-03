@@ -1,6 +1,6 @@
 import type { PollError } from "../auth/pending.ts";
 
-type Status = "pending" | "complete" | "error";
+type Status = "pending" | "exchanging" | "complete" | "error";
 
 type Pending = {
   state: string;
@@ -27,16 +27,18 @@ export class CalendarConnects {
       if (pending && now >= pending.expiresAt) this.remove(pending);
       return { ok: false };
     }
+    // Single-flight: mark exchanging so replayed/concurrent callbacks are rejected.
+    pending.status = "exchanging";
     return { ok: true, pending };
   }
 
   complete(pending: Pending): void {
-    if (pending.status !== "pending") return;
+    if (pending.status !== "pending" && pending.status !== "exchanging") return;
     pending.status = "complete";
   }
 
   fail(pending: Pending, error: PollError): void {
-    if (pending.status !== "pending") return;
+    if (pending.status !== "pending" && pending.status !== "exchanging") return;
     pending.status = "error";
     pending.error = error;
   }
@@ -56,7 +58,7 @@ export class CalendarConnects {
       this.remove(pending);
       return { type: "expired" };
     }
-    if (pending.status === "pending") {
+    if (pending.status === "pending" || pending.status === "exchanging") {
       return { type: "pending", expiresIn: Math.max(0, Math.ceil((pending.expiresAt - now) / 1000)) };
     }
     if (pending.status === "complete") {

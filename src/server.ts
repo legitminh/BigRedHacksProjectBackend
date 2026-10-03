@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
-import { newEmailCode, parseEmail, parseEmailCode } from "./auth/email.ts";
+import { EmailCodeGuard, newEmailCode, parseEmail, parseEmailCode } from "./auth/email.ts";
 import { GoogleExchangeError, authorizationUrl, createGoogleClient, type GoogleClient } from "./auth/google.ts";
 import { PendingLogins, type CompletedLogin } from "./auth/pending.ts";
 import { hashToken, newOpaqueToken, signAccessToken, verifyAccessToken } from "./auth/tokens.ts";
@@ -14,6 +14,13 @@ import { handleAdmin } from "./admin.ts";
 import { coachTokenOk, handleCoach } from "./coach/ollama.ts";
 import { attachCompanionLiveUpgrade } from "./companion/liveUpgrade.ts";
 import { createMailer, type Mailer } from "./mailer.ts";
+import {
+  DEFAULT_RATE_RULES,
+  RateLimiter,
+  clientIp,
+  rateLimited,
+  type RateRules,
+} from "./security/rateLimit.ts";
 import { handleProduct } from "./product/routes.ts";
 import { handleVoiceHealth, handleVoiceTts } from "./voice/tts.ts";
 import { aggregateStatus } from "./status/aggregate.ts";
@@ -41,7 +48,40 @@ export type AppDeps = {
   calendarConnects?: CalendarConnects;
   now?: () => Date;
   fetch?: FetchLike;
+  /** Abuse-shield state; defaults to a fresh in-process limiter per app. */
+  limiter?: RateLimiter;
+  /** Override individual rate-limit rules (tests / ops). */
+  rateRules?: Partial<RateRules>;
+  /** Per-mailbox OTP brute-force guard; defaults to 5 failures → 15 min lockout. */
+  emailCodeGuard?: EmailCodeGuard;
 };
+
+type Shields = {
+  limiter: RateLimiter;
+  rules: RateRules;
+  emailCodeGuard: EmailCodeGuard;
+};
+
+type HandleDeps = Required<
+  Pick<
+    AppDeps,
+    "config" | "store" | "pending" | "google" | "mailer" | "calendar" | "drive" | "calendarConnects" | "now" | "fetch"
+  >
+> & { shields: Shields };
+
+function shieldIp(deps: HandleDeps, req: IncomingMessage): string {
+  return clientIp(req, deps.config.trustProxy);
+}
+
+/** Throws 429 (+ Retry-After) when `id` exceeds `rule` for `bucket`. */
+function limit(
+  deps: Pick<HandleDeps, "shields" | "now">,
+  bucket: string,
+  id: string,
+  rule: keyof RateRules,
+): void {
+  deps.shields.limiter.consume(bucket, id, deps.shields.rules[rule], deps.now().getTime());
+}
 
 function nowSeconds(now: Date): number {
   return Math.floor(now.getTime() / 1000);
@@ -111,6 +151,11 @@ export function createApp(deps: AppDeps): Server {
   const calendar = deps.calendar ?? createCalendarClient(fetchImpl);
   const drive = deps.drive ?? createDriveClient(fetchImpl);
   const calendarConnects = deps.calendarConnects ?? new CalendarConnects();
+  const shields: Shields = {
+    limiter: deps.limiter ?? new RateLimiter(),
+    rules: { ...DEFAULT_RATE_RULES, ...deps.rateRules },
+    emailCodeGuard: deps.emailCodeGuard ?? new EmailCodeGuard(),
+  };
 
   const server = createServer((req, res) => {
     applyCors(req, res, deps.config);
@@ -128,6 +173,7 @@ export function createApp(deps: AppDeps): Server {
       calendarConnects,
       now: nowFn,
       fetch: fetchImpl,
+      shields,
     }).catch(
       (error: unknown) => {
         if (!res.headersSent) sendError(res, error);
@@ -148,12 +194,7 @@ export function createApp(deps: AppDeps): Server {
 async function handle(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: Required<
-    Pick<
-      AppDeps,
-      "config" | "store" | "pending" | "google" | "mailer" | "calendar" | "drive" | "calendarConnects" | "now" | "fetch"
-    >
-  >,
+  deps: HandleDeps,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const path = url.pathname;
@@ -165,6 +206,7 @@ async function handle(
   }
 
   if (method === "GET" && path === "/v1/status") {
+    limit(deps, "status", shieldIp(deps, req), "statusIp");
     const now = deps.now();
     const user = await optionalUser(deps, req, now);
     let googleConnected: boolean | null = null;
@@ -189,6 +231,7 @@ async function handle(
   }
 
   if (method === "POST" && path === "/v1/auth/google/start") {
+    limit(deps, "google-start", shieldIp(deps, req), "googleStartIp");
     await startGoogle(res, deps);
     return;
   }
@@ -209,6 +252,7 @@ async function handle(
     return;
   }
   if (method === "POST" && path === "/v1/auth/refresh") {
+    limit(deps, "refresh", shieldIp(deps, req), "refreshIp");
     await refresh(req, res, deps);
     return;
   }
@@ -222,15 +266,21 @@ async function handle(
     return;
   }
   if (method === "POST" && path === "/v1/session/ephemeral-token") {
+    if (!deps.config.ephemeralTokenEnabled) {
+      throw new HttpError(
+        404,
+        "ephemeral_token_disabled",
+        "Ephemeral Gemini tokens are disabled. Use the server-side Live proxy (WS /v1/companion/live).",
+      );
+    }
     await issueEphemeralToken(req, res, deps);
     return;
   }
   if (
-    await handleCoach(method, path, req, res, deps.config, deps.fetch, async () => {
+    await handleCoach(method, path, req, res, deps.config, deps.fetch, () =>
       // Baked desktop coach token OR signed-in Waypoint JWT.
-      if (coachTokenOk(deps.config, req)) return;
-      await requireUser(deps, req, deps.now());
-    })
+      authorizeMetered(deps, req, "coach", "coachIp", "coachUser"),
+    )
   ) {
     return;
   }
@@ -238,13 +288,15 @@ async function handle(
     return;
   }
   if (
-    await handleVoiceTts(method, path, req, res, deps.config, deps.fetch, async () => {
+    await handleVoiceTts(method, path, req, res, deps.config, deps.fetch, () =>
       // Same auth as lock-in coach — study heads-ups may use JWT or coach token.
-      if (coachTokenOk(deps.config, req)) return;
-      await requireUser(deps, req, deps.now());
-    })
+      authorizeMetered(deps, req, "tts", "ttsIp", "ttsUser"),
+    )
   ) {
     return;
+  }
+  if (method === "POST" && (path === "/v1/gemini/chat" || path === "/v1/companion/chat")) {
+    limit(deps, "chat", shieldIp(deps, req), "chatIp");
   }
   if (
     await handleProduct(method, path, url, req, res, {
@@ -270,7 +322,7 @@ async function handle(
     path === "/v1/me" ||
     path === "/v1/auth/google/callback" ||
     path === "/v1/auth/google/poll" ||
-    path === "/v1/session/ephemeral-token" ||
+    (deps.config.ephemeralTokenEnabled && path === "/v1/session/ephemeral-token") ||
     path === "/v1/status" ||
     path === "/v1/voice/tts" ||
     path === "/v1/voice/health" ||
@@ -282,16 +334,41 @@ async function handle(
 }
 
 
+/**
+ * Coach/TTS gate: per-IP throttle first (so bad tokens can't be brute-forced), then
+ * coach-token-or-JWT auth, then a per-identity throttle. The coach token is a shared
+ * baked secret, so its identity is scoped by IP rather than one global bucket.
+ */
+async function authorizeMetered(
+  deps: HandleDeps,
+  req: IncomingMessage,
+  bucket: string,
+  ipRule: keyof RateRules,
+  identityRule: keyof RateRules,
+): Promise<void> {
+  const ip = shieldIp(deps, req);
+  limit(deps, `${bucket}-ip`, ip, ipRule);
+  let identity: string;
+  if (coachTokenOk(deps.config, req)) {
+    identity = `token:${ip}`;
+  } else {
+    identity = `user:${(await requireUser(deps, req, deps.now())).id}`;
+  }
+  limit(deps, `${bucket}-id`, identity, identityRule);
+}
+
 async function startEmail(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: Required<Pick<AppDeps, "config" | "store" | "mailer" | "now">>,
+  deps: HandleDeps,
 ): Promise<void> {
+  limit(deps, "email-start-ip", shieldIp(deps, req), "emailStartIp");
   const body = await readJson(req);
   const email = parseEmail(body && typeof body === "object" && "email" in body ? body.email : undefined);
   if (!email) {
     throw new HttpError(400, "invalid_email", "Enter a valid email address.");
   }
+  limit(deps, "email-start-email", email, "emailStartEmail");
   if (!deps.config.sessionSecret) {
     throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
   }
@@ -319,23 +396,33 @@ async function startEmail(
 async function verifyEmail(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: Required<Pick<AppDeps, "config" | "store" | "now">>,
+  deps: HandleDeps,
 ): Promise<void> {
   if (!deps.config.sessionSecret) {
     throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
   }
+  limit(deps, "email-verify-ip", shieldIp(deps, req), "emailVerifyIp");
   const body = await readJson(req);
   const record = body && typeof body === "object" ? body : {};
   const email = parseEmail("email" in record ? record.email : undefined);
   const code = parseEmailCode("code" in record ? record.code : undefined);
-  if (!email || !code) {
+  if (!email) {
     throw new HttpError(401, "invalid_code", "That code is invalid or expired.");
   }
   const now = deps.now();
-  const consumed = await deps.store.consumeEmailLoginCode(email, hashToken(code), now);
+  const nowMs = now.getTime();
+  const guard = deps.shields.emailCodeGuard;
+  // Locked mailboxes are refused before touching the store, even for a correct code.
+  const lockedFor = guard.lockedForSeconds(email, nowMs);
+  if (lockedFor > 0) throw rateLimited(lockedFor, "otp_locked");
+  const consumed = code ? await deps.store.consumeEmailLoginCode(email, hashToken(code), now) : false;
   if (!consumed) {
+    if (guard.recordFailure(email, nowMs)) {
+      throw rateLimited(guard.lockedForSeconds(email, nowMs), "otp_locked");
+    }
     throw new HttpError(401, "invalid_code", "That code is invalid or expired.");
   }
+  guard.recordSuccess(email);
   const user = await deps.store.findOrCreateUserByEmail(email, now);
   const refresh = newRefreshRecord(user.id, now, deps.config.refreshTokenTtlSeconds);
   await deps.store.insertRefreshToken(refresh.record);

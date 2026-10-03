@@ -2,7 +2,7 @@
 
 Account login is already specified in `devplan.md` and `README.md`. This file is the next product surface: a durable student profile, Google Calendar deadlines and confirmed event writes, and the task record the desktop app uses for advise vs pair.
 
-The app sends `Authorization: Bearer <access_token>` on every route below. The client never writes Postgres. Gemini runs on the client with an ephemeral credential; these routes are the tools' side effects.
+The app sends `Authorization: Bearer <access_token>` on every route below. The client never writes Postgres. Gemini Live is proxied by this server (`WS /v1/companion/live`); the legacy client-side ephemeral token (`POST /v1/session/ephemeral-token`) is off unless `ENABLE_EPHEMERAL_TOKEN=1`. These routes are the tools' side effects.
 
 Errors keep the existing shape:
 
@@ -83,9 +83,11 @@ Move a topic one step (`learning` → `comfortable` → `strong`, or the reverse
 
 ## Calendar
 
-Sign-in stays `openid email profile`. Connecting Calendar is incremental auth: a second Google consent with `include_granted_scopes=true`, scope `https://www.googleapis.com/auth/calendar.events`, `access_type=offline`. The new refresh token replaces `users.google_refresh_token`. Disconnecting Calendar nulls that use of the token's calendar scope by storing a flag `calendar_connected` (default false) rather than deleting the identity session.
+Desktop sign-in (`POST /v1/auth/google/start`) already requests the bundled scopes `openid email profile`, `calendar.events`, and `drive.readonly` in one consent. `POST /v1/google/calendar/start` is a second consent (re-connect / incremental) with `include_granted_scopes=true`, scopes `calendar.events drive.readonly`, `access_type=offline`. The new refresh token replaces `users.google_refresh_token`. Disconnecting Calendar nulls that use of the token's calendar scope by storing a flag `calendar_connected` (default false) rather than deleting the identity session.
 
-`calendar_connected` is false until this flow completes. Memory and tasks work either way.
+`calendar_connected` is false until a grant exists (bundled sign-in or this flow). Memory and tasks work either way.
+
+Limitation: pending calendar-connect state (state, PKCE verifier, poll token) is **in-memory only** with a short TTL. An API restart drops in-flight connects; the app calls `/v1/google/calendar/start` again. Completed grants are durable.
 
 ### `POST /v1/google/calendar/start`
 

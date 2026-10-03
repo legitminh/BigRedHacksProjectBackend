@@ -144,7 +144,16 @@ function byId(body: StatusResponse, id: string) {
   return row;
 }
 
-test("GET /v1/status reports healthy services when probes succeed", async () => {
+test("GET /v1/status reports config-only for anonymous callers (no live probes)", async () => {
+  let geminiHits = 0;
+  let ollamaHits = 0;
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("generativelanguage.googleapis.com")) geminiHits += 1;
+    if (url.includes("/api/tags")) ollamaHits += 1;
+    return stubFetch({ geminiOk: true, ollamaOk: true })(input, init);
+  }) as typeof fetch;
+
   await withApp(
     async (base) => {
       const response = await fetch(`${base}/v1/status`);
@@ -154,23 +163,29 @@ test("GET /v1/status reports healthy services when probes succeed", async () => 
       assert.equal(typeof body.checked_at, "string");
       assert.equal(body.cache_ttl_seconds, 30);
       assert.equal(byId(body, "gemini").state, "ok");
-      assert.equal(byId(body, "gemini").status, "Connected");
+      assert.equal(byId(body, "gemini").status, "Configured");
       assert.equal(byId(body, "ollama").state, "ok");
+      assert.equal(byId(body, "ollama").status, "Configured");
       assert.equal(byId(body, "chat_provider").state, "ok");
       assert.equal(byId(body, "api").state, "ok");
       assert.equal(byId(body, "google_oauth").state, "ok");
       assert.equal(byId(body, "account").state, "warn");
       assert.equal(byId(body, "google").state, "warn");
       assert.ok(!body.services.some((s) => s.id === "presage"));
+      assert.equal(geminiHits, 0);
+      assert.equal(ollamaHits, 0);
     },
-    { fetchImpl: stubFetch({ geminiOk: true, ollamaOk: true }) },
+    { fetchImpl },
   );
 });
 
-test("GET /v1/status marks Gemini quota and Ollama down", async () => {
+test("GET /v1/status marks Gemini quota and Ollama down when signed in", async () => {
   await withApp(
     async (base) => {
-      const response = await fetch(`${base}/v1/status`);
+      const access = await signIn(base);
+      const response = await fetch(`${base}/v1/status`, {
+        headers: { Authorization: `Bearer ${access}` },
+      });
       assert.equal(response.status, 200);
       const body = (await response.json()) as StatusResponse;
       assert.equal(body.ok, false);
@@ -202,7 +217,7 @@ test("GET /v1/status enriches account + Google when signed in", async () => {
   );
 });
 
-test("GET /v1/status caches Gemini probe within TTL", async () => {
+test("GET /v1/status caches Gemini probe within TTL when signed in", async () => {
   let geminiHits = 0;
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -224,11 +239,15 @@ test("GET /v1/status caches Gemini probe within TTL", async () => {
 
   await withApp(
     async (base) => {
-      const a = await fetch(`${base}/v1/status`);
-      const b = await fetch(`${base}/v1/status`);
+      const access = await signIn(base);
+      const headers = { Authorization: `Bearer ${access}` };
+      const a = await fetch(`${base}/v1/status`, { headers });
+      const b = await fetch(`${base}/v1/status`, { headers });
       assert.equal(a.status, 200);
       assert.equal(b.status, 200);
       assert.equal(geminiHits, 1);
+      const connected = (await a.json()) as StatusResponse;
+      assert.equal(byId(connected, "gemini").status, "Connected");
     },
     { fetchImpl },
   );

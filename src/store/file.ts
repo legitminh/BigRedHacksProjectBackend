@@ -508,6 +508,7 @@ export function openFileStore(path: string): Store {
         if (!user) return;
         user.calendar_connected = connected;
         if (refreshToken) user.google_refresh_token = refreshToken;
+        else if (!connected) user.google_refresh_token = null;
         await write(data);
       });
     },

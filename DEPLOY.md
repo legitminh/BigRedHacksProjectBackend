@@ -133,7 +133,7 @@ https://api.example.com/v1/google/calendar/callback
 
 6. Put client id/secret only in the server `.env` — **never** in the Mac app’s `secrets.toml`.
 
-Login scopes (handled by the API) include identity + Calendar events + Drive readonly.
+Sign-in is one bundled consent (handled by the API): identity (`openid email profile`) + Calendar events + Drive readonly. The calendar connect endpoint re-requests Calendar + Drive for re-connects.
 
 ---
 
@@ -142,6 +142,12 @@ Login scopes (handled by the API) include identity + Calendar events + Drive rea
 Terminate TLS at nginx; proxy to loopback Node:
 
 ```nginx
+# http {} scope: only send "Upgrade" for real WebSocket requests
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ''      close;
+}
+
 server {
   listen 443 ssl http2;
   server_name api.example.com;
@@ -155,11 +161,18 @@ server {
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    # WebSocket upgrade (study companion Live at /v1/companion/live)
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
     # Long Copilot / Ollama generations
     proxy_read_timeout 300s;
+    # Keep idle Live WebSockets from being cut at 60s
+    proxy_send_timeout 300s;
   }
 }
 ```
+
+Without the `Upgrade` / `Connection` headers, `WS /v1/companion/live` fails behind nginx. Caddy upgrades WebSockets automatically.
 
 Caddy equivalent: reverse_proxy to `127.0.0.1:8787` with automatic HTTPS.
 
@@ -193,6 +206,8 @@ Type=simple
 User=waypoint
 WorkingDirectory=/opt/waypoint/BigRedHacksProjectBackend
 Environment=NODE_ENV=production
+# Secrets live in a root-owned file, not in the unit: chmod 600, chown root:root
+EnvironmentFile=/etc/waypoint/api.env
 ExecStart=/usr/bin/node --experimental-strip-types src/index.ts
 Restart=on-failure
 RestartSec=3
@@ -206,6 +221,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now waypoint-api
 sudo systemctl status waypoint-api
 ```
+
+`/etc/waypoint/api.env` uses plain `KEY=value` lines (no `export`, no quotes needed) — same variables as `.env`. The API also reads `.env` from `WorkingDirectory`, but `EnvironmentFile` keeps secrets out of the repo checkout.
+
+**Single process:** pending Google sign-in and calendar-connect polls are in memory. A restart drops in-flight ones (the app just starts again); completed sessions and grants persist. Don't run multiple API instances behind a load balancer.
+
+**Admin cookie:** `wp_admin` gets the `Secure` attribute automatically when `PUBLIC_BASE_URL` is `https://…`.
+
+**Legacy ephemeral token:** `POST /v1/session/ephemeral-token` is disabled (404) unless `ENABLE_EPHEMERAL_TOKEN=1`. Leave it off; the desktop uses `WS /v1/companion/live`.
 
 After **any** code or `.env` change: restart the service (`systemctl restart waypoint-api`).
 

@@ -5,6 +5,8 @@ import type { Config } from "./config.ts";
 export class HttpError extends Error {
   status: number;
   code: string;
+  /** When set, `sendError` adds a `Retry-After` header (429 responses). */
+  retryAfterSeconds?: number;
 
   constructor(status: number, code: string, message: string) {
     super(message);
@@ -38,6 +40,9 @@ export function sendHtml(res: ServerResponse, status: number, html: string): voi
 
 export function sendError(res: ServerResponse, error: unknown): void {
   if (error instanceof HttpError) {
+    if (error.retryAfterSeconds !== undefined) {
+      res.setHeader("Retry-After", String(error.retryAfterSeconds));
+    }
     sendJson(res, error.status, { error: { code: error.code, message: error.message } });
     return;
   }
@@ -77,13 +82,18 @@ export function originAllowed(origin: string, extra: string[]): boolean {
   }
 }
 
-export async function readJson(req: IncomingMessage): Promise<unknown> {
+/** Default JSON body cap (auth, small product writes). */
+export const JSON_BODY_MAX = 16 * 1024;
+/** Chat/companion bodies carry history + calendar/Drive context. */
+export const CHAT_BODY_MAX = 256 * 1024;
+
+export async function readJson(req: IncomingMessage, maxBytes = JSON_BODY_MAX): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
     size += buf.length;
-    if (size > 16 * 1024) {
+    if (size > maxBytes) {
       throw new HttpError(413, "body_too_large", "Request body is too large.");
     }
     chunks.push(buf);

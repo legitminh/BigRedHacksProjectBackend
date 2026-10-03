@@ -15,6 +15,7 @@ import {
   type RawEvent,
 } from "../calendar/classify.ts";
 import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
+import { buildCompanionChatSystem, buildCopilotChatSystem } from "../companion/geminiLive.ts";
 import { createDriveClient, summarizeDriveFiles, type DriveClient } from "../drive/client.ts";
 import { geminiChat } from "../gemini/chat.ts";
 import {
@@ -25,7 +26,7 @@ import {
 } from "../gemini/localChat.ts";
 import type { FetchLike } from "../gemini/ephemeral.ts";
 import { googleConfigured, pendingTtlSeconds, type Config } from "../config.ts";
-import { HttpError, bearerToken, page, readJson, sendEmpty, sendHtml, sendJson } from "../http.ts";
+import { CHAT_BODY_MAX, HttpError, bearerToken, page, readJson, sendEmpty, sendHtml, sendJson } from "../http.ts";
 import type { GoogleClient } from "../auth/google.ts";
 import {
   actualMinutes,
@@ -61,6 +62,22 @@ export type ProductDeps = {
 
 function nowSeconds(now: Date): number {
   return Math.floor(now.getTime() / 1000);
+}
+
+/** Best-effort: revoke the stored Google grant before we drop it. Never throws. */
+async function revokeStoredGoogleGrant(deps: ProductDeps, userId: string): Promise<void> {
+  try {
+    const { refreshToken } = await deps.store.getCalendarConnection(userId);
+    if (!refreshToken) return;
+    await deps.fetch("https://oauth2.googleapis.com/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token: refreshToken }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // Local clear must still succeed if Google is unreachable.
+  }
 }
 
 async function requireUser(deps: ProductDeps, req: IncomingMessage, now: Date): Promise<PublicUser> {
@@ -201,6 +218,7 @@ export async function handleProduct(
   }
   if (method === "POST" && path === "/v1/google/disconnect") {
     const user = await requireUser(deps, req, now);
+    await revokeStoredGoogleGrant(deps, user.id);
     await deps.store.setCalendarGrant(user.id, null, false);
     sendEmpty(res, 204);
     return true;
@@ -223,23 +241,22 @@ export async function handleProduct(
   }
   if (method === "DELETE" && path === "/v1/me/data") {
     const user = await requireUser(deps, req, now);
+    await revokeStoredGoogleGrant(deps, user.id);
     await deps.store.clearUserData(user.id, now);
     sendEmpty(res, 204);
     return true;
   }
   if (method === "POST" && path === "/v1/gemini/chat") {
     const user = await requireUser(deps, req, now);
-    const body = await readJson(req);
+    const body = await readJson(req, CHAT_BODY_MAX);
     if (!body || typeof body !== "object") {
       throw new HttpError(400, "invalid_chat", "Expected a JSON object.");
     }
     const record = body as Record<string, unknown>;
     const message = typeof record.message === "string" ? record.message.trim() : "";
     if (!message) throw new HttpError(400, "invalid_chat", "message is required.");
-    const system =
-      typeof record.system === "string" && record.system.trim()
-        ? record.system
-        : "You are Waypoint, a school navigation coach.";
+    // Server-owned template: safety preamble first; client `system` is capped, untrusted guidance.
+    const system = buildCopilotChatSystem(record.system);
     const historyRaw = Array.isArray(record.history) ? record.history : [];
     const history = historyRaw
       .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
@@ -252,7 +269,8 @@ export async function handleProduct(
               : ("user" as const),
         content: typeof item.content === "string" ? item.content : "",
       }))
-      .filter((item) => item.content.length > 0)
+      // Client-supplied "system" turns would bypass the server-owned template.
+      .filter((item) => item.role !== "system" && item.content.length > 0)
       .slice(-40);
 
     const reply = await chatWithLocalFallback(deps, {
@@ -266,7 +284,7 @@ export async function handleProduct(
   }
   if (method === "POST" && path === "/v1/companion/chat") {
     const user = await requireUser(deps, req, now);
-    const body = await readJson(req);
+    const body = await readJson(req, CHAT_BODY_MAX);
     if (!body || typeof body !== "object") {
       throw new HttpError(400, "invalid_companion", "Expected a JSON object.");
     }
@@ -274,11 +292,12 @@ export async function handleProduct(
     const message = typeof record.message === "string" ? record.message.trim() : "";
     if (!message) throw new HttpError(400, "invalid_companion", "message is required.");
     const history = parseChatHistory(record.history).slice(-40);
-    const contextBlock = formatCompanionContext(record.context);
-    const system =
-      typeof record.system === "string" && record.system.trim()
-        ? record.system.trim()
-        : defaultCompanionSystem(contextBlock);
+    // Server-owned template; any client-supplied `system` is ignored.
+    const system = buildCompanionChatSystem(
+      record.context && typeof record.context === "object"
+        ? (record.context as Record<string, unknown>)
+        : null,
+    );
 
     const reply = await chatWithLocalFallback(deps, {
       system,
@@ -485,47 +504,8 @@ function parseChatHistory(raw: unknown): CompanionTurn[] {
             : ("user" as const),
       content: typeof item.content === "string" ? item.content : "",
     }))
-    .filter((item) => item.content.length > 0);
-}
-
-function formatCompanionContext(raw: unknown): string {
-  if (!raw || typeof raw !== "object") return "No active study context.";
-  const ctx = raw as Record<string, unknown>;
-  const lines: string[] = [];
-  const goals = typeof ctx.goals === "string" ? ctx.goals.trim() : "";
-  if (goals) lines.push(`Mission / material: ${goals}`);
-  const notes = typeof ctx.notes === "string" ? ctx.notes.trim() : "";
-  if (notes) lines.push(`Student notes: ${notes}`);
-  const modality = typeof ctx.modality === "string" ? ctx.modality.trim() : "";
-  if (modality) lines.push(`Modality: ${modality}`);
-  if (typeof ctx.duration_mins === "number" && Number.isFinite(ctx.duration_mins)) {
-    lines.push(`Planned duration: ${Math.round(ctx.duration_mins)} minutes`);
-  }
-  if (typeof ctx.remaining_mins === "number" && Number.isFinite(ctx.remaining_mins)) {
-    lines.push(`Time remaining: about ${Math.max(0, Math.round(ctx.remaining_mins))} minutes`);
-  }
-  if (typeof ctx.next_step_secs === "number" && Number.isFinite(ctx.next_step_secs)) {
-    const secs = Math.max(0, Math.round(ctx.next_step_secs));
-    lines.push(`Next-step timer: ${secs} seconds left`);
-  }
-  if (typeof ctx.paused === "boolean") {
-    lines.push(ctx.paused ? "Session is paused (on a break)." : "Session is active.");
-  }
-  return lines.length ? lines.join("\n") : "No active study context.";
-}
-
-function defaultCompanionSystem(contextBlock: string): string {
-  return [
-    "You are Waypoint Companion — a calm conversational study partner during an active lock-in.",
-    "Talk with the student turn-by-turn: answer questions, quiz gently, unstick them, and keep focus on their current material.",
-    "Keep replies short enough to speak aloud (usually 2–5 sentences). Prefer one clear next step.",
-    "Use the STUDY CONTEXT below; do not invent calendar, Drive, or syllabus facts beyond it.",
-    "Do not ask them to type into a chat box — you are already in a spoken/typed companion loop.",
-    "Format lightly: plain sentences, short lists only when helpful. Avoid long motivational preambles.",
-    "",
-    "STUDY CONTEXT:",
-    contextBlock,
-  ].join("\n");
+    // Client-supplied "system" turns would bypass the server-owned template.
+    .filter((item) => item.role !== "system" && item.content.length > 0);
 }
 
 async function chatWithLocalFallback(

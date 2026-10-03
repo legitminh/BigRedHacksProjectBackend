@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { loadConfig, type Config } from "../src/config.ts";
 import { createApp } from "../src/server.ts";
 import { openFileStore } from "../src/store/file.ts";
+import type { Store } from "../src/store/types.ts";
 
 const SESSION_SECRET = "0123456789abcdef0123456789abcdef";
 const ADMIN_PASSWORD = "AdminTestPassword9xK2mQ";
@@ -23,7 +24,7 @@ function appConfig(extra: Record<string, string> = {}): Config {
 }
 
 async function withApp(
-  fn: (base: string) => Promise<void>,
+  fn: (base: string, store: Store) => Promise<void>,
   options: { config?: Config } = {},
 ): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "waypoint-admin-"));
@@ -35,7 +36,7 @@ async function withApp(
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
   const address = server.address() as AddressInfo;
   try {
-    await fn(`http://127.0.0.1:${address.port}`);
+    await fn(`http://127.0.0.1:${address.port}`, store);
   } finally {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
@@ -136,5 +137,85 @@ test("admin data browse and user detail work after login", async () => {
       { headers: { Cookie: cookie } },
     );
     assert.equal(missing.status, 404);
+  });
+});
+
+async function adminLogin(base: string): Promise<Response> {
+  return fetch(`${base}/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `password=${encodeURIComponent(ADMIN_PASSWORD)}`,
+    redirect: "manual",
+  });
+}
+
+function adminSetCookie(res: Response): string {
+  const list = res.headers.getSetCookie?.() ?? [];
+  return list.find((c) => c.startsWith("wp_admin=")) ?? res.headers.get("set-cookie") ?? "";
+}
+
+test("admin cookie is not Secure on http PUBLIC_BASE_URL", async () => {
+  await withApp(async (base) => {
+    const cookie = adminSetCookie(await adminLogin(base));
+    assert.match(cookie, /HttpOnly/);
+    assert.match(cookie, /SameSite=Strict/);
+    assert.doesNotMatch(cookie, /;\s*Secure/i);
+  });
+});
+
+test("admin login and logout cookies are Secure when PUBLIC_BASE_URL is https", async () => {
+  const config = appConfig({ PUBLIC_BASE_URL: "https://api.example.com" });
+  await withApp(
+    async (base) => {
+      const login = adminSetCookie(await adminLogin(base));
+      assert.match(login, /;\s*Secure/);
+      assert.match(login, /HttpOnly/);
+      assert.match(login, /SameSite=Strict/);
+
+      const logout = await fetch(`${base}/admin/logout`, { method: "POST", redirect: "manual" });
+      assert.equal(logout.status, 303);
+      const cleared = adminSetCookie(logout);
+      assert.match(cleared, /wp_admin=;/);
+      assert.match(cleared, /Max-Age=0/);
+      assert.match(cleared, /;\s*Secure/);
+    },
+    { config },
+  );
+});
+
+test("admin user delete requires a session and removes the user", async () => {
+  await withApp(async (base, store) => {
+    const user = await store.upsertGoogleUser(
+      {
+        sub: "google-sub-delete",
+        email: "delete-me@example.com",
+        emailVerified: true,
+        name: "Delete Me",
+        picture: null,
+        googleRefreshToken: null,
+      },
+      new Date("2026-10-03T12:00:00.000Z"),
+    );
+    const url = `${base}/admin/users/${user.id}/delete`;
+
+    const anon = await fetch(url, { method: "POST", redirect: "manual" });
+    assert.equal(anon.status, 401);
+    assert.ok(await store.getUser(user.id));
+
+    const cookie = adminSetCookie(await adminLogin(base)).split(";")[0];
+    const missing = await fetch(
+      `${base}/admin/users/00000000-0000-4000-8000-000000000000/delete`,
+      { method: "POST", headers: { Cookie: cookie }, redirect: "manual" },
+    );
+    assert.equal(missing.status, 404);
+
+    const deleted = await fetch(url, {
+      method: "POST",
+      headers: { Cookie: cookie },
+      redirect: "manual",
+    });
+    assert.equal(deleted.status, 303);
+    assert.equal(deleted.headers.get("location"), "/admin");
+    assert.equal(await store.getUser(user.id), null);
   });
 });

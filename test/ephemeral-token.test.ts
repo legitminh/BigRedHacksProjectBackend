@@ -21,6 +21,8 @@ function appConfig(extra: Record<string, string> = {}): Config {
     GOOGLE_CLIENT_SECRET: "client-secret",
     SESSION_SECRET,
     PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+    // Legacy route is OFF by default; these tests exercise it explicitly.
+    ENABLE_EPHEMERAL_TOKEN: "1",
     ...extra,
   });
 }
@@ -213,5 +215,31 @@ test("a failed Google token response is 502 and does not leak secrets", async ()
       assert.equal(body.error.message.includes(GEMINI_API_KEY), false);
     },
     { config: appConfig({ GEMINI_API_KEY }), fetchImpl },
+  );
+});
+
+test("ephemeral token route is disabled by default (404, never calls Google)", async () => {
+  let called = false;
+  await withApp(
+    async (base) => {
+      const token = await accessToken(base);
+      for (const headers of [{}, { Authorization: `Bearer ${token}` }]) {
+        const response = await fetch(`${base}/v1/session/ephemeral-token`, {
+          method: "POST",
+          headers,
+        });
+        assert.equal(response.status, 404);
+        const body = (await response.json()) as { error: { code: string } };
+        assert.equal(body.error.code, "ephemeral_token_disabled");
+      }
+      assert.equal(called, false);
+    },
+    {
+      config: appConfig({ GEMINI_API_KEY, ENABLE_EPHEMERAL_TOKEN: "" }),
+      fetchImpl: async () => {
+        called = true;
+        throw new Error("should not call Google");
+      },
+    },
   );
 });

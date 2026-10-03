@@ -117,12 +117,53 @@ async function proxyOllama(
   return { status: res.status, json };
 }
 
-function normalizeGenerateBody(body: unknown): Record<string, unknown> {
+/** Treat `name` and `name:latest` as the same Ollama model. */
+function canonicalModel(name: string): string {
+  const lower = name.trim().toLowerCase();
+  return lower.endsWith(":latest") ? lower.slice(0, -":latest".length) : lower;
+}
+
+/** Models this API host is willing to run: the three configured ones + OLLAMA_ALLOWED_MODELS. */
+export function allowedOllamaModels(config: Config): Set<string> {
+  return new Set(
+    [config.ollamaModel, config.ollamaVisionModel, config.ollamaChatModel, ...config.ollamaAllowedModels]
+      .filter((name) => typeof name === "string" && name.trim().length > 0)
+      .map(canonicalModel),
+  );
+}
+
+/** Upper bounds so a caller cannot pin the GPU with huge contexts / endless generations. */
+const MAX_NUM_PREDICT = 4096;
+
+function normalizeGenerateBody(config: Config, body: unknown): Record<string, unknown> {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "invalid_body", "Generate body must be a JSON object.");
   }
+  const input = body as Record<string, unknown>;
+  const model = input.model;
+  if (typeof model !== "string" || model.trim().length === 0) {
+    throw new HttpError(400, "model_required", "A model is required.");
+  }
+  if (!allowedOllamaModels(config).has(canonicalModel(model))) {
+    // Do not echo the allowlist back — just say it is not served here.
+    throw new HttpError(403, "model_not_allowed", "That model is not available on this server.");
+  }
   // Proxy always returns a single JSON object; streaming NDJSON is not supported.
-  return { ...(body as Record<string, unknown>), stream: false };
+  const out: Record<string, unknown> = { ...input, stream: false };
+  if (input.options !== undefined) {
+    if (input.options === null || typeof input.options !== "object" || Array.isArray(input.options)) {
+      throw new HttpError(400, "invalid_body", "options must be an object.");
+    }
+    const options: Record<string, unknown> = { ...(input.options as Record<string, unknown>) };
+    if (typeof options.num_ctx === "number" && options.num_ctx > config.ollamaChatNumCtx) {
+      options.num_ctx = config.ollamaChatNumCtx;
+    }
+    if (typeof options.num_predict === "number" && options.num_predict > MAX_NUM_PREDICT) {
+      options.num_predict = MAX_NUM_PREDICT;
+    }
+    out.options = options;
+  }
+  return out;
 }
 
 /** Ollama-compatible surface under /v1/coach so the desktop can set base to …/v1/coach */
@@ -176,7 +217,7 @@ export async function handleCoach(
     }
 
     if (method === "POST" && path === "/v1/coach/api/generate") {
-      const body = normalizeGenerateBody(await readCoachJson(req));
+      const body = normalizeGenerateBody(config, await readCoachJson(req));
       const { status, json } = await proxyOllama(
         config,
         fetchImpl,

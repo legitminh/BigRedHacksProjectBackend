@@ -212,6 +212,20 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
   return result;
 }
 
+/** Anonymous Gemini row — reflects configuration only (never calls Google). */
+function configOnlyGemini(config: Config): ProbeResult {
+  return config.geminiApiKey
+    ? { state: "ok", status: "Configured", detail: "Cloud coach configured — sign in for a live check" }
+    : { state: "err", status: "Offline", detail: "GEMINI_API_KEY missing on the API server" };
+}
+
+/** Anonymous Ollama row — reflects configuration only (never calls Ollama). */
+function configOnlyOllama(config: Config): ProbeResult {
+  return config.ollamaBaseUrl
+    ? { state: "ok", status: "Configured", detail: "Lock-in coach configured — sign in for a live check" }
+    : { state: "err", status: "Offline", detail: "OLLAMA_BASE_URL unset — lock-in coach disabled" };
+}
+
 function apiIndicator(store: Store): ServiceIndicator {
   return {
     id: "api",
@@ -349,17 +363,22 @@ function chatProviderIndicator(
 
 /**
  * Aggregate live service health for the desktop Connection status panel.
- * Gemini + Ollama probes are TTL-cached; user-scoped rows use the JWT when present.
+ * Gemini + Ollama probes are TTL-cached and only run for signed-in users; anonymous
+ * callers see config-only rows. User-scoped rows use the JWT when present.
  */
 export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse> {
   const nowFn = deps.now ?? (() => new Date());
   const now = nowFn();
   const nowMs = now.getTime();
 
-  const [gemini, ollama] = await Promise.all([
-    probeGemini(deps.config, deps.fetch, nowMs),
-    probeOllama(deps.config, deps.fetch, nowMs),
-  ]);
+  // Anonymous callers get config-only answers: no outbound Gemini/Ollama probes, so an
+  // unauthenticated client cannot burn Gemini quota or make the API host fan out requests.
+  const [gemini, ollama] = deps.user
+    ? await Promise.all([
+        probeGemini(deps.config, deps.fetch, nowMs),
+        probeOllama(deps.config, deps.fetch, nowMs),
+      ])
+    : [configOnlyGemini(deps.config), configOnlyOllama(deps.config)];
 
   const services: ServiceIndicator[] = [
     {

@@ -54,6 +54,21 @@ export type Config = {
   ollamaChatNumCtx: number;
   /** Shared secret for the local HTML admin console at /admin. */
   adminPassword: string | null;
+  /**
+   * Legacy: expose `POST /v1/session/ephemeral-token` (client-side Gemini Live).
+   * Default OFF — the desktop uses the server-side Live proxy (`/v1/companion/live`).
+   * Set ENABLE_EPHEMERAL_TOKEN=1 only for older/other clients.
+   */
+  ephemeralTokenEnabled: boolean;
+  /** NODE_ENV=production — hardens defaults (e.g. email auth requires real SMTP). */
+  production: boolean;
+  /**
+   * Trust X-Forwarded-For (rightmost hop) for per-IP rate limits. Enable ONLY behind
+   * a reverse proxy you control; otherwise clients could spoof their address.
+   */
+  trustProxy: boolean;
+  /** Extra Ollama models /v1/coach/api/generate may use (on top of the three configured above). */
+  ollamaAllowedModels: string[];
 };
 
 const PENDING_TTL_SECONDS = 600;
@@ -110,6 +125,12 @@ function optionalPort(value: string | undefined): number | null {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
+}
+
+/** Parse a boolean env flag. Only 1/true/yes/on enable; anything else is off. */
+export function parseEnvFlag(value: string | undefined): boolean {
+  const raw = (value ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 }
 
 /** Parse LOCAL_CHAT_PROVIDER — aliases map onto ollama vs gemini. */
@@ -177,7 +198,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ollamaChatModel: nonempty(env.OLLAMA_CHAT_MODEL) ?? "qwen2.5:7b",
     ollamaChatNumCtx: positiveInt(env.OLLAMA_CHAT_NUM_CTX, 16384),
     adminPassword: nonempty(env.ADMIN_PASSWORD),
+    ephemeralTokenEnabled: parseEnvFlag(env.ENABLE_EPHEMERAL_TOKEN),
+    production: (env.NODE_ENV ?? "").trim().toLowerCase() === "production",
+    trustProxy: parseEnvFlag(env.TRUST_PROXY),
+    ollamaAllowedModels: (env.OLLAMA_ALLOWED_MODELS ?? "")
+      .split(",")
+      .map((model) => model.trim())
+      .filter((model) => model.length > 0),
   };
+}
+
+export function smtpConfigured(config: Config): boolean {
+  return Boolean(
+    config.smtpHost && config.smtpPort !== null && config.smtpUser && config.smtpPass && config.mailFrom,
+  );
 }
 
 export function googleConfigured(config: Config): boolean {

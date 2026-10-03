@@ -22,7 +22,7 @@ A TypeScript HTTP server the desktop app can call.
 
 The Google client secret never ships in the desktop binary. Google refresh tokens, if Google returns one, stay on the server and are not sent to the client.
 
-Identity scopes only: `openid`, `email`, `profile`. Calendar and Drive stay on the existing in-app OAuth until a later slice brokers them with the stored Google refresh token.
+Sign-in uses one bundled consent: identity (`openid`, `email`, `profile`) plus `calendar.events` and `drive.readonly`. The server stores the Google refresh token and brokers Calendar/Drive; the app never holds Google data tokens.
 
 ## Stack
 
@@ -77,7 +77,7 @@ The authorization URL includes:
 - `response_type=code`
 - `code_challenge` / `code_challenge_method=S256` (PKCE; the verifier stays on the server)
 - `state`
-- `scope=openid email profile`
+- `scope=openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly`
 - `access_type=offline` and `prompt=consent` so Google can return a refresh token for a later Calendar/Drive slice
 - `redirect_uri` equal to `{PUBLIC_BASE_URL}/v1/auth/google/callback`
 
@@ -150,7 +150,7 @@ Refresh tokens are 32 random bytes, base64url. Only their SHA-256 hashes are sto
 
 ## Data
 
-Pending logins (state, PKCE verifier, poll token, status) live in process memory with a 10-minute TTL. One API process is assumed. A restart drops in-flight browser logins; the app starts again.
+Pending logins (state, PKCE verifier, poll token, status) live in process memory with a 10-minute TTL. One API process is assumed. Calendar-connect pending state (`CalendarConnects`) is likewise memory-only. A restart drops in-flight browser logins and calendar connects; the app starts again.
 
 Users and refresh tokens are durable.
 
@@ -214,7 +214,7 @@ README.md                 frontend integration
 `npm test` with `node:test`. Google’s token and userinfo URLs are injected so tests never call Google.
 
 - Start refuses to run without Google credentials and without a long enough session secret.
-- Start URL contains PKCE, state, and the identity scopes.
+- Start URL contains PKCE, state, and the bundled identity + Calendar + Drive scopes.
 - Callback with a bad state returns an error page and does not complete the poll.
 - A mocked code exchange plus userinfo completes the poll once and creates the user.
 - A second poll of the same token is not found.
@@ -240,7 +240,7 @@ Documented in `README.md` with curl and a Rust sketch. The app changes are not p
 Product contract: `specs.md`. These are on `main`:
 
 1. Email code login and SMTP, with the same Waypoint token format as Google.
-2. `POST /v1/session/ephemeral-token` so the app does not embed `GEMINI_API_KEY`.
+2. `POST /v1/session/ephemeral-token` so the app does not embed `GEMINI_API_KEY`. **Legacy:** superseded by the server-side Live proxy (`WS /v1/companion/live`); off by default, enable with `ENABLE_EPHEMERAL_TOKEN=1`.
 3. Memory profile: `GET` / `PUT /v1/memory`, pace samples, and one-step proficiency.
 4. Tasks (`advise`, `pair`, `ask`) and `POST /v1/sessions` for the lock-in recap.
 5. Incremental Calendar consent, agenda classification, and create/update/delete only for events Waypoint created.

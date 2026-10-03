@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import type { PublicUser } from "../store/types.ts";
@@ -16,7 +16,7 @@ export type CompletedLogin = {
   user: PublicUser;
 };
 
-type PendingStatus = "pending" | "complete" | "error";
+type PendingStatus = "pending" | "exchanging" | "complete" | "error";
 
 type Pending = {
   state: string;
@@ -69,18 +69,20 @@ export class PendingLogins {
       return { ok: false, reason: "expired" };
     }
     if (pending.status !== "pending") return { ok: false, reason: "used" };
+    // Single-flight: first claimer wins; replays/concurrent callbacks see "used".
+    pending.status = "exchanging";
     return { ok: true, pending };
   }
 
   complete(pending: Pending, result: CompletedLogin): void {
-    if (pending.status !== "pending") return;
+    if (pending.status !== "pending" && pending.status !== "exchanging") return;
     pending.status = "complete";
     pending.result = result;
     this.save();
   }
 
   fail(pending: Pending, error: PollError): void {
-    if (pending.status !== "pending") return;
+    if (pending.status !== "pending" && pending.status !== "exchanging") return;
     pending.status = "error";
     pending.error = error;
     this.save();
@@ -93,7 +95,7 @@ export class PendingLogins {
       this.remove(pending);
       return { type: "expired" };
     }
-    if (pending.status === "pending") {
+    if (pending.status === "pending" || pending.status === "exchanging") {
       return {
         type: "pending",
         expiresIn: Math.max(0, Math.ceil((pending.expiresAt - now) / 1000)),
@@ -127,6 +129,9 @@ export class PendingLogins {
       for (const pending of parsed.pendings ?? []) {
         if (!pending?.state || !pending.pollToken) continue;
         if (now >= pending.expiresAt) continue;
+        // Completed results (tokens) are memory-only; exchanging flows cannot resume.
+        if (pending.status !== "pending" && pending.status !== "error") continue;
+        delete pending.result;
         this.byState.set(pending.state, pending);
         this.byPoll.set(pending.pollToken, pending);
       }
@@ -138,12 +143,16 @@ export class PendingLogins {
   private save(): void {
     if (!this.persistPath) return;
     try {
-      mkdirSync(dirname(this.persistPath), { recursive: true });
+      mkdirSync(dirname(this.persistPath), { recursive: true, mode: 0o700 });
+      // Never write access/refresh tokens: only in-flight (pending) and error rows, no `result`.
       const body: FileShape = {
-        pendings: [...this.byPoll.values()],
+        pendings: [...this.byPoll.values()]
+          .filter((p) => p.status === "pending" || p.status === "error")
+          .map(({ result: _result, ...rest }) => rest),
       };
       const tmp = `${this.persistPath}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify(body));
+      writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
+      chmodSync(tmp, 0o600);
       renameSync(tmp, this.persistPath);
     } catch (error) {
       console.error("Failed to persist pending Google logins:", error);
