@@ -12,6 +12,7 @@ import type {
   TaskRecord,
 } from "../product/model.ts";
 import type {
+  AdminOverview,
   EmailLoginCode,
   GoogleProfile,
   PublicUser,
@@ -257,6 +258,32 @@ export function openFileStore(path: string): Store {
         await write(data);
       });
     },
+    async adminOverview(): Promise<AdminOverview> {
+      return lock(async () => {
+        const data = await read();
+        const nowMs = Date.now();
+        const users = [...data.users]
+          .sort((a, b) => Date.parse(b.last_login_at) - Date.parse(a.last_login_at))
+          .slice(0, 50)
+          .map((u) => ({
+            id: u.id,
+            email: u.email,
+            name: u.name,
+            created_at: u.created_at ?? null,
+            last_login_at: u.last_login_at ?? null,
+          }));
+        return {
+          storage: "file",
+          userCount: data.users.length,
+          sessionCount: data.sessions.length,
+          taskCount: data.tasks.length,
+          activeRefreshTokens: data.refreshTokens.filter(
+            (t) => !t.revokedAt && Date.parse(t.expiresAt) > nowMs,
+          ).length,
+          users,
+        };
+      });
+    },
     async getUser(id) {
       return lock(async () => {
         const data = await read();
@@ -402,6 +429,26 @@ export function openFileStore(path: string): Store {
           .filter((session) => session.userId === userId)
           .map(({ userId: _userId, ...session }) => session)
           .sort((a, b) => Date.parse(b.ended_at) - Date.parse(a.ended_at));
+      });
+    },
+    async clearUserData(userId, now) {
+      await lock(async () => {
+        const data = await read();
+        data.profiles = data.profiles.filter((item) => item.userId !== userId);
+        data.proficiencies = data.proficiencies.filter((item) => item.userId !== userId);
+        data.paceSamples = data.paceSamples.filter((item) => item.userId !== userId);
+        data.tasks = data.tasks.filter((item) => item.userId !== userId);
+        data.sessions = data.sessions.filter((item) => item.userId !== userId);
+        const user = data.users.find((item) => item.id === userId);
+        if (user) {
+          user.google_refresh_token = null;
+          user.calendar_connected = false;
+        }
+        const revokedAt = now.toISOString();
+        for (const token of data.refreshTokens) {
+          if (token.userId === userId && !token.revokedAt) token.revokedAt = revokedAt;
+        }
+        await write(data);
       });
     },
     async close() {},

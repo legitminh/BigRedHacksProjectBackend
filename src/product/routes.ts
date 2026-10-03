@@ -15,6 +15,9 @@ import {
   type RawEvent,
 } from "../calendar/classify.ts";
 import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
+import { createDriveClient, summarizeDriveFiles, type DriveClient } from "../drive/client.ts";
+import { geminiChat } from "../gemini/chat.ts";
+import type { FetchLike } from "../gemini/ephemeral.ts";
 import { googleConfigured, pendingTtlSeconds, type Config } from "../config.ts";
 import { HttpError, bearerToken, page, readJson, sendEmpty, sendHtml, sendJson } from "../http.ts";
 import type { GoogleClient } from "../auth/google.ts";
@@ -27,6 +30,7 @@ import {
   parsePaceInput,
   parseProficiencyList,
   parseSession,
+  parseStudyMemory,
   parseTaskCreate,
   parseTaskPatch,
   stepProficiency,
@@ -34,13 +38,19 @@ import {
 } from "./model.ts";
 import type { PublicUser, Store } from "../store/types.ts";
 
+/** Calendar write + Drive read for Copilot (second consent after Waypoint Google sign-in). */
+const GOOGLE_DATA_SCOPES =
+  "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly";
+
 export type ProductDeps = {
   config: Config;
   store: Store;
   google: GoogleClient;
   calendar: CalendarClient;
+  drive: DriveClient;
   calendarConnects: CalendarConnects;
   now: () => Date;
+  fetch: FetchLike;
 };
 
 function nowSeconds(now: Date): number {
@@ -65,12 +75,23 @@ function isProductPath(path: string): boolean {
     path === "/v1/memory" ||
     path === "/v1/memory/pace" ||
     path === "/v1/memory/proficiency" ||
+    path === "/v1/study-memory" ||
     path === "/v1/google/calendar/start" ||
     path === "/v1/google/calendar/callback" ||
     path === "/v1/google/calendar/poll" ||
+    path === "/v1/google/connect/start" ||
+    path === "/v1/google/connect/callback" ||
+    path === "/v1/google/connect/poll" ||
+    path === "/v1/google/status" ||
+    path === "/v1/google/disconnect" ||
     path === "/v1/calendar/agenda" ||
+    path === "/v1/calendar/summary" ||
     path === "/v1/calendar/events" ||
     path.startsWith("/v1/calendar/events/") ||
+    path === "/v1/drive/recent" ||
+    path === "/v1/drive/search" ||
+    path === "/v1/gemini/chat" ||
+    path === "/v1/me/data" ||
     path === "/v1/tasks" ||
     path === "/v1/tasks/active" ||
     path.startsWith("/v1/tasks/") ||
@@ -140,16 +161,149 @@ export async function handleProduct(
     return true;
   }
 
-  if (method === "POST" && path === "/v1/google/calendar/start") {
+  if (
+    (method === "POST" && path === "/v1/google/calendar/start") ||
+    (method === "POST" && path === "/v1/google/connect/start")
+  ) {
     await startCalendar(req, res, deps, now);
     return true;
   }
-  if (method === "GET" && path === "/v1/google/calendar/callback") {
+  if (
+    (method === "GET" && path === "/v1/google/calendar/callback") ||
+    (method === "GET" && path === "/v1/google/connect/callback")
+  ) {
     await calendarCallback(url, res, deps, now);
     return true;
   }
-  if (method === "GET" && path === "/v1/google/calendar/poll") {
+  if (
+    (method === "GET" && path === "/v1/google/calendar/poll") ||
+    (method === "GET" && path === "/v1/google/connect/poll")
+  ) {
     pollCalendar(url, res, deps, now);
+    return true;
+  }
+  if (method === "GET" && path === "/v1/google/status") {
+    const user = await requireUser(deps, req, now);
+    const connection = await deps.store.getCalendarConnection(user.id);
+    sendJson(res, 200, {
+      google_connected: connection.connected,
+      calendar_connected: connection.connected,
+      drive_connected: connection.connected,
+    });
+    return true;
+  }
+  if (method === "POST" && path === "/v1/google/disconnect") {
+    const user = await requireUser(deps, req, now);
+    await deps.store.setCalendarGrant(user.id, null, false);
+    sendEmpty(res, 204);
+    return true;
+  }
+  if (method === "GET" && path === "/v1/study-memory") {
+    const user = await requireUser(deps, req, now);
+    const profile = await deps.store.getProfile(user.id);
+    sendJson(res, 200, { study_memory: profile?.study_memory ?? null });
+    return true;
+  }
+  if (method === "PUT" && path === "/v1/study-memory") {
+    const user = await requireUser(deps, req, now);
+    const body = await readJson(req);
+    const blob = parseStudyMemory(body, now);
+    const current = await deps.store.getProfile(user.id);
+    const next = applyMemoryPut(current, { study_memory: blob }, now);
+    await deps.store.saveProfile(user.id, next);
+    sendJson(res, 200, { study_memory: blob });
+    return true;
+  }
+  if (method === "DELETE" && path === "/v1/me/data") {
+    const user = await requireUser(deps, req, now);
+    await deps.store.clearUserData(user.id, now);
+    sendEmpty(res, 204);
+    return true;
+  }
+  if (method === "POST" && path === "/v1/gemini/chat") {
+    const user = await requireUser(deps, req, now);
+    if (!deps.config.geminiApiKey) {
+      throw new HttpError(503, "gemini_not_configured", "Set GEMINI_API_KEY in .env.");
+    }
+    const body = await readJson(req);
+    if (!body || typeof body !== "object") {
+      throw new HttpError(400, "invalid_chat", "Expected a JSON object.");
+    }
+    const record = body as Record<string, unknown>;
+    const message = typeof record.message === "string" ? record.message.trim() : "";
+    if (!message) throw new HttpError(400, "invalid_chat", "message is required.");
+    const system =
+      typeof record.system === "string" && record.system.trim()
+        ? record.system
+        : "You are Waypoint, a school navigation coach.";
+    const historyRaw = Array.isArray(record.history) ? record.history : [];
+    const history = historyRaw
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+      .map((item) => ({
+        role:
+          item.role === "assistant" || item.role === "model"
+            ? ("assistant" as const)
+            : item.role === "system"
+              ? ("system" as const)
+              : ("user" as const),
+        content: typeof item.content === "string" ? item.content : "",
+      }))
+      .filter((item) => item.content.length > 0)
+      .slice(-40);
+    const reply = await geminiChat({
+      apiKey: deps.config.geminiApiKey,
+      model: deps.config.geminiModel,
+      system,
+      history,
+      message,
+      fetchImpl: deps.fetch,
+    });
+    sendJson(res, 200, { role: "assistant", content: reply, user_id: user.id });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/drive/recent") {
+    const user = await requireUser(deps, req, now);
+    const access = await googleAccess(deps, user.id);
+    const limit = clampInt(url.searchParams.get("limit"), 6, 1, 20);
+    const files = await deps.drive.listRecent(access, limit);
+    sendJson(res, 200, {
+      files,
+      summary: summarizeDriveFiles(files, "Recently modified Drive files (partial listing):"),
+    });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/drive/search") {
+    const user = await requireUser(deps, req, now);
+    const access = await googleAccess(deps, user.id);
+    const q = url.searchParams.get("q") ?? "";
+    const limit = clampInt(url.searchParams.get("limit"), 5, 1, 20);
+    const files = await deps.drive.search(access, q, limit);
+    sendJson(res, 200, {
+      files,
+      summary: summarizeDriveFiles(files, `Drive search for “${q.trim() || "…"}”:`),
+    });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/calendar/summary") {
+    const user = await requireUser(deps, req, now);
+    const days = windowDays(url.searchParams.get("days"));
+    const access = await googleAccess(deps, user.id);
+    const timeMin = now.toISOString();
+    const timeMax = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+    const events = await deps.calendar.listEvents(access, timeMin, timeMax);
+    const lines = events.slice(0, 12).map((event) => {
+      const summary = event.summary ?? "(untitled)";
+      const start =
+        event.start?.dateTime ?? event.start?.date ?? "?";
+      return `- ${start}: ${summary}`;
+    });
+    sendJson(res, 200, {
+      summary:
+        lines.length === 0
+          ? `No upcoming calendar events in the next ${days} days.`
+          : `Upcoming calendar:\n${lines.join("\n")}`,
+      count: events.length,
+    });
     return true;
   }
   if (method === "GET" && path === "/v1/calendar/agenda") {
@@ -285,7 +439,15 @@ async function memoryCard(store: Store, userId: string) {
     pace: paceCards(samples),
     interaction: profile.interaction,
     updated_at: profile.updated_at,
+    study_memory: profile.study_memory ?? null,
   };
+}
+
+function clampInt(value: string | null, fallback: number, min: number, max: number): number {
+  if (value === null || value === "") return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
 }
 
 async function startCalendar(req: IncomingMessage, res: ServerResponse, deps: ProductDeps, now: Date) {
@@ -311,7 +473,7 @@ async function startCalendar(req: IncomingMessage, res: ServerResponse, deps: Pr
       redirectUri: deps.config.calendarRedirectUri,
       state,
       codeVerifier,
-      scopes: "https://www.googleapis.com/auth/calendar.events",
+      scopes: GOOGLE_DATA_SCOPES,
     }),
     state,
     poll_token: pollToken,
@@ -347,11 +509,15 @@ async function calendarCallback(url: URL, res: ServerResponse, deps: ProductDeps
     }
     await deps.store.setCalendarGrant(claim.pending.userId, tokens.refreshToken, true);
     deps.calendarConnects.complete(claim.pending);
-    sendHtml(res, 200, page("Calendar connected", "You can close this tab and return to Waypoint."));
+    sendHtml(
+      res,
+      200,
+      page("Google connected", "Calendar and Drive are linked. You can close this tab and return to Waypoint."),
+    );
   } catch (error) {
-    deps.calendarConnects.fail(claim.pending, { code: "google_exchange_failed", message: "Calendar connection failed." });
+    deps.calendarConnects.fail(claim.pending, { code: "google_exchange_failed", message: "Google connection failed." });
     if (!(error instanceof GoogleExchangeError) && !(error instanceof HttpError)) console.error(error);
-    sendHtml(res, 502, page("Calendar not connected", "Waypoint could not finish Calendar access. Return to the app and try again."));
+    sendHtml(res, 502, page("Google not connected", "Waypoint could not finish Google access. Return to the app and try again."));
   }
 }
 
@@ -369,7 +535,12 @@ function pollCalendar(url: URL, res: ServerResponse, deps: ProductDeps, now: Dat
     sendJson(res, 200, { status: "error", error: result.error });
     return;
   }
-  sendJson(res, 200, { status: "complete", calendar_connected: true });
+  sendJson(res, 200, {
+    status: "complete",
+    calendar_connected: true,
+    google_connected: true,
+    drive_connected: true,
+  });
 }
 
 async function googleAccess(deps: ProductDeps, userId: string): Promise<string> {
@@ -471,6 +642,10 @@ function present(event: RawEvent, kind: "deadline" | "study_block") {
 
 export function defaultCalendar(fetchImpl: typeof fetch): CalendarClient {
   return createCalendarClient(fetchImpl);
+}
+
+export function defaultDrive(fetchImpl: typeof fetch): DriveClient {
+  return createDriveClient(fetchImpl);
 }
 
 export type { Level };

@@ -14,9 +14,11 @@ import {
   type PaceSample,
   type SessionRecap,
   type StoredProfile,
+  type StudyMemoryBlob,
   type TaskRecord,
 } from "../product/model.ts";
 import type {
+  AdminOverview,
   EmailLoginCode,
   GoogleProfile,
   PublicUser,
@@ -49,8 +51,23 @@ function isUniqueViolation(error: unknown): boolean {
 
 const userReturning = `RETURNING id, email, email_verified, name, picture`;
 
+function postgresPoolConfig(databaseUrl: string): ConstructorParameters<typeof Pool>[0] {
+  // pg treats sslmode=require as verify-full and ignores a separate ssl object.
+  // Strip sslmode from the URL and pass explicit TLS for managed Tiger/Timescale.
+  const wantsSsl = /[?&]sslmode=/i.test(databaseUrl);
+  const connectionString = databaseUrl
+    .replace(/([?&])sslmode=[^&]*/i, "$1")
+    .replace(/[?&]$/, "")
+    .replace(/\?&/, "?")
+    .replace(/&&+/g, "&");
+  return {
+    connectionString,
+    ...(wantsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+  };
+}
+
 export async function openPostgres(databaseUrl: string): Promise<Store> {
-  const pool = new Pool({ connectionString: databaseUrl });
+  const pool = new Pool(postgresPoolConfig(databaseUrl));
   const schemaPath = join(dirname(fileURLToPath(import.meta.url)), "../db/schema.sql");
   const schema = readFileSync(schemaPath, "utf8");
   for (const statement of schema
@@ -340,6 +357,50 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         [userId, now.toISOString()],
       );
     },
+    async adminOverview(): Promise<AdminOverview> {
+      const [counts, users] = await Promise.all([
+        pool.query<{
+          users: string;
+          sessions: string;
+          tasks: string;
+          tokens: string;
+        }>(
+          `SELECT
+             (SELECT COUNT(*)::text FROM users) AS users,
+             (SELECT COUNT(*)::text FROM session_recaps) AS sessions,
+             (SELECT COUNT(*)::text FROM tasks) AS tasks,
+             (SELECT COUNT(*)::text FROM refresh_tokens
+               WHERE revoked_at IS NULL AND expires_at > NOW()) AS tokens`,
+        ),
+        pool.query<{
+          id: string;
+          email: string | null;
+          name: string | null;
+          created_at: Date;
+          last_login_at: Date;
+        }>(
+          `SELECT id, email, name, created_at, last_login_at
+           FROM users
+           ORDER BY last_login_at DESC
+           LIMIT 50`,
+        ),
+      ]);
+      const row = counts.rows[0];
+      return {
+        storage: "postgres",
+        userCount: Number(row?.users ?? 0),
+        sessionCount: Number(row?.sessions ?? 0),
+        taskCount: Number(row?.tasks ?? 0),
+        activeRefreshTokens: Number(row?.tokens ?? 0),
+        users: users.rows.map((u) => ({
+          id: u.id,
+          email: u.email,
+          name: u.name,
+          created_at: new Date(u.created_at).toISOString(),
+          last_login_at: new Date(u.last_login_at).toISOString(),
+        })),
+      };
+    },
     async getUser(id) {
       const result = await pool.query<UserRow>(
         `SELECT id, email, email_verified, name, picture FROM users WHERE id = $1`,
@@ -354,9 +415,11 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         long_term_goals: unknown;
         priorities: unknown;
         interaction: unknown;
+        study_memory: unknown;
         updated_at: Date;
       }>(
-        `SELECT interests, long_term_goals, priorities, interaction, updated_at FROM user_profiles WHERE user_id = $1`,
+        `SELECT interests, long_term_goals, priorities, interaction, study_memory, updated_at
+         FROM user_profiles WHERE user_id = $1`,
         [userId],
       );
       const row = result.rows[0];
@@ -366,18 +429,20 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         long_term_goals: asStrings(row.long_term_goals),
         priorities: asStrings(row.priorities),
         interaction: asInteraction(row.interaction),
+        study_memory: asStudyMemory(row.study_memory),
         updated_at: new Date(row.updated_at).toISOString(),
       };
     },
     async saveProfile(userId, profile: StoredProfile) {
       await pool.query(
-        `INSERT INTO user_profiles (user_id, interests, long_term_goals, priorities, interaction, updated_at)
-         VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6)
+        `INSERT INTO user_profiles (user_id, interests, long_term_goals, priorities, interaction, study_memory, updated_at)
+         VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7)
          ON CONFLICT (user_id) DO UPDATE SET
            interests = EXCLUDED.interests,
            long_term_goals = EXCLUDED.long_term_goals,
            priorities = EXCLUDED.priorities,
            interaction = EXCLUDED.interaction,
+           study_memory = EXCLUDED.study_memory,
            updated_at = EXCLUDED.updated_at`,
         [
           userId,
@@ -385,6 +450,7 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           JSON.stringify(profile.long_term_goals),
           JSON.stringify(profile.priorities),
           JSON.stringify(profile.interaction),
+          profile.study_memory ? JSON.stringify(profile.study_memory) : null,
           profile.updated_at,
         ],
       );
@@ -584,6 +650,31 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         note: row.note,
       }));
     },
+    async clearUserData(userId, now) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(`DELETE FROM session_recaps WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM tasks WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM pace_samples WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM proficiencies WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM user_profiles WHERE user_id = $1`, [userId]);
+        await client.query(
+          `UPDATE users SET google_refresh_token = NULL, calendar_connected = FALSE WHERE id = $1`,
+          [userId],
+        );
+        await client.query(
+          `UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, $2) WHERE user_id = $1`,
+          [userId, now.toISOString()],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
     async close() {
       await pool.end();
     },
@@ -624,4 +715,17 @@ function asStrings(value: unknown): string[] {
 function asInteraction(value: unknown): Interaction {
   if (!value || typeof value !== "object") return { ...DEFAULT_INTERACTION };
   return { ...DEFAULT_INTERACTION, ...(value as Partial<Interaction>) };
+}
+
+function asStudyMemory(value: unknown): StudyMemoryBlob | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as { narrative?: unknown; stats?: unknown; updated_at?: unknown };
+  return {
+    narrative: typeof row.narrative === "string" ? row.narrative : "",
+    stats:
+      row.stats && typeof row.stats === "object" && !Array.isArray(row.stats)
+        ? (row.stats as Record<string, unknown>)
+        : {},
+    updated_at: typeof row.updated_at === "string" ? row.updated_at : new Date(0).toISOString(),
+  };
 }

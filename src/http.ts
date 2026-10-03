@@ -53,7 +53,7 @@ export function applyCors(req: IncomingMessage, res: ServerResponse, config: Con
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
 }
 
 /** Tauri webview + local Vite origins are always allowed; extras come from WAYPOINT_CORS_ORIGINS. */

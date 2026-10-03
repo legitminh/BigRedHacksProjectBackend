@@ -48,8 +48,26 @@ export type EmailLoginCode = {
   createdAt: string;
 };
 
+export type AdminUserRow = {
+  id: string;
+  email: string | null;
+  name: string | null;
+  created_at: string | null;
+  last_login_at: string | null;
+};
+
+export type AdminOverview = {
+  storage: "file" | "postgres";
+  userCount: number;
+  sessionCount: number;
+  taskCount: number;
+  activeRefreshTokens: number;
+  users: AdminUserRow[];
+};
+
 export type Store = {
   kind: "file" | "postgres";
+  adminOverview(): Promise<AdminOverview>;
   upsertGoogleUser(profile: GoogleProfile, now: Date): Promise<PublicUser>;
   findOrCreateUserByEmail(email: string, now: Date): Promise<PublicUser>;
   replaceEmailLoginCode(code: EmailLoginCode): Promise<void>;
@@ -78,5 +96,7 @@ export type Store = {
   saveTask(userId: string, task: TaskRecord): Promise<void>;
   insertSession(userId: string, session: SessionRecap): Promise<SessionRecap>;
   listSessions(userId: string): Promise<SessionRecap[]>;
+  /** Wipe synced product data for a user (memory, sessions, tasks, Google grant). */
+  clearUserData(userId: string, now: Date): Promise<void>;
   close(): Promise<void>;
 };

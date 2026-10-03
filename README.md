@@ -1,6 +1,6 @@
 # Waypoint API
 
-Account server for the Waypoint desktop app. People sign in with Google or a one-time email code. The Google client secret and the Gemini key stay here. The app receives a Waypoint access token and uses it for memory, tasks, calendar writes, and the lock-in recap.
+Account server for the Waypoint desktop app. **Desktop login is Google OAuth only** — Google identity is upserted to a Waypoint `user.id`, then the app stores a JWT. A one-time email code path remains for API/dev tests only (not exposed in the desktop UI). The Google client secret and the Gemini key stay here. The app uses its Waypoint access token for memory, tasks, calendar/Drive, and Copilot chat.
 
 ## Run
 

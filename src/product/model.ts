@@ -39,6 +39,13 @@ export type MemoryCard = {
   pace: PaceCard[];
   interaction: Interaction;
   updated_at: string | null;
+  study_memory: StudyMemoryBlob | null;
+};
+
+export type StudyMemoryBlob = {
+  narrative: string;
+  stats: Record<string, unknown>;
+  updated_at: string;
 };
 
 export type StoredProfile = {
@@ -47,6 +54,8 @@ export type StoredProfile = {
   priorities: string[];
   interaction: Interaction;
   updated_at: string;
+  /** Lock-in consolidated notes + rolling stats (synced across devices). */
+  study_memory?: StudyMemoryBlob | null;
 };
 
 export type PaceSample = {
@@ -120,6 +129,24 @@ export function emptyMemory(): MemoryCard {
     pace: [],
     interaction: { ...DEFAULT_INTERACTION },
     updated_at: null,
+    study_memory: null,
+  };
+}
+
+export function parseStudyMemory(body: unknown, now: Date): StudyMemoryBlob {
+  if (!isRecord(body)) throw new HttpError(400, "invalid_study_memory", "Expected a JSON object.");
+  const narrative = typeof body.narrative === "string" ? body.narrative.trim() : "";
+  if (narrative.length > 4000) {
+    throw new HttpError(400, "invalid_study_memory", "narrative is too long.");
+  }
+  const stats =
+    body.stats && typeof body.stats === "object" && !Array.isArray(body.stats)
+      ? (body.stats as Record<string, unknown>)
+      : {};
+  return {
+    narrative,
+    stats,
+    updated_at: now.toISOString(),
   };
 }
 
@@ -172,12 +199,17 @@ export function applyMemoryPut(
     priorities: base.priorities,
     interaction: { ...base.interaction },
     updated_at: now.toISOString(),
+    study_memory: base.study_memory ?? null,
   };
   if ("interests" in body) next.interests = stringList(body.interests, 12);
   if ("long_term_goals" in body) next.long_term_goals = stringList(body.long_term_goals, 8);
   if ("priorities" in body) next.priorities = stringList(body.priorities, 8);
   if ("proficiencies" in body) parseProficiencyList(body.proficiencies);
   if ("interaction" in body) next.interaction = parseInteraction(body.interaction, next.interaction);
+  if ("study_memory" in body) {
+    next.study_memory =
+      body.study_memory === null ? null : parseStudyMemory(body.study_memory, now);
+  }
   return next;
 }
 

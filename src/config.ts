@@ -26,6 +26,8 @@ export type Config = {
   coachApiToken: string | null;
   ollamaModel: string;
   ollamaVisionModel: string;
+  /** Shared secret for the local HTML admin console at /admin. */
+  adminPassword: string | null;
 };
 
 const PENDING_TTL_SECONDS = 600;
@@ -55,7 +57,12 @@ export function loadEnvFile(path = resolve(".env")): void {
     ) {
       value = value.slice(1, -1);
     }
-    if (process.env[key] === undefined) process.env[key] = value;
+    // Treat blank process.env values as unset so .env can fill them
+    // (shells/CI often export DATABASE_URL=).
+    const existing = process.env[key];
+    if (existing === undefined || existing.trim() === "") {
+      process.env[key] = value;
+    }
   }
 }
 
@@ -116,6 +123,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     coachApiToken: nonempty(env.COACH_API_TOKEN),
     ollamaModel: nonempty(env.OLLAMA_MODEL) ?? "qwen2.5:0.5b",
     ollamaVisionModel: nonempty(env.OLLAMA_VISION_MODEL) ?? "moondream",
+    adminPassword: nonempty(env.ADMIN_PASSWORD),
   };
 }
 

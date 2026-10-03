@@ -8,7 +8,9 @@ import { hashToken, newOpaqueToken, signAccessToken, verifyAccessToken } from ".
 import { emailCodeTtlSeconds, googleConfigured, pendingTtlSeconds, type Config } from "./config.ts";
 import { CalendarConnects } from "./calendar/connect.ts";
 import { createCalendarClient, type CalendarClient } from "./calendar/client.ts";
+import { createDriveClient, type DriveClient } from "./drive/client.ts";
 import { mintEphemeralToken, type FetchLike } from "./gemini/ephemeral.ts";
+import { handleAdmin } from "./admin.ts";
 import { coachTokenOk, handleCoach } from "./coach/ollama.ts";
 import { createMailer, type Mailer } from "./mailer.ts";
 import { handleProduct } from "./product/routes.ts";
@@ -32,6 +34,7 @@ export type AppDeps = {
   google?: GoogleClient;
   mailer?: Mailer;
   calendar?: CalendarClient;
+  drive?: DriveClient;
   calendarConnects?: CalendarConnects;
   now?: () => Date;
   fetch?: FetchLike;
@@ -93,6 +96,7 @@ export function createApp(deps: AppDeps): Server {
   const nowFn = deps.now ?? (() => new Date());
   const fetchImpl = deps.fetch ?? fetch;
   const calendar = deps.calendar ?? createCalendarClient(fetchImpl);
+  const drive = deps.drive ?? createDriveClient(fetchImpl);
   const calendarConnects = deps.calendarConnects ?? new CalendarConnects();
 
   return createServer((req, res) => {
@@ -107,6 +111,7 @@ export function createApp(deps: AppDeps): Server {
       google,
       mailer,
       calendar,
+      drive,
       calendarConnects,
       now: nowFn,
       fetch: fetchImpl,
@@ -124,7 +129,7 @@ async function handle(
   deps: Required<
     Pick<
       AppDeps,
-      "config" | "store" | "pending" | "google" | "mailer" | "calendar" | "calendarConnects" | "now" | "fetch"
+      "config" | "store" | "pending" | "google" | "mailer" | "calendar" | "drive" | "calendarConnects" | "now" | "fetch"
     >
   >,
 ): Promise<void> {
@@ -134,6 +139,10 @@ async function handle(
 
   if (method === "GET" && path === "/health") {
     sendJson(res, 200, { ok: true, service: "waypoint-api", storage: deps.store.kind });
+    return;
+  }
+
+  if (await handleAdmin(method, path, req, res, { config: deps.config, store: deps.store })) {
     return;
   }
 
@@ -189,8 +198,10 @@ async function handle(
       store: deps.store,
       google: deps.google,
       calendar: deps.calendar,
+      drive: deps.drive,
       calendarConnects: deps.calendarConnects,
       now: deps.now,
+      fetch: deps.fetch,
     })
   ) {
     return;
@@ -293,6 +304,10 @@ function assertLoginReady(config: Config): void {
   }
 }
 
+/** Sign-in + Calendar + Drive in one consent (required for the desktop app). */
+const GOOGLE_LOGIN_SCOPES =
+  "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly";
+
 async function startGoogle(
   res: ServerResponse,
   deps: Required<Pick<AppDeps, "config" | "pending" | "now">>,
@@ -316,6 +331,7 @@ async function startGoogle(
       redirectUri: deps.config.redirectUri,
       state,
       codeVerifier,
+      scopes: GOOGLE_LOGIN_SCOPES,
     }),
     state,
     poll_token: pollToken,
@@ -360,6 +376,9 @@ async function googleCallback(
       clientSecret: deps.config.googleClientSecret!,
       redirectUri: deps.config.redirectUri,
     });
+    if (!tokens.refreshToken) {
+      throw new GoogleExchangeError("Google did not return a refresh token for Calendar/Drive.");
+    }
     const profile = await deps.google.fetchUserInfo(tokens.accessToken);
     const user = await deps.store.upsertGoogleUser(
       {
@@ -372,6 +391,8 @@ async function googleCallback(
       },
       now,
     );
+    // Login grants identity + Calendar/Drive — mark Google data linked.
+    await deps.store.setCalendarGrant(user.id, tokens.refreshToken, true);
     const refresh = newRefreshRecord(user.id, now, deps.config.refreshTokenTtlSeconds);
     await deps.store.insertRefreshToken(refresh.record);
     const result: CompletedLogin = {
@@ -385,7 +406,10 @@ async function googleCallback(
     sendHtml(
       res,
       200,
-      page("Waypoint connected", "You can close this tab and return to Waypoint."),
+      page(
+        "Waypoint connected",
+        "Google account, Calendar, and Drive are linked. You can close this tab and return to Waypoint.",
+      ),
     );
   } catch (error) {
     const message =

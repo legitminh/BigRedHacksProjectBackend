@@ -44,8 +44,11 @@ CREATE TABLE IF NOT EXISTS user_profiles (
   long_term_goals JSONB NOT NULL DEFAULT '[]',
   priorities JSONB NOT NULL DEFAULT '[]',
   interaction JSONB NOT NULL,
+  study_memory JSONB,
   updated_at TIMESTAMPTZ NOT NULL
 );
+
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS study_memory JSONB;
 
 CREATE TABLE IF NOT EXISTS proficiencies (
   user_id UUID NOT NULL REFERENCES users (id),

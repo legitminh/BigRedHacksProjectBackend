@@ -265,14 +265,22 @@ test("calendar consent classifies the agenda and refuses edits to other events",
     assert.equal(start.status, 200);
     const started = (await start.json()) as { authorization_url: string; state: string; poll_token: string };
     const authUrl = new URL(started.authorization_url);
-    assert.equal(authUrl.searchParams.get("scope"), "https://www.googleapis.com/auth/calendar.events");
+    assert.equal(
+      authUrl.searchParams.get("scope"),
+      "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly",
+    );
     assert.equal(authUrl.searchParams.get("include_granted_scopes"), "true");
     const callback = await fetch(
       `${base}/v1/google/calendar/callback?code=abc&state=${encodeURIComponent(started.state)}`,
     );
     assert.equal(callback.status, 200);
     const poll = await fetch(`${base}/v1/google/calendar/poll?poll_token=${encodeURIComponent(started.poll_token)}`);
-    assert.deepEqual(await poll.json(), { status: "complete", calendar_connected: true });
+    assert.deepEqual(await poll.json(), {
+      status: "complete",
+      calendar_connected: true,
+      google_connected: true,
+      drive_connected: true,
+    });
 
     const agenda = await fetch(`${base}/v1/calendar/agenda?days=14`, { headers: auth });
     const classified = (await agenda.json()) as {
