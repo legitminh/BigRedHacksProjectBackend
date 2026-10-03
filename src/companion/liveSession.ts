@@ -8,6 +8,12 @@ import WebSocket from "ws";
 
 import type { Config } from "../config.ts";
 import {
+  AUDIO_KIND_UPLINK,
+  AUDIO_PROTOCOL,
+  DownlinkAudioBatcher,
+  tryDecodePcmFrame,
+} from "./audioProtocol.ts";
+import {
   audioMessage,
   audioStreamEndMessage,
   buildCompanionSystem,
@@ -30,7 +36,11 @@ const SETUP_TIMEOUT_MS = 20_000;
 const SCREENCAP_CLIENT_TIMEOUT_MS = 12_000;
 
 type Inbound =
-  | { type: "start"; context?: Record<string, unknown> | null }
+  | {
+      type: "start";
+      context?: Record<string, unknown> | null;
+      audio_protocol?: string;
+    }
   | { type: "audio"; pcm: string }
   | { type: "text"; text: string }
   | { type: "barge" }
@@ -45,10 +55,10 @@ type Inbound =
 
 type Outbound =
   | { type: "status"; phase: string }
-  | { type: "ready"; model: string }
+  | { type: "ready"; model: string; audio_protocol?: string }
   | { type: "user"; text: string; final: boolean }
   | { type: "assistant"; text: string; final: boolean }
-  | { type: "audio"; pcm: string; sample_rate: number; epoch: number }
+  | { type: "audio"; pcm: string; sample_rate: number; epoch: number; seq?: number }
   | { type: "audio_end"; epoch: number }
   | { type: "clear_audio"; epoch: number }
   | { type: "screencap_request"; id: string; name: string }
@@ -215,6 +225,12 @@ function parseInbound(raw: string): Inbound | null {
           value.context && typeof value.context === "object"
             ? (value.context as Record<string, unknown>)
             : null,
+        audio_protocol:
+          typeof value.audio_protocol === "string"
+            ? value.audio_protocol
+            : typeof value.audioProtocol === "string"
+              ? value.audioProtocol
+              : undefined,
       };
     }
     if (type === "audio" && typeof value.pcm === "string") {
@@ -296,7 +312,7 @@ async function connectGemini(apiKey: string, model: string, system: string): Pro
 
 export async function runCompanionLiveSession(client: WebSocket, config: Config): Promise<void> {
   if (!config.geminiApiKey) {
-    sendError(client, "GEMINI_API_KEY is not configured on the Waypoint API.");
+    sendError(client, "Live voice isn’t available right now. Try again later.");
     client.close();
     return;
   }
@@ -307,6 +323,11 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   let geminiGenerating = false;
   let announcedReply = false;
   let lastScreencapAt = 0;
+  let useBinaryAudio = false;
+  const downlink = new DownlinkAudioBatcher((frame) => {
+    if (closed || client.readyState !== WebSocket.OPEN) return;
+    client.send(frame);
+  });
   const pendingScreencaps = new Map<
     string,
     { call: ToolCall; timer: ReturnType<typeof setTimeout> }
@@ -353,6 +374,7 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     if (closed) return;
     closed = true;
     clearPendingScreencaps();
+    downlink.reset();
     if (gemini && gemini.readyState === WebSocket.OPEN) {
       try {
         gemini.send(JSON.stringify(audioStreamEndMessage()));
@@ -362,6 +384,19 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
       gemini.close();
     }
     gemini = null;
+  };
+
+  const forwardDownlinkPcm = (pcmBase64: string, sampleRate: number) => {
+    if (useBinaryAudio) {
+      downlink.push(pcmBase64, sampleRate);
+      return;
+    }
+    send(client, {
+      type: "audio",
+      pcm: pcmBase64,
+      sample_rate: sampleRate,
+      epoch,
+    });
   };
 
   client.on("close", cleanup);
@@ -379,19 +414,30 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     return;
   }
 
+  useBinaryAudio = first.audio_protocol === AUDIO_PROTOCOL;
   send(client, { type: "status", phase: "connecting" });
   const system = buildCompanionSystem(first.context);
   try {
     gemini = await connectGemini(config.geminiApiKey, model, system);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Could not open Gemini Live.";
-    sendError(client, message);
+    const message =
+      error instanceof Error ? error.message : "Could not start live voice.";
+    sendError(
+      client,
+      /gemini|api key|generativelanguage/i.test(message)
+        ? "Could not start live voice. Please try again."
+        : message,
+    );
     cleanup();
     client.close();
     return;
   }
 
-  send(client, { type: "ready", model });
+  send(client, {
+    type: "ready",
+    model,
+    audio_protocol: useBinaryAudio ? AUDIO_PROTOCOL : undefined,
+  });
   send(client, { type: "status", phase: "listening" });
 
   gemini.on("message", (data) => {
@@ -404,14 +450,14 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     }
     const err = errorMessage(payload);
     if (err) {
-      sendError(client, `Gemini Live: ${err}`);
+      sendError(client, "Live voice hit a problem. Please try again.");
       cleanup();
       client.close();
       return;
     }
     const record = payload as Record<string, unknown>;
     if (record.goAway != null || record.go_away != null) {
-      sendError(client, "Gemini Live is ending this session.");
+      sendError(client, "Live voice ended this session. Tap Talk to start again.");
       cleanup();
       client.close();
       return;
@@ -424,12 +470,7 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     const signals = signalsFromMessage(payload);
     for (const signal of signals) {
       if (signal.kind === "audio") {
-        send(client, {
-          type: "audio",
-          pcm: signal.pcmBase64,
-          sample_rate: sampleRateFromMime(signal.mimeType),
-          epoch,
-        });
+        forwardDownlinkPcm(signal.pcmBase64, sampleRateFromMime(signal.mimeType));
         if (!announcedReply) {
           announcedReply = true;
           send(client, { type: "status", phase: "speaking" });
@@ -453,9 +494,11 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
       ) {
         if (signal.kind === "interrupted") {
           epoch += 1;
+          downlink.setEpoch(epoch);
           send(client, { type: "clear_audio", epoch });
           send(client, { type: "status", phase: "listening" });
         } else if (signal.kind === "generation_complete" || signal.kind === "turn_complete") {
+          downlink.forceFlush();
           send(client, { type: "audio_end", epoch });
           send(client, { type: "status", phase: "listening" });
         }
@@ -467,13 +510,30 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
 
   gemini.on("close", () => {
     if (closed) return;
-    sendError(client, "Gemini Live closed the session.");
+    sendError(client, "Live voice disconnected. Tap Talk to start again.");
     cleanup();
     client.close();
   });
 
-  client.on("message", (data) => {
+  const forwardUplinkPcm = (bytes: Buffer) => {
+    if (bytes.length === 0 || bytes.length > MAX_PCM_BYTES || bytes.length % 2 !== 0) return;
+    if (gemini && gemini.readyState === WebSocket.OPEN) {
+      gemini.send(JSON.stringify(audioMessage(bytes)));
+    }
+  };
+
+  client.on("message", (data, isBinary) => {
     if (closed || !gemini) return;
+    if (isBinary || Buffer.isBuffer(data)) {
+      const buf = Buffer.isBuffer(data)
+        ? data
+        : Buffer.from(data as ArrayBuffer);
+      const frame = tryDecodePcmFrame(buf);
+      if (frame && frame.kind === AUDIO_KIND_UPLINK) {
+        forwardUplinkPcm(frame.pcm);
+      }
+      return;
+    }
     const inbound = parseInbound(String(data));
     if (!inbound) return;
     if (inbound.type === "stop") {
@@ -488,10 +548,7 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
       } catch {
         return;
       }
-      if (bytes.length === 0 || bytes.length > MAX_PCM_BYTES || bytes.length % 2 !== 0) return;
-      if (gemini.readyState === WebSocket.OPEN) {
-        gemini.send(JSON.stringify(audioMessage(bytes)));
-      }
+      forwardUplinkPcm(bytes);
       return;
     }
     if (inbound.type === "text") {
@@ -506,6 +563,7 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     }
     if (inbound.type === "barge") {
       epoch += 1;
+      downlink.setEpoch(epoch);
       send(client, { type: "clear_audio", epoch });
       if (geminiGenerating) {
         // Gemini activityHandling already interrupts on speech; clear local playback.
