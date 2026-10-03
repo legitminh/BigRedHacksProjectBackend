@@ -16,6 +16,11 @@ export function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
+export function hashesMatch(storedHash: string, providedHash: string): boolean {
+  if (storedHash.length === 0 || storedHash.length !== providedHash.length) return false;
+  return timingSafeEqual(Buffer.from(storedHash), Buffer.from(providedHash));
+}
+
 export function codeChallenge(verifier: string): string {
   return createHash("sha256").update(verifier).digest("base64url");
 }

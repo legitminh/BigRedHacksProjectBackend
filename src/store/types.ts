@@ -30,9 +30,21 @@ export type RotateResult =
   | { status: "reuse" }
   | { status: "invalid" };
 
+export type EmailLoginCode = {
+  id: string;
+  email: string;
+  codeHash: string;
+  expiresAt: string;
+  consumedAt: string | null;
+  createdAt: string;
+};
+
 export type Store = {
   kind: "file" | "postgres";
   upsertGoogleUser(profile: GoogleProfile, now: Date): Promise<PublicUser>;
+  findOrCreateUserByEmail(email: string, now: Date): Promise<PublicUser>;
+  replaceEmailLoginCode(code: EmailLoginCode): Promise<void>;
+  consumeEmailLoginCode(email: string, codeHash: string, now: Date): Promise<boolean>;
   insertRefreshToken(token: StoredRefreshToken): Promise<void>;
   rotateRefreshToken(
     oldHash: string,

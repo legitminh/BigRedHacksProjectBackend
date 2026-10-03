@@ -1,10 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
+import { newEmailCode, parseEmail, parseEmailCode } from "./auth/email.ts";
 import { GoogleExchangeError, authorizationUrl, createGoogleClient, type GoogleClient } from "./auth/google.ts";
 import { PendingLogins, type CompletedLogin } from "./auth/pending.ts";
 import { hashToken, newOpaqueToken, signAccessToken, verifyAccessToken } from "./auth/tokens.ts";
-import { googleConfigured, pendingTtlSeconds, type Config } from "./config.ts";
+import { emailCodeTtlSeconds, googleConfigured, pendingTtlSeconds, type Config } from "./config.ts";
+import { createMailer, type Mailer } from "./mailer.ts";
 import {
   HttpError,
   applyCors,
@@ -23,6 +25,7 @@ export type AppDeps = {
   store: Store;
   pending?: PendingLogins;
   google?: GoogleClient;
+  mailer?: Mailer;
   now?: () => Date;
 };
 
@@ -78,6 +81,7 @@ async function requireUser(deps: AppDeps, req: IncomingMessage, now: Date): Prom
 export function createApp(deps: AppDeps): Server {
   const pending = deps.pending ?? new PendingLogins();
   const google = deps.google ?? createGoogleClient();
+  const mailer = deps.mailer ?? createMailer(deps.config);
   const nowFn = deps.now ?? (() => new Date());
 
   return createServer((req, res) => {
@@ -86,7 +90,7 @@ export function createApp(deps: AppDeps): Server {
       sendEmpty(res, 204);
       return;
     }
-    void handle(req, res, { ...deps, pending, google, now: nowFn }).catch((error: unknown) => {
+    void handle(req, res, { ...deps, pending, google, mailer, now: nowFn }).catch((error: unknown) => {
       if (!res.headersSent) sendError(res, error);
     });
   });
@@ -95,7 +99,7 @@ export function createApp(deps: AppDeps): Server {
 async function handle(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: Required<Pick<AppDeps, "config" | "store" | "pending" | "google" | "now">>,
+  deps: Required<Pick<AppDeps, "config" | "store" | "pending" | "google" | "mailer" | "now">>,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const path = url.pathname;
@@ -118,6 +122,14 @@ async function handle(
     pollGoogle(url, res, deps);
     return;
   }
+  if (method === "POST" && path === "/v1/auth/email/start") {
+    await startEmail(req, res, deps);
+    return;
+  }
+  if (method === "POST" && path === "/v1/auth/email/verify") {
+    await verifyEmail(req, res, deps);
+    return;
+  }
   if (method === "POST" && path === "/v1/auth/refresh") {
     await refresh(req, res, deps);
     return;
@@ -134,6 +146,8 @@ async function handle(
 
   if (
     path === "/v1/auth/google/start" ||
+    path === "/v1/auth/email/start" ||
+    path === "/v1/auth/email/verify" ||
     path === "/v1/auth/refresh" ||
     path === "/v1/auth/sign-out" ||
     path === "/v1/me" ||
@@ -144,6 +158,73 @@ async function handle(
     throw new HttpError(405, "method_not_allowed", "Method not allowed.");
   }
   throw new HttpError(404, "not_found", "No route for that path.");
+}
+
+
+async function startEmail(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: Required<Pick<AppDeps, "config" | "store" | "mailer" | "now">>,
+): Promise<void> {
+  const body = await readJson(req);
+  const email = parseEmail(body && typeof body === "object" && "email" in body ? body.email : undefined);
+  if (!email) {
+    throw new HttpError(400, "invalid_email", "Enter a valid email address.");
+  }
+  if (!deps.config.sessionSecret) {
+    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+  }
+  const now = deps.now();
+  const code = newEmailCode();
+  const expiresIn = emailCodeTtlSeconds();
+  await deps.store.replaceEmailLoginCode({
+    id: randomUUID(),
+    email,
+    codeHash: hashToken(code),
+    expiresAt: new Date(now.getTime() + expiresIn * 1000).toISOString(),
+    consumedAt: null,
+    createdAt: now.toISOString(),
+  });
+  try {
+    await deps.mailer.sendLoginCode({ to: email, code, expiresIn });
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    console.error("email login delivery failed");
+    throw new HttpError(502, "mail_failed", "Could not send the login email.");
+  }
+  sendJson(res, 200, { status: "sent", expires_in: expiresIn });
+}
+
+async function verifyEmail(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: Required<Pick<AppDeps, "config" | "store" | "now">>,
+): Promise<void> {
+  if (!deps.config.sessionSecret) {
+    throw new HttpError(503, "session_secret_missing", "SESSION_SECRET must be at least 32 characters.");
+  }
+  const body = await readJson(req);
+  const record = body && typeof body === "object" ? body : {};
+  const email = parseEmail("email" in record ? record.email : undefined);
+  const code = parseEmailCode("code" in record ? record.code : undefined);
+  if (!email || !code) {
+    throw new HttpError(401, "invalid_code", "That code is invalid or expired.");
+  }
+  const now = deps.now();
+  const consumed = await deps.store.consumeEmailLoginCode(email, hashToken(code), now);
+  if (!consumed) {
+    throw new HttpError(401, "invalid_code", "That code is invalid or expired.");
+  }
+  const user = await deps.store.findOrCreateUserByEmail(email, now);
+  const refresh = newRefreshRecord(user.id, now, deps.config.refreshTokenTtlSeconds);
+  await deps.store.insertRefreshToken(refresh.record);
+  sendJson(res, 200, {
+    token_type: "Bearer",
+    access_token: issueAccessToken(deps.config, user, now),
+    refresh_token: refresh.token,
+    expires_in: deps.config.accessTokenTtlSeconds,
+    user,
+  });
 }
 
 function assertLoginReady(config: Config): void {

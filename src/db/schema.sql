@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY,
-  google_sub TEXT NOT NULL UNIQUE,
+  google_sub TEXT UNIQUE,
   email TEXT,
   email_verified BOOLEAN NOT NULL DEFAULT FALSE,
   name TEXT,
@@ -10,6 +10,12 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at TIMESTAMPTZ NOT NULL
 );
 
+ALTER TABLE users ALTER COLUMN google_sub DROP NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uidx
+  ON users (lower(email))
+  WHERE email IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   id UUID PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES users (id),
@@ -17,5 +23,14 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   expires_at TIMESTAMPTZ NOT NULL,
   revoked_at TIMESTAMPTZ,
   replaced_by UUID,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS email_login_codes (
+  id UUID PRIMARY KEY,
+  email TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL
 );

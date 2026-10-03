@@ -12,12 +12,22 @@ export type Config = {
   refreshTokenTtlSeconds: number;
   corsOrigins: string[];
   redirectUri: string;
+  smtpHost: string | null;
+  smtpPort: number | null;
+  smtpUser: string | null;
+  smtpPass: string | null;
+  mailFrom: string | null;
 };
 
 const PENDING_TTL_SECONDS = 600;
+const EMAIL_CODE_TTL_SECONDS = 600;
 
 export function pendingTtlSeconds(): number {
   return PENDING_TTL_SECONDS;
+}
+
+export function emailCodeTtlSeconds(): number {
+  return EMAIL_CODE_TTL_SECONDS;
 }
 
 export function loadEnvFile(path = resolve(".env")): void {
@@ -53,6 +63,13 @@ function positiveInt(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function optionalPort(value: string | undefined): number | null {
+  if (!value || !value.trim()) return null;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const port = positiveInt(env.PORT, 8787);
   const publicBaseUrl = (nonempty(env.PUBLIC_BASE_URL) ?? `http://127.0.0.1:${port}`).replace(
@@ -74,6 +91,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0),
     redirectUri: `${publicBaseUrl}/v1/auth/google/callback`,
+    smtpHost: nonempty(env.SMTP_HOST),
+    smtpPort: optionalPort(env.SMTP_PORT),
+    smtpUser: nonempty(env.SMTP_USER),
+    smtpPass: nonempty(env.SMTP_PASS),
+    mailFrom: nonempty(env.MAIL_FROM),
   };
 }
 

@@ -3,9 +3,12 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 
+import { canonicalEmail } from "../auth/email.ts";
+import { hashesMatch } from "../auth/tokens.ts";
 import type {
+  EmailLoginCode,
   GoogleProfile,
   PublicUser,
   RotateResult,
@@ -31,6 +34,12 @@ function toPublic(row: UserRow): PublicUser {
   };
 }
 
+function isUniqueViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
+}
+
+const userReturning = `RETURNING id, email, email_verified, name, picture`;
+
 export async function openPostgres(databaseUrl: string): Promise<Store> {
   const pool = new Pool({ connectionString: databaseUrl });
   const schemaPath = join(dirname(fileURLToPath(import.meta.url)), "../db/schema.sql");
@@ -42,25 +51,75 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
     await pool.query(statement);
   }
 
-  return {
-    kind: "postgres",
-    async upsertGoogleUser(profile: GoogleProfile, now: Date) {
-      const result = await pool.query<UserRow>(
+  async function applyGoogleProfile(
+    client: PoolClient,
+    id: string,
+    profile: GoogleProfile,
+    email: string | null,
+    now: Date,
+  ): Promise<PublicUser> {
+    const result = await client.query<UserRow>(
+      `UPDATE users SET
+         google_sub = $2,
+         email = $3,
+         email_verified = $4,
+         name = $5,
+         picture = $6,
+         google_refresh_token = COALESCE($7, google_refresh_token),
+         last_login_at = $8
+       WHERE id = $1
+       ${userReturning}`,
+      [
+        id,
+        profile.sub,
+        email,
+        profile.emailVerified,
+        profile.name,
+        profile.picture,
+        profile.googleRefreshToken,
+        now.toISOString(),
+      ],
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("User update returned no row.");
+    return toPublic(row);
+  }
+
+  async function upsertGoogleOnce(profile: GoogleProfile, email: string | null, now: Date): Promise<PublicUser> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const bySub = await client.query<{ id: string }>(
+        `SELECT id FROM users WHERE google_sub = $1 FOR UPDATE`,
+        [profile.sub],
+      );
+      const matched = bySub.rows[0];
+      if (matched) {
+        const user = await applyGoogleProfile(client, matched.id, profile, email, now);
+        await client.query("COMMIT");
+        return user;
+      }
+      if (email) {
+        const byEmail = await client.query<{ id: string }>(
+          `SELECT id FROM users WHERE lower(email) = $1 FOR UPDATE`,
+          [email],
+        );
+        const linked = byEmail.rows[0];
+        if (linked) {
+          const user = await applyGoogleProfile(client, linked.id, profile, email, now);
+          await client.query("COMMIT");
+          return user;
+        }
+      }
+      const inserted = await client.query<UserRow>(
         `INSERT INTO users (
            id, google_sub, email, email_verified, name, picture, google_refresh_token, created_at, last_login_at
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-         ON CONFLICT (google_sub) DO UPDATE SET
-           email = EXCLUDED.email,
-           email_verified = EXCLUDED.email_verified,
-           name = EXCLUDED.name,
-           picture = EXCLUDED.picture,
-           google_refresh_token = COALESCE(EXCLUDED.google_refresh_token, users.google_refresh_token),
-           last_login_at = EXCLUDED.last_login_at
-         RETURNING id, email, email_verified, name, picture`,
+         ${userReturning}`,
         [
           randomUUID(),
           profile.sub,
-          profile.email,
+          email,
           profile.emailVerified,
           profile.name,
           profile.picture,
@@ -68,9 +127,116 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           now.toISOString(),
         ],
       );
-      const row = result.rows[0];
+      const row = inserted.rows[0];
       if (!row) throw new Error("User upsert returned no row.");
+      await client.query("COMMIT");
       return toPublic(row);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  return {
+    kind: "postgres",
+    async upsertGoogleUser(profile: GoogleProfile, now: Date) {
+      const email = canonicalEmail(profile.email);
+      try {
+        return await upsertGoogleOnce(profile, email, now);
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        return upsertGoogleOnce(profile, email, now);
+      }
+    },
+    async findOrCreateUserByEmail(email: string, now: Date) {
+      const canonical = canonicalEmail(email);
+      if (!canonical) throw new Error("Email is required.");
+      const existing = await pool.query<UserRow>(
+        `UPDATE users SET email = $2, email_verified = TRUE, last_login_at = $3
+         WHERE lower(email) = $1
+         ${userReturning}`,
+        [canonical, canonical, now.toISOString()],
+      );
+      const row = existing.rows[0];
+      if (row) return toPublic(row);
+      try {
+        const inserted = await pool.query<UserRow>(
+          `INSERT INTO users (
+             id, google_sub, email, email_verified, name, picture, google_refresh_token, created_at, last_login_at
+           ) VALUES ($1, NULL, $2, TRUE, NULL, NULL, NULL, $3, $3)
+           ${userReturning}`,
+          [randomUUID(), canonical, now.toISOString()],
+        );
+        const created = inserted.rows[0];
+        if (!created) throw new Error("User insert returned no row.");
+        return toPublic(created);
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        const again = await pool.query<UserRow>(
+          `UPDATE users SET email = $2, email_verified = TRUE, last_login_at = $3
+           WHERE lower(email) = $1
+           ${userReturning}`,
+          [canonical, canonical, now.toISOString()],
+        );
+        const linked = again.rows[0];
+        if (!linked) throw error;
+        return toPublic(linked);
+      }
+    },
+    async replaceEmailLoginCode(code: EmailLoginCode) {
+      const email = canonicalEmail(code.email);
+      if (!email) throw new Error("Email is required.");
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(`DELETE FROM email_login_codes WHERE lower(email) = $1`, [email]);
+        await client.query(
+          `INSERT INTO email_login_codes (id, email, code_hash, expires_at, consumed_at, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [code.id, email, code.codeHash, code.expiresAt, code.consumedAt, code.createdAt],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    async consumeEmailLoginCode(email: string, codeHash: string, now: Date) {
+      const canonical = canonicalEmail(email);
+      if (!canonical) return false;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const found = await client.query<{ id: string; code_hash: string; expires_at: Date }>(
+          `SELECT id, code_hash, expires_at
+           FROM email_login_codes
+           WHERE lower(email) = $1 AND consumed_at IS NULL
+           ORDER BY created_at DESC
+           LIMIT 1
+           FOR UPDATE`,
+          [canonical],
+        );
+        const row = found.rows[0];
+        if (!row || !hashesMatch(row.code_hash, codeHash) || new Date(row.expires_at).getTime() <= now.getTime()) {
+          await client.query("ROLLBACK");
+          return false;
+        }
+        const updated = await client.query(
+          `UPDATE email_login_codes SET consumed_at = $2 WHERE id = $1 AND consumed_at IS NULL`,
+          [row.id, now.toISOString()],
+        );
+        await client.query("COMMIT");
+        return (updated.rowCount ?? 0) > 0;
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
     async insertRefreshToken(token: StoredRefreshToken) {
       await pool.query(

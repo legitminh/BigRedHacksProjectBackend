@@ -1,6 +1,6 @@
 # Waypoint API
 
-Account server for the Waypoint desktop app. This slice is Google sign-in. The Google client secret stays here. The app receives a Waypoint access token and refresh token, then sends the access token on later requests.
+Account server for the Waypoint desktop app. People sign in with Google or a one-time email code. The Google client secret stays here. The app receives a Waypoint access token and refresh token, then sends the access token on later requests.
 
 Calendar and Drive access still use the desktop OAuth client inside the Tauri app. This server does not replace that yet.
 
@@ -18,7 +18,7 @@ There is no `.env` with real keys in the repo. Fill `.env` before trying a real 
 openssl rand -base64 32
 ```
 
-Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup.
+Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup. Leave the SMTP variables blank for local email login; the code is written to `data/outbox.jsonl`.
 
 ```bash
 npm run dev
@@ -30,7 +30,7 @@ The process listens on `http://127.0.0.1:8787`. `GET /health` returns:
 { "ok": true, "service": "waypoint-api", "storage": "file" }
 ```
 
-`storage` is `postgres` when `DATABASE_URL` is set. `npm test` covers the login flow with Google mocked.
+`storage` is `postgres` when `DATABASE_URL` is set. `npm test` covers Google sign-in and email codes. Email tests inject a mailer, so they do not send mail.
 
 ## Google Cloud client
 
@@ -243,6 +243,54 @@ pub async fn sign_in_with_google() -> Result<PollBody, String> {
 
 Persist `access_token` and `refresh_token` from the `complete` poll the same way `auth.rs` writes `waypoint_session.json`. On later commands, send `Authorization: Bearer <access_token>`. On `401`, `POST /v1/auth/refresh`, store the new pair, and retry once.
 
+## Email login
+
+`POST /v1/auth/email/start` asks Waypoint to email a one-time code. There is no password.
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/auth/email/start \
+  -H "Content-Type: application/json" \
+  -d '{"email":"student@cornell.edu"}'
+```
+
+When the address is syntactically valid, the response is always the same, whether or not an account already exists:
+
+```json
+{ "status": "sent", "expires_in": 600 }
+```
+
+The body never includes the code. `400` `invalid_email` means the address is not a valid email. The code expires in 10 minutes. Starting again for the same address replaces the previous code.
+
+`POST /v1/auth/email/verify` exchanges that code for Waypoint tokens:
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/auth/email/verify \
+  -H "Content-Type: application/json" \
+  -d '{"email":"student@cornell.edu","code":"123456"}'
+```
+
+Success has the same fields as a completed Google poll, without `status`:
+
+```json
+{
+  "token_type": "Bearer",
+  "access_token": "<jwt>",
+  "refresh_token": "<opaque>",
+  "expires_in": 900,
+  "user": {
+    "id": "6d0f0a2e-1c2b-4a7e-9c1d-0b5a6e7f8091",
+    "email": "student@cornell.edu",
+    "email_verified": true,
+    "name": null,
+    "picture": null
+  }
+}
+```
+
+Save `access_token`, `refresh_token`, the expiry (`now + expires_in`), and `user` the same way as Google sign-in, in the Waypoint data directory (`waypoint_session.json`). Send `Authorization: Bearer <access_token>` on later calls. When it expires, `POST /v1/auth/refresh` with the refresh token and replace both saved tokens. A wrong, expired, or already used code is `401` `invalid_code`.
+
+For local development, leave `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `MAIL_FROM` blank. The server appends one JSON line per code to `data/outbox.jsonl` (gitignored via `data/`). That file is for local dev only. Read `code` from the last line, then call verify. Set all five SMTP variables to send the code by email instead.
+
 ## What this server does not do yet
 
-Email login, mail delivery, Gemini ephemeral tokens, preference and history APIs, and session summaries are later slices. See `devplan.md`.
+Gemini ephemeral tokens, preference and history APIs, and session summaries are later slices. See `devplan.md`.

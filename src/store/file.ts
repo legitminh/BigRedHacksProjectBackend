@@ -2,7 +2,10 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { canonicalEmail } from "../auth/email.ts";
+import { hashesMatch } from "../auth/tokens.ts";
 import type {
+  EmailLoginCode,
   GoogleProfile,
   PublicUser,
   RotateResult,
@@ -11,7 +14,7 @@ import type {
 } from "./types.ts";
 
 type UserRecord = PublicUser & {
-  google_sub: string;
+  google_sub: string | null;
   google_refresh_token: string | null;
   created_at: string;
   last_login_at: string;
@@ -20,10 +23,11 @@ type UserRecord = PublicUser & {
 type FileData = {
   users: UserRecord[];
   refreshTokens: StoredRefreshToken[];
+  emailCodes: EmailLoginCode[];
 };
 
 function empty(): FileData {
-  return { users: [], refreshTokens: [] };
+  return { users: [], refreshTokens: [], emailCodes: [] };
 }
 
 function toPublic(user: UserRecord): PublicUser {
@@ -55,6 +59,7 @@ export function openFileStore(path: string): Store {
       return {
         users: parsed.users ?? [],
         refreshTokens: parsed.refreshTokens ?? [],
+        emailCodes: parsed.emailCodes ?? [],
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
@@ -74,9 +79,17 @@ export function openFileStore(path: string): Store {
     async upsertGoogleUser(profile: GoogleProfile, now: Date) {
       return lock(async () => {
         const data = await read();
-        const existing = data.users.find((user) => user.google_sub === profile.sub);
+        const email = canonicalEmail(profile.email);
+        const bySub = data.users.find((user) => user.google_sub === profile.sub);
+        const byEmail = bySub
+          ? undefined
+          : email
+            ? data.users.find((user) => canonicalEmail(user.email) === email)
+            : undefined;
+        const existing = bySub ?? byEmail;
         if (existing) {
-          existing.email = profile.email;
+          existing.google_sub = profile.sub;
+          existing.email = email;
           existing.email_verified = profile.emailVerified;
           existing.name = profile.name;
           existing.picture = profile.picture;
@@ -90,7 +103,7 @@ export function openFileStore(path: string): Store {
         const created: UserRecord = {
           id: randomUUID(),
           google_sub: profile.sub,
-          email: profile.email,
+          email,
           email_verified: profile.emailVerified,
           name: profile.name,
           picture: profile.picture,
@@ -101,6 +114,61 @@ export function openFileStore(path: string): Store {
         data.users.push(created);
         await write(data);
         return toPublic(created);
+      });
+    },
+    async findOrCreateUserByEmail(email: string, now: Date) {
+      return lock(async () => {
+        const data = await read();
+        const canonical = canonicalEmail(email);
+        if (!canonical) throw new Error("Email is required.");
+        const existing = data.users.find((user) => canonicalEmail(user.email) === canonical);
+        if (existing) {
+          existing.email = canonical;
+          existing.email_verified = true;
+          existing.last_login_at = now.toISOString();
+          await write(data);
+          return toPublic(existing);
+        }
+        const created: UserRecord = {
+          id: randomUUID(),
+          google_sub: null,
+          email: canonical,
+          email_verified: true,
+          name: null,
+          picture: null,
+          google_refresh_token: null,
+          created_at: now.toISOString(),
+          last_login_at: now.toISOString(),
+        };
+        data.users.push(created);
+        await write(data);
+        return toPublic(created);
+      });
+    },
+    async replaceEmailLoginCode(code: EmailLoginCode) {
+      await lock(async () => {
+        const data = await read();
+        const email = canonicalEmail(code.email);
+        if (!email) throw new Error("Email is required.");
+        data.emailCodes = data.emailCodes.filter((item) => canonicalEmail(item.email) !== email);
+        data.emailCodes.push({ ...code, email });
+        await write(data);
+      });
+    },
+    async consumeEmailLoginCode(email: string, codeHash: string, now: Date) {
+      return lock(async () => {
+        const data = await read();
+        const canonical = canonicalEmail(email);
+        if (!canonical) return false;
+        const active = [...data.emailCodes]
+          .reverse()
+          .find((item) => canonicalEmail(item.email) === canonical && !item.consumedAt);
+        if (!active) return false;
+        if (!hashesMatch(active.codeHash, codeHash)) return false;
+        if (Date.parse(active.expiresAt) <= now.getTime()) return false;
+        active.consumedAt = now.toISOString();
+        await write(data);
+        return true;
       });
     },
     async insertRefreshToken(token) {
