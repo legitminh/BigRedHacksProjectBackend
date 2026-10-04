@@ -28,7 +28,7 @@ Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_
 |---|---|---|---|
 | Copilot / companion **text** | `GEMINI_MODEL` (default `gemini-3.5-flash-lite`) | REST `generateContent` via `POST /v1/gemini/chat` + `/v1/companion/chat` | Default `LOCAL_CHAT_PROVIDER=gemini` tries Gemini REST first; silent Ollama fallback (`OLLAMA_CHAT_MODEL`, default `qwen2.5:7b`) on quota/outage. A Gemini **429 on chat is REST quota**, not a Live WebSocket failure. |
 | School digest / deep Drive | `GEMINI_OVERVIEW_MODEL` | REST overview | Once/day digest + optional Lite depth (`LITE_DEPTH_USE_LLM=1`). |
-| Talk / Live **voice** | `GEMINI_LIVE_MODEL` + **`XAI_API_KEY`** | `WS /v1/companion/live` | Live WebSocket only. Heads-up TTS (`POST /v1/voice/tts`) can fall back to macOS `say`; **Live cannot**. The same `XAI_API_KEY` draws the final-review session summary image (`POST /v1/concept-map` → Grok Imagine). |
+| Talk / Live **voice** | `GEMINI_LIVE_MODEL` + **`XAI_API_KEY`** | `WS /v1/companion/live` | Live WebSocket only. Heads-up TTS (`POST /v1/voice/tts`) can fall back to macOS `say`; **Live cannot**. The same `XAI_API_KEY` draws the final-review mission brag sheet (`POST /v1/concept-map` → Grok Imagine). |
 
 Set `LOCAL_CHAT_PROVIDER=ollama` (aliases: `llama`, `local`) to force local Llama and never call Gemini for chat. Set `PRESAGE_API_KEY` on this API for camera accountability vitals (`POST /v1/camera/observe`); the desktop uploads short clips here and never holds the Presage key on that path.
 
@@ -430,4 +430,4 @@ Sign-in stays `openid email profile`. Calendar is a second consent.
 
 ### Session notes
 
-`POST /v1/session-notes` upserts the Markdown lock-in note for `(user, session_id)`. `GET /v1/session-notes` lists up to 50 newest; `GET /v1/session-notes/:id` returns one. `GET /v1/memory` includes up to five `recent_notes` excerpts. Chat with `purpose=session_note` uses the note writer template (not Copilot). `POST /v1/concept-map` draws a Grok Imagine shareable session-summary graphic from note markdown (6/hour per user). See `specs.md`.
+`POST /v1/session-notes` upserts the Markdown lock-in note for `(user, session_id)`. `GET /v1/session-notes` lists up to 50 newest; `GET /v1/session-notes/:id` returns one. `GET /v1/memory` includes up to five `recent_notes` excerpts. Chat with `purpose=session_note` uses the note writer template (not Copilot). `POST /v1/concept-map` draws a Grok Imagine space-themed mission brag sheet from note markdown + lock-in stats (6/hour per user). See `specs.md`.

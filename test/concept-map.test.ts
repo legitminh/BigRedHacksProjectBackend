@@ -22,13 +22,33 @@ function config(extra: Record<string, string> = {}): Config {
   });
 }
 
-test("session summary prompt uses the note and drops a study suggestion", () => {
+const BLANK_DIGLOG = `# Finish ENGL 1140 work
+
+## What I worked on
+Not captured.
+
+## Decisions
+Not captured.
+
+## Stuck on
+Not captured.
+
+## Next
+Not captured.`;
+
+test("brag sheet prompt uses space mission stats and drops a study suggestion", () => {
   const prompt = buildConceptMapPrompt(
     "## Heaps\n\nPush is O(log n).\n<<<STUDY_SUGGEST>>>{\"goals\":\"flashcards\"}<<<END_STUDY_SUGGEST>>>",
+    { locked_in_minutes: 25, mission: "Heaps practice" },
   );
-  assert.match(prompt, /study-session summary/i);
+  assert.match(prompt, /brag sheet/i);
   assert.match(prompt, /NOT a concept map/i);
+  assert.match(prompt, /NOT a flowchart/i);
+  assert.match(prompt, /Locked in: 25 minutes/);
+  assert.match(prompt, /Mission: Heaps practice/);
   assert.match(prompt, /Push is O\(log n\)/);
+  const stats = prompt.split("BRAG SHEET STATS:\n")[1] ?? "";
+  assert.doesNotMatch(stats, /Not captured/i);
   assert.doesNotMatch(prompt, /STUDY_SUGGEST/);
   assert.doesNotMatch(prompt, /flashcards/);
 });
@@ -44,34 +64,51 @@ test("session summary rejects an empty note and an image payload", () => {
   );
 });
 
-test("session summary refuses a blank Not-captured template", () => {
-  const blank = `# Reviewing Chinese
+test("empty diglog with mission title is allowed for a time+mission brag sheet", () => {
+  const parsed = parseConceptMapBody({
+    markdown: BLANK_DIGLOG,
+    locked_in_minutes: 40,
+  });
+  assert.equal(parsed.stats.locked_in_minutes, 40);
+  const prompt = buildConceptMapPrompt(parsed.markdown, parsed.stats);
+  assert.match(prompt, /Locked in: 40 minutes/);
+  assert.match(prompt, /Mission: Finish ENGL 1140 work/);
+  const stats = prompt.split("BRAG SHEET STATS:\n")[1] ?? "";
+  assert.doesNotMatch(stats, /Not captured/i);
+  assert.doesNotMatch(stats, /What I worked on/i);
+});
 
-## What I was learning
-Not captured.
+test("empty diglog with only a mission title (no duration) is still allowed", () => {
+  const parsed = parseConceptMapBody({ markdown: BLANK_DIGLOG });
+  const prompt = buildConceptMapPrompt(parsed.markdown, parsed.stats);
+  assert.match(prompt, /Mission: Finish ENGL 1140 work/);
+  const stats = prompt.split("BRAG SHEET STATS:\n")[1] ?? "";
+  assert.doesNotMatch(stats, /Not captured/i);
+});
 
-## In my own words
-Not captured.
-
-## Gaps / shaky parts
+test("truly empty body with no mission and no duration is refused", () => {
+  assert.throws(
+    () =>
+      parseConceptMapBody({
+        markdown: `## What I worked on
 Not captured.
 
 ## Next
-Not captured.`;
-  assert.throws(
-    () => parseConceptMapBody({ markdown: blank }),
+Not captured.`,
+      }),
     (error: unknown) =>
       error instanceof HttpError &&
       error.code === "empty_concept_map" &&
-      /no captured content to summarize/i.test(error.message),
+      /locked-in time or a mission goal/i.test(error.message),
   );
 });
 
-test("session summary clips a long note to 8000 characters", () => {
+test("brag sheet payload clips to 8000 characters", () => {
   const note = "a".repeat(9000);
   const prompt = buildConceptMapPrompt(note);
-  const source = prompt.split("NOTE:\n")[1] ?? "";
-  assert.equal(source.length, 8000);
+  const statsBlock = prompt.split("BRAG SHEET STATS:\n")[1] ?? "";
+  assert.ok(statsBlock.length <= 8000);
+  assert.match(prompt, /BRAG SHEET STATS:/);
 });
 
 test("imagine response keeps jpeg bytes and drops a data-url prefix", () => {
@@ -82,11 +119,12 @@ test("imagine response keeps jpeg bytes and drops a data-url prefix", () => {
   assert.equal(parsed.image_base64, JPEG);
 });
 
-test("session summary calls Grok Imagine with the note and returns the image", async () => {
+test("session summary calls Grok Imagine with the brag prompt and returns the image", async () => {
   let body = "";
   const image = await generateConceptMap({
     config: config({ XAI_API_KEY: "xai-test-key" }),
-    markdown: "Priority queues use a heap.",
+    markdown: BLANK_DIGLOG,
+    stats: { locked_in_minutes: 45, mission: "Finish ENGL 1140 work", on_task_percent: 80 },
     fetchImpl: async (_url, init) => {
       body = String(init?.body ?? "");
       return new Response(JSON.stringify({ data: [{ b64_json: JPEG }] }), { status: 200 });
@@ -107,7 +145,10 @@ test("session summary calls Grok Imagine with the note and returns the image", a
   assert.equal(sent.resolution, "1k");
   assert.equal(sent.quality, "low");
   assert.equal(sent.response_format, "b64_json");
-  assert.match(sent.prompt, /Priority queues use a heap/);
+  assert.match(sent.prompt, /Locked in: 45 minutes/);
+  assert.match(sent.prompt, /space-mission brag sheet/i);
+  const stats = sent.prompt.split("BRAG SHEET STATS:\n")[1] ?? "";
+  assert.doesNotMatch(stats, /Not captured/i);
   assert.equal(image.image_base64, JPEG);
 });
 
@@ -124,6 +165,6 @@ test("session summary reports when Grok Imagine is not configured", async () => 
     (error: unknown) =>
       error instanceof HttpError &&
       error.code === "imagine_not_configured" &&
-      /Session summaries need Grok Imagine/i.test(error.message),
+      /Brag sheets need Grok Imagine/i.test(error.message),
   );
 });

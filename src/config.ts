@@ -33,7 +33,7 @@ export type Config = {
   geminiLiveModel: string;
   /**
    * xAI / Grok API key for study heads-up TTS (`POST /v1/voice/tts`) and the
-   * final-review session summary image (`POST /v1/concept-map` → Grok Imagine).
+   * final-review mission brag sheet (`POST /v1/concept-map` → Grok Imagine).
    * Stays on this server only — never bake into Waypoint.app.
    */
   xaiApiKey: string | null;

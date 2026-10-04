@@ -10,19 +10,26 @@ const IMAGINE_MODEL = "grok-imagine-image-2.0";
 const MARKDOWN_MAX = 8_000;
 const IMAGINE_TIMEOUT_MS = 60_000;
 
-const SESSION_SUMMARY_INSTRUCTION = `Create one polished, shareable study-session summary graphic from this note.
-Layout: a clean social-ready summary card — NOT a flowchart, NOT a concept map, no nodes, no arrows, no mind-map.
-Include only content that appears in the note:
-- Session title / goal (from the note heading when present)
-- What was worked on
-- Key takeaways, decisions, gaps / stuck points, or next steps when those sections have real content
-If a section says "Not captured.", omit that section entirely. Do not invent topics, takeaways, or next steps.
-Style: readable typography, light background, generous margins, high-contrast text, subtle study aesthetic.
+const BRAG_SHEET_INSTRUCTION = `Create one polished, shareable space-mission brag sheet poster from these session stats.
+Layout: a proud statistics achievement card — NOT a flowchart, NOT a concept map, no nodes, no arrows, no mind-map, no tree, no org chart.
+Primary brag (when minutes are provided): "Locked in for N minutes" as the hero number.
+Include the mission / goal title prominently.
+If a concrete accomplishment is listed (finished milestone, completed discussion post, shipped something), feature it as a proud brag line.
+Optional light stats (on-task percent, etc.) only when provided — never invent numbers, achievements, or study details.
+Tone: celebratory, rocket / mission / cosmos vibe — make a student proud to share. Cosmic gradient or deep-space aesthetic is welcome; keep typography high-contrast and readable.
+NEVER render empty diglog placeholders or uncaptured-section filler text. NEVER invent empty diglog sections (What I worked on / Decisions / Stuck on / Next).
 No photographs, no people, no faces, no logos, no UI screenshots, no watermarks.`;
 
 export type ConceptMapImage = {
   content_type: string;
   image_base64: string;
+};
+
+/** Optional lock-in stats from the desktop (prefer these over inventing from diglog). */
+export type BragSheetStats = {
+  locked_in_minutes?: number;
+  mission?: string;
+  on_task_percent?: number;
 };
 
 /** Drop a leaked Copilot suggestion block so it is not drawn into the summary. */
@@ -33,7 +40,15 @@ export function stripStudySuggest(markdown: string): string {
     .trim();
 }
 
-/** True when the note has content beyond a title and "Not captured." placeholders. */
+export function extractMissionTitle(markdown: string): string {
+  for (const line of markdown.split("\n")) {
+    const heading = line.trim().match(/^#\s+(.+)$/);
+    if (heading?.[1]?.trim()) return heading[1].trim();
+  }
+  return "";
+}
+
+/** True when the note body has real diglog content beyond "Not captured." placeholders. */
 export function noteHasMapTopics(markdown: string): boolean {
   for (const line of markdown.split("\n")) {
     const trimmed = line.trim();
@@ -46,26 +61,114 @@ export function noteHasMapTopics(markdown: string): boolean {
   return false;
 }
 
-export function conceptMapSource(markdown: string): string {
-  const cleaned = stripStudySuggest(markdown);
-  if (!cleaned) {
-    throw new HttpError(400, "invalid_concept_map", "markdown is required.");
+/** Non-empty diglog lines (section label + body), skipping Not-captured placeholders. */
+export function diglogHighlights(markdown: string): string[] {
+  const out: string[] = [];
+  let section = "";
+  for (const line of markdown.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const h2 = trimmed.match(/^##\s+(.+)$/);
+    if (h2?.[1]) {
+      section = h2[1].trim();
+      continue;
+    }
+    if (trimmed.startsWith("#")) continue;
+    const body = trimmed.replace(/^[-*]\s+/, "").trim();
+    if (!body || /^not captured\.?$/i.test(body)) continue;
+    out.push(section ? `${section}: ${body}` : body);
   }
-  if (!noteHasMapTopics(cleaned)) {
+  return out;
+}
+
+function positiveInt(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const n = Math.round(value);
+  return n > 0 ? n : undefined;
+}
+
+function percentInt(value: unknown): number | undefined {
+  const n = positiveInt(value);
+  if (n === undefined) return undefined;
+  return Math.min(100, n);
+}
+
+/** Shareable when we have mission, locked-in minutes, or real diglog — not only Not-captured lines. */
+export function canBuildBragSheet(markdown: string, stats: BragSheetStats = {}): boolean {
+  const cleaned = stripStudySuggest(markdown);
+  const mission = (stats.mission?.trim() || extractMissionTitle(cleaned)).trim();
+  const minutes = positiveInt(stats.locked_in_minutes) ?? 0;
+  if (mission || minutes > 0) return true;
+  return diglogHighlights(cleaned).length > 0;
+}
+
+/** Build the stats block sent to Imagine — omits empty diglog / Not captured entirely. */
+export function buildBragSheetPayload(markdown: string, stats: BragSheetStats = {}): string {
+  const cleaned = stripStudySuggest(markdown);
+  if (!canBuildBragSheet(cleaned, stats)) {
+    if (!cleaned) {
+      throw new HttpError(400, "invalid_concept_map", "markdown is required.");
+    }
     throw new HttpError(
       400,
       "empty_concept_map",
-      "This note has no captured content to summarize — every section is empty.",
+      "Nothing to brag about yet — need locked-in time or a mission goal.",
     );
   }
-  return cleaned.length > MARKDOWN_MAX ? cleaned.slice(0, MARKDOWN_MAX) : cleaned;
+
+  const mission = (stats.mission?.trim() || extractMissionTitle(cleaned)).trim();
+  const minutes = positiveInt(stats.locked_in_minutes);
+  const onTask = percentInt(stats.on_task_percent);
+  const highlights = diglogHighlights(cleaned);
+
+  const lines: string[] = ["BRAG SHEET STATS:"];
+  if (minutes !== undefined) {
+    lines.push(`- Locked in: ${minutes} minutes`);
+  }
+  if (mission) {
+    lines.push(`- Mission: ${mission}`);
+  }
+  if (onTask !== undefined) {
+    lines.push(`- On-task: ${onTask}%`);
+  }
+  if (highlights.length) {
+    lines.push("- Highlights (only include if they sound like real progress; do not invent):");
+    for (const h of highlights.slice(0, 8)) {
+      lines.push(`  - ${h}`);
+    }
+  } else {
+    lines.push(
+      "- No diglog highlights — celebrate locked-in time + mission only. Do not invent work details.",
+    );
+  }
+
+  let payload = lines.join("\n");
+  if (payload.length > MARKDOWN_MAX) {
+    payload = payload.slice(0, MARKDOWN_MAX);
+  }
+  return payload;
 }
 
-export function buildConceptMapPrompt(markdown: string): string {
-  return `${SESSION_SUMMARY_INSTRUCTION}\n\nNOTE:\n${conceptMapSource(markdown)}`;
+/** @deprecated Prefer buildBragSheetPayload — kept for callers that only have markdown. */
+export function conceptMapSource(markdown: string, stats: BragSheetStats = {}): string {
+  return buildBragSheetPayload(markdown, stats);
 }
 
-export function parseConceptMapBody(body: unknown): string {
+export function buildConceptMapPrompt(markdown: string, stats: BragSheetStats = {}): string {
+  return `${BRAG_SHEET_INSTRUCTION}\n\n${buildBragSheetPayload(markdown, stats)}`;
+}
+
+export function parseBragSheetStats(record: Record<string, unknown>): BragSheetStats {
+  const mission =
+    typeof record.mission === "string" && record.mission.trim() ? record.mission.trim() : undefined;
+  return {
+    locked_in_minutes: positiveInt(record.locked_in_minutes),
+    mission,
+    on_task_percent: percentInt(record.on_task_percent),
+  };
+}
+
+export function parseConceptMapBody(body: unknown): { markdown: string; stats: BragSheetStats } {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "invalid_concept_map", "Expected a JSON object.");
   }
@@ -74,7 +177,10 @@ export function parseConceptMapBody(body: unknown): string {
   if (typeof record.markdown !== "string") {
     throw new HttpError(400, "invalid_concept_map", "markdown is required.");
   }
-  return conceptMapSource(record.markdown);
+  const stats = parseBragSheetStats(record);
+  // Validate shareable content up front (throws empty/invalid).
+  buildBragSheetPayload(record.markdown, stats);
+  return { markdown: record.markdown, stats };
 }
 
 export function imageContentType(base64: string): string {
@@ -104,16 +210,17 @@ export function parseImagineResponse(body: unknown): ConceptMapImage {
 export async function generateConceptMap(input: {
   config: Config;
   markdown: string;
+  stats?: BragSheetStats;
   fetchImpl: FetchLike;
 }): Promise<ConceptMapImage> {
   if (!input.config.xaiApiKey) {
     throw new HttpError(
       503,
       "imagine_not_configured",
-      "Session summaries need Grok Imagine on the API (set XAI_API_KEY).",
+      "Brag sheets need Grok Imagine on the API (set XAI_API_KEY).",
     );
   }
-  const prompt = buildConceptMapPrompt(input.markdown);
+  const prompt = buildConceptMapPrompt(input.markdown, input.stats ?? {});
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IMAGINE_TIMEOUT_MS);
   let response: Response;
@@ -165,7 +272,7 @@ export async function generateConceptMap(input: {
   return parseImagineResponse(payload);
 }
 
-/** Signed-in session-summary image for the lock-in final review (`POST /v1/concept-map`). */
+/** Signed-in mission brag-sheet image for the lock-in final review (`POST /v1/concept-map`). */
 export async function handleConceptMap(
   method: string,
   path: string,
@@ -181,8 +288,8 @@ export async function handleConceptMap(
       throw new HttpError(405, "method_not_allowed", "Method not allowed.");
     }
     await authorize();
-    const markdown = parseConceptMapBody(await readJson(req, 48 * 1024));
-    const image = await generateConceptMap({ config, markdown, fetchImpl });
+    const { markdown, stats } = parseConceptMapBody(await readJson(req, 48 * 1024));
+    const image = await generateConceptMap({ config, markdown, stats, fetchImpl });
     sendJson(res, 200, image);
     return true;
   } catch (error) {

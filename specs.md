@@ -234,17 +234,22 @@ The first POST returns `201` with the stored row (`id`, `user_id`, `session_id`,
 
 `session_notes`: `id`, `user_id`, `session_id`, `started_at`, `ended_at`, `goals`, `kind`, `markdown`, `created_at`. Unique on `(user_id, session_id)`. Indexed on `(user_id, ended_at DESC)`.
 
-## Session summary image
+## Session summary image (mission brag sheet)
 
-`POST /v1/concept-map` (path kept for compatibility) draws one shareable study-session summary graphic for the lock-in final review. Signed-in users only. The desktop sends the session note, not a free-form prompt.
+`POST /v1/concept-map` (path kept for compatibility) draws one shareable space-themed **brag sheet** for the lock-in final review. Signed-in users only. The desktop sends session note markdown plus optional lock-in stats — not a free-form prompt.
 
 ```json
-{ "markdown": "## Lock-in\n\nFinished push on the priority queue." }
+{
+  "markdown": "# Finish ENGL 1140 work\n\n## What I worked on\nNot captured.",
+  "locked_in_minutes": 45,
+  "mission": "Finish ENGL 1140 work",
+  "on_task_percent": 80
+}
 ```
 
-`markdown` is required. Empty text is `400` `invalid_concept_map`. A note whose body is only "Not captured." placeholders is `400` `empty_concept_map`. Text longer than 8,000 characters is clipped to that length. Fields named like `image` or `screenshot`, and base64 image payloads, are rejected with `400` `image_not_allowed`. The route does not store the image, and session notes still reject images.
+`markdown` is required. Empty text with no stats is `400` `invalid_concept_map`. Refuse with `400` `empty_concept_map` only when there is truly nothing to celebrate (no locked-in minutes, no mission/title, and no real diglog lines). An all-“Not captured.” diglog is still allowed when a mission title or `locked_in_minutes` is present — empty placeholder sections are omitted from the Imagine prompt, never drawn. Optional `locked_in_minutes`, `mission`, and `on_task_percent` enrich the brag card. Payload text longer than 8,000 characters is clipped. Fields named like `image` or `screenshot`, and base64 image payloads, are rejected with `400` `image_not_allowed`. The route does not store the image.
 
-The server writes the prompt. It asks Grok Imagine for a polished summary card (title, what was worked on, takeaways/gaps/next when present) — not a flowchart or concept map — using only topics in the note, and it drops any study-suggestion block before the call. The upstream request is `POST https://api.x.ai/v1/images/generations` with model `grok-imagine-image-2.0`, `n` 1, `aspect_ratio` `16:9`, `resolution` `1k`, `quality` `low`, and `response_format` `b64_json`. The key is `XAI_API_KEY`. If it is unset, the route returns `503` `imagine_not_configured`.
+The server writes the prompt. It asks Grok Imagine for a proud space/mission stats poster (locked-in minutes, mission name, optional completion highlights) — not a flowchart or concept map — and forbids “Not captured.” text. Study-suggestion blocks are dropped before the call. The upstream request is `POST https://api.x.ai/v1/images/generations` with model `grok-imagine-image-2.0`, `n` 1, `aspect_ratio` `16:9`, `resolution` `1k`, `quality` `low`, and `response_format` `b64_json`. The key is `XAI_API_KEY`. If it is unset, the route returns `503` `imagine_not_configured`.
 
 Success is `200`:
 
