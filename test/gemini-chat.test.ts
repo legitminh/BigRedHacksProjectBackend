@@ -53,11 +53,37 @@ test("geminiChat: non-quota failures stay gemini_failed; empty is gemini_empty",
       (e: unknown) =>
         e instanceof HttpError &&
         e.code === "gemini_failed" &&
+        e.status === 502 &&
         !/model not found/i.test(e.message),
     );
     await assert.rejects(
       () => geminiChat({ ...base, fetchImpl: json(200, { candidates: [] }) }),
       (e: unknown) => e instanceof HttpError && e.code === "gemini_empty",
+    );
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test("geminiChat: upstream 5xx become sanitized gemini_failed with status 503", async () => {
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await assert.rejects(
+      () =>
+        geminiChat({
+          ...base,
+          fetchImpl: json(503, { error: { message: "The service is currently unavailable", status: "UNAVAILABLE" } }),
+        }),
+      (e: unknown) =>
+        e instanceof HttpError &&
+        e.code === "gemini_failed" &&
+        e.status === 503 &&
+        !/currently unavailable/i.test(e.message),
+    );
+    await assert.rejects(
+      () => geminiChat({ ...base, fetchImpl: json(500, { error: { message: "internal boom", status: "INTERNAL" } }) }),
+      (e: unknown) => e instanceof HttpError && e.code === "gemini_failed" && e.status === 503,
     );
   } finally {
     console.warn = warn;

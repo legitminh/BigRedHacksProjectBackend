@@ -159,6 +159,17 @@ function normalizeGenerateBody(config: Config, body: unknown): Record<string, un
   if (typeof input.prompt === "string") out.prompt = input.prompt;
   if (typeof input.system === "string") out.system = input.system;
   if (typeof input.template === "string") out.template = input.template;
+  // Ollama structured output: "json" or a JSON-schema object (plain object only).
+  if (typeof input.format === "string") {
+    out.format = input.format;
+  } else if (
+    input.format !== undefined &&
+    input.format !== null &&
+    typeof input.format === "object" &&
+    !Array.isArray(input.format)
+  ) {
+    out.format = input.format;
+  }
   if (typeof input.raw === "boolean") out.raw = input.raw;
   if (typeof input.keep_alive === "string" || typeof input.keep_alive === "number") {
     out.keep_alive = input.keep_alive;

@@ -67,8 +67,10 @@ export async function geminiChat(input: {
         "Cloud coach hit today’s free limit. Try again tomorrow, or keep using local lock-in coaching.",
       );
     }
+    // Sanitize client text (no upstream leak). Map 5xx → 503 so shouldFallbackToLocal
+    // can still hand off to Ollama; keep 4xx as 502 (no silent local fallback).
     throw new HttpError(
-      502,
+      response.status >= 500 ? 503 : 502,
       "gemini_failed",
       "Cloud coach failed. Try again, or keep using local lock-in coaching.",
     );

@@ -680,7 +680,7 @@ Use only the sources in the user message.
 
 The user message names the kind. Follow it.
 - study: Markdown title, then only What I was learning and In my own words when there is evidence. No Gaps / Next.
-- diglog: Markdown title, then only What I worked on when there is evidence. No Decisions / Stuck on / Next.
+- devlog: Markdown title, then only What I worked on when there is evidence. No Decisions / Stuck on / Next.
 If there is no evidence beyond the goal, output the Markdown title alone.
 The title may be the goal. Output the Markdown note only. No code fence around the note.`;
 

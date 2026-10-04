@@ -98,7 +98,12 @@ export async function ollamaChat(input: {
   return text;
 }
 
-/** Gemini failures where a silent local fallback is better than user friction. */
+/**
+ * Gemini failures where a silent local fallback is better than user friction.
+ * Client-facing messages are sanitized (no upstream detail), so outage detection
+ * relies on status/code: 5xx from Gemini REST are remapped to status 503.
+ * Do not fall back on ordinary 4xx gemini_failed (e.g. model not found).
+ */
 export function shouldFallbackToLocal(error: unknown): boolean {
   if (!(error instanceof HttpError)) return false;
   if (
@@ -110,6 +115,9 @@ export function shouldFallbackToLocal(error: unknown): boolean {
     return true;
   }
   if (error.code === "gemini_failed") {
+    // Prefer status after sanitize (REST 5xx → 503); keep message regex for Live
+    // paths that still forward a short operator-facing message. Status 502 alone
+    // is not enough — that is also used for sanitized 4xx (no local fallback).
     const msg = error.message.toLowerCase();
     return (
       error.status === 429 ||

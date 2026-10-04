@@ -407,6 +407,72 @@ test("gemini chat falls back to local Ollama on quota without surfacing friction
   }
 });
 
+test("gemini chat falls back to Ollama on sanitized REST 5xx", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
+  const sent: { code: string }[] = [];
+  const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes("generativelanguage.googleapis.com")) {
+      return new Response(
+        JSON.stringify({ error: { message: "The service is currently unavailable", status: "UNAVAILABLE" } }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.includes("/api/chat")) {
+      return new Response(
+        JSON.stringify({ message: { role: "assistant", content: "Ollama after Gemini 5xx." } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return fetch(input, init);
+  };
+  const server: Server = createApp({
+    config: loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      SESSION_SECRET: SECRET,
+      PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+      GEMINI_API_KEY: "test-gemini-key",
+      LOCAL_CHAT_PROVIDER: "gemini",
+      OLLAMA_BASE_URL: "http://127.0.0.1:11434",
+      OLLAMA_CHAT_MODEL: "qwen2.5:7b",
+    }),
+    store: openFileStore(join(dir, "store.json")),
+    google: google(),
+    mailer,
+    calendar: calendar([]),
+    fetch: fetchImpl,
+    // No liveChat override — exercise REST geminiChat sanitize + shouldFallbackToLocal.
+    now: () => new Date("2026-10-03T18:00:00.000Z"),
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const token = await tokenFor(base, sent);
+    const warn = console.warn;
+    console.warn = () => {};
+    let res: Response;
+    try {
+      res = await fetch(`${base}/v1/gemini/chat`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "What should I study next?", history: [] }),
+      });
+    } finally {
+      console.warn = warn;
+    }
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { content: string; provider: string; degraded: boolean };
+    assert.equal(body.content, "Ollama after Gemini 5xx.");
+    assert.equal(body.provider, "ollama");
+    assert.equal(body.degraded, true);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
 test("LOCAL_CHAT_PROVIDER=ollama never calls Gemini even when GEMINI_API_KEY is set", async () => {
   const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
   const sent: { code: string }[] = [];

@@ -153,6 +153,45 @@ test("coach generate accepts JWT and forces stream false", async () => {
   );
 });
 
+test("coach generate forwards format json to Ollama", async () => {
+  let posted: unknown;
+  await withApp(
+    async (base) => {
+      const token = await accessToken(base);
+      const response = await fetch(`${base}/v1/coach/api/generate`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "qwen2.5:0.5b",
+          prompt: "hi",
+          format: "json",
+          not_allowed: "drop-me",
+        }),
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(posted, {
+        model: "qwen2.5:0.5b",
+        prompt: "hi",
+        stream: false,
+        format: "json",
+      });
+    },
+    {
+      fetchImpl: async (url, init) => {
+        assert.equal(url, "http://127.0.0.1:11434/api/generate");
+        posted = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ response: "{}" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    },
+  );
+});
+
 test("coach tags returns clear error when Ollama is down", async () => {
   await withApp(
     async (base) => {
