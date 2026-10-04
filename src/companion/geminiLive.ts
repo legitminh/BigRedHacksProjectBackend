@@ -675,11 +675,13 @@ Use only the sources in the user message.
 - COACH PROMPTS are not the user's words. Do not treat them as activity.
 - Do not invent topics, exercises, pronunciation work, flashcards, files, courses, or next steps that are not written in those sources.
 - Do not turn a goal title into a story about what they studied.
-- If a section has no evidence, write exactly: Not captured.
+- If a section has no evidence, omit that section entirely. Never write "Not captured."
+- Never invent Decisions, Stuck on, Next, Gaps, or Gaps / shaky parts sections.
 
 The user message names the kind. Follow it.
-- study: Markdown title, then What I was learning, In my own words, Gaps / shaky parts, Next.
-- devlog: Markdown title, then What I worked on, Decisions, Stuck on, Next.
+- study: Markdown title, then only What I was learning and In my own words when there is evidence. No Gaps / Next.
+- diglog: Markdown title, then only What I worked on when there is evidence. No Decisions / Stuck on / Next.
+If there is no evidence beyond the goal, output the Markdown title alone.
 The title may be the goal. Output the Markdown note only. No code fence around the note.`;
 
 /** Server-owned template for a lock-in note. No Copilot role and no study-suggestion block. */
