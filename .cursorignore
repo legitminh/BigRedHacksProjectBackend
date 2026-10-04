@@ -1,0 +1,27 @@
+# Dependencies & build
+node_modules/
+dist/
+coverage/
+.turbo/
+
+# Lockfiles (low signal, high token cost)
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Runtime / secrets / local data
+.env
+.env.*
+data/
+
+# Agent audit noise
+AUDIT-*.local.md
+*.local.md
+
+# Logs & OS junk
+logs/
+*.log
+*.ndjson
+*.jsonl
+*.har
+.DS_Store
