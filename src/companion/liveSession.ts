@@ -30,6 +30,7 @@ import {
   audioStreamEndMessage,
   buildCompanionListenSystem,
   buildCompanionVoiceReplySystem,
+  contextLooksLikeActiveLockIn,
   selectGeminiChatModel,
   denyToolResponse,
   errorMessage,
@@ -38,8 +39,7 @@ import {
   signalsFromMessage,
   toolCallsFromMessage,
   type LiveSignal,
-} from "./geminiLive.ts";
-import {
+} from "./geminiLive.ts";import {
   connectGrokTts,
   GROK_TTS_MAX_CHARS,
   GROK_TTS_SAMPLE_RATE,
@@ -784,7 +784,8 @@ export async function runCompanionLiveSession(
       history.push({ role: "assistant", content: fullReply });
       while (history.length > 12) history.shift();
       send(client, { type: "assistant", text: fullReply, final: true });
-      if (suggestion) {
+      // Never forward start-session suggestions while a lock-in is already running.
+      if (suggestion && !contextLooksLikeActiveLockIn(turnContext ?? sessionContext)) {
         send(client, {
           type: "study_suggest",
           goals: suggestion.goals,

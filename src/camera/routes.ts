@@ -131,8 +131,11 @@ export async function handleCameraObserve(
         "[camera/observe] Presage failed:",
         err instanceof Error ? err.message : err,
       );
-      // Presence can still run as uncertain.
-      faceDetected = null;
+      // Treat analyze failures like "no usable face signal" so the away /
+      // obstructed ladder can still confirm (phone-over-lens, walk-away).
+      // A single failure stays silent (AWAY_CONFIRM_OBSERVES=2); network blips
+      // alone do not speak. vitals stay null — never invent stress.
+      faceDetected = false;
     }
   } else if (!isVideo) {
     // JPEG-only: no Presage vitals; presence stays uncertain unless brightness says obstructed.

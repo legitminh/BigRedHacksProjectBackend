@@ -406,31 +406,52 @@ test("POST /v1/camera/observe rate limit allows ~25s desktop cadence", async () 
   );
 });
 
-test("POST /v1/camera/observe Presage failure yields null vitals (documented fallback)", async () => {
+test("POST /v1/camera/observe Presage failure yields null vitals; away confirms on second fail", async () => {
   await withApp(
     async (base, token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      const payload = {
+        session_id: "lock-presage-fail",
+        phase: "active",
+        mime: "video/mp4",
+        data_base64: Buffer.from("clip-bytes").toString("base64"),
+      };
       const res = await fetch(`${base}/v1/camera/observe`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          session_id: "lock-presage-fail",
-          phase: "active",
-          mime: "video/mp4",
-          data_base64: Buffer.from("clip-bytes").toString("base64"),
-        }),
+        headers,
+        body: JSON.stringify(payload),
       });
       assert.equal(res.status, 200);
       const body = (await res.json()) as {
         vitals: unknown;
         nudge: unknown;
         presence: string;
+        face_detected: boolean | null;
       };
       assert.equal(body.vitals, null);
       assert.equal(body.nudge, null);
+      // First failure: face_detected=false but away not yet confirmed.
+      assert.equal(body.face_detected, false);
       assert.equal(body.presence, "uncertain");
+
+      const second = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 200);
+      const secondBody = (await second.json()) as {
+        presence: string;
+        face_detected: boolean | null;
+        vitals: unknown;
+      };
+      // Sustained analyze failures (phone-over-lens / walk-away) enter the away ladder.
+      assert.equal(secondBody.face_detected, false);
+      assert.equal(secondBody.presence, "left_frame");
+      assert.equal(secondBody.vitals, null);
     },
     {
       cameraAnalyze: async () => {
