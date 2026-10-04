@@ -7,8 +7,8 @@ type Pending = {
   pollToken: string;
   codeVerifier: string;
   userId: string;
-  /** Catalog tool this consent is for. Old records without it are rejected. */
-  toolId: string;
+  /** Set for a per-tool consent. Absent for the bundled Calendar + Drive grant. */
+  toolId?: string;
   expiresAt: number;
   status: Status;
   error?: PollError;
@@ -52,7 +52,7 @@ export class CalendarConnects {
     | { type: "missing" }
     | { type: "expired" }
     | { type: "pending"; expiresIn: number }
-    | { type: "complete"; toolId: string; userId: string }
+    | { type: "complete"; toolId?: string; userId: string }
     | { type: "error"; error: PollError } {
     const pending = this.byPoll.get(token);
     if (!pending) return { type: "missing" };

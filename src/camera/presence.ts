@@ -12,6 +12,13 @@ import {
 
 export type CameraPhase = "active" | "paused" | "break";
 
+/** Desktop: when kind === "suggest_break" → emit-only `suggest_break_timer` (never auto-start). */
+export const SUGGEST_BREAK_KIND = "suggest_break" as const;
+/** Calm breath fallback after a recent break suggestion. */
+export const STRESSED_BREATH_KIND = "stressed" as const;
+
+export type StressNudgeKind = typeof SUGGEST_BREAK_KIND | typeof STRESSED_BREATH_KIND;
+
 export type PresenceNudge = {
   kind: string;
   text: string;
@@ -33,8 +40,16 @@ export type ObservePresenceResult = {
   watching_note: string;
 };
 
+/** Need 2 away observes (or held candidate time) so a single glance does not confirm leave. */
 const AWAY_CONFIRM_OBSERVES = 2;
+/** Time-based confirm when observes are denser than the ~25–30s desktop cadence. */
 const AWAY_CONFIRM_MS = 5_000;
+/**
+ * Absence ladder after left_frame is confirmed (active only).
+ * Timings are wall-clock from when the away candidate began (not from confirm tick),
+ * so with ~25–30s observe cadence a real away (~20–60s+) gets a first nudge on the
+ * confirming observe — not an extra full period later.
+ */
 const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: string }> = [
   {
     step: "first",
@@ -56,8 +71,18 @@ const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: str
   },
 ];
 const OBSTRUCTED_MS = 30_000;
-const STRESS_COOLDOWN_MS = 180_000;
+/** Shared cooldown for stress-family nudges (`suggest_break` | `stressed`). */
+export const STRESS_COOLDOWN_MS = 180_000;
 const RETURN_CONFIRM_MS = 2_000;
+
+// Keep under ~12 words; never include digits (HR/RR/%). Spell out "five".
+const SUGGEST_BREAK_TEXT = "Feeling tense — optional five-minute break?";
+const STRESSED_BREATH_TEXT = "You seem tense — one slow breath, then back.";
+
+/** Pause and break phases: no spoken nudges. */
+export function isSilentCameraPhase(phase: CameraPhase): boolean {
+  return phase === "paused" || phase === "break";
+}
 
 function classify(
   faceDetected: boolean | null,
@@ -96,6 +121,42 @@ function resetAbsence(session: CameraPresenceSession): void {
   session.presentSince = null;
 }
 
+/**
+ * Whether stress should surface a break suggestion (vs breath fallback).
+ * Prefer `suggest_break` unless the last stress nudge was already a break offer.
+ */
+export function shouldSuggestBreak(lastStressKind: StressNudgeKind | null): boolean {
+  return lastStressKind !== SUGGEST_BREAK_KIND;
+}
+
+/**
+ * Stress nudge policy:
+ * - Shared STRESS_COOLDOWN_MS between any stress-family lines (sparse).
+ * - Prefer `suggest_break` (voluntary five-minute invite — suggestion only).
+ * - Alternate with `stressed` (slow breath) so break offers are not every tick.
+ * - Silent on paused/break; quiet phases also refresh the stress cooldown clock
+ *   so resuming after a break does not immediately re-nudge.
+ * - No biometric numbers in copy.
+ *
+ * Desktop: nudge.kind === "suggest_break" → emit-only suggest_break_timer locally.
+ */
+export function mapStressedToNudge(opts: {
+  stressed: boolean | null | undefined;
+  silentPhase: boolean;
+  msSinceLastStressNudge: number;
+  lastStressKind: StressNudgeKind | null;
+  cooldownMs?: number;
+}): PresenceNudge | null {
+  if (opts.silentPhase || opts.stressed !== true) return null;
+  const cooldown = opts.cooldownMs ?? STRESS_COOLDOWN_MS;
+  if (opts.msSinceLastStressNudge < cooldown) return null;
+
+  if (shouldSuggestBreak(opts.lastStressKind)) {
+    return { kind: SUGGEST_BREAK_KIND, text: SUGGEST_BREAK_TEXT };
+  }
+  return { kind: STRESSED_BREATH_KIND, text: STRESSED_BREATH_TEXT };
+}
+
 /** Apply one camera observe tick; returns at most one short nudge. */
 export function observePresence(
   store: CameraSessionStore,
@@ -104,7 +165,14 @@ export function observePresence(
   const now = input.now ?? new Date();
   store.prune(now);
   const session = store.getOrCreate(input.userId, input.sessionId, now);
-  const silentPhase = input.phase === "paused" || input.phase === "break";
+  const silentPhase = isSilentCameraPhase(input.phase);
+
+  // Quiet phases: hold the stress cooldown clock so we do not fire a stress
+  // line the moment the user leaves break/pause (a five-minute break already
+  // outlasts STRESS_COOLDOWN_MS).
+  if (silentPhase) {
+    session.lastStressNudgeAt = now;
+  }
 
   const raw = classify(input.faceDetected, input.brightness ?? null);
 
@@ -149,7 +217,9 @@ export function observePresence(
     }
 
     if (session.absentSince == null) {
-      session.absentSince = now;
+      // Credit time from the first away candidate tick so ladder thresholds match
+      // real desk-absence, not "time since the confirming observe".
+      session.absentSince = session.awayCandidateSince ?? now;
       session.leftConfirmed = true;
       session.welcomedBack = false;
     }
@@ -157,6 +227,7 @@ export function observePresence(
     session.presence = "left_frame";
     const absentMs = now.getTime() - session.absentSince.getTime();
 
+    // Quiet on paused/break; after pause-ack stay silent for this absence.
     if (!silentPhase && !session.ladderQuiet) {
       for (const rung of LADDER) {
         if (session.ladderSpoken.has(rung.step) || absentMs < rung.afterMs) continue;
@@ -191,18 +262,18 @@ export function observePresence(
 
   session.presence = "present";
 
-  if (
-    !nudge &&
-    !silentPhase &&
-    input.stressed === true
-  ) {
+  if (!nudge) {
     const last = session.lastStressNudgeAt?.getTime() ?? 0;
-    if (now.getTime() - last >= STRESS_COOLDOWN_MS) {
+    const stressNudge = mapStressedToNudge({
+      stressed: input.stressed,
+      silentPhase,
+      msSinceLastStressNudge: now.getTime() - last,
+      lastStressKind: session.lastStressNudgeKind,
+    });
+    if (stressNudge) {
       session.lastStressNudgeAt = now;
-      nudge = {
-        kind: "stressed",
-        text: "You seem tense — one slow breath, then back to it.",
-      };
+      session.lastStressNudgeKind = stressNudge.kind as StressNudgeKind;
+      nudge = stressNudge;
     }
   }
 

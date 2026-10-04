@@ -4,6 +4,11 @@ import { randomUUID } from "node:crypto";
 
 import { canonicalEmail } from "../auth/email.ts";
 import { hashesMatch } from "../auth/tokens.ts";
+import {
+  clipCachedText,
+  driveCacheEvictFileIds,
+  type DriveCachedFile,
+} from "../drive/cache.ts";
 import type {
   PaceSample,
   Proficiency,
@@ -22,6 +27,7 @@ import type {
   GoogleProfile,
   PublicUser,
   RotateResult,
+  SchoolDigest,
   Store,
   StoredRefreshToken,
   ToolConnection,
@@ -49,7 +55,15 @@ type FileData = {
   sessions: Owned<SessionRecap>[];
   sessionNotes: Owned<SessionNote>[];
   toolConnections: ToolConnection[];
+  driveFileCache: DriveCachedFile[];
+  schoolDigests: SchoolDigest[];
 };
+
+function clipDigestText(text: string): string {
+  const max = 80_000;
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1).trimEnd()}…`;
+}
 
 function empty(): FileData {
   return {
@@ -63,6 +77,8 @@ function empty(): FileData {
     sessions: [],
     sessionNotes: [],
     toolConnections: [],
+    driveFileCache: [],
+    schoolDigests: [],
   };
 }
 
@@ -103,6 +119,8 @@ export function openFileStore(path: string): Store {
         sessions: parsed.sessions ?? [],
         sessionNotes: parsed.sessionNotes ?? [],
         toolConnections: parsed.toolConnections ?? [],
+        driveFileCache: parsed.driveFileCache ?? [],
+        schoolDigests: parsed.schoolDigests ?? [],
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
@@ -307,6 +325,8 @@ export function openFileStore(path: string): Store {
           activeRefreshTokens: data.refreshTokens.filter(
             (t) => !t.revokedAt && Date.parse(t.expiresAt) > nowMs,
           ).length,
+          driveCacheCount: (data.driveFileCache ?? []).length,
+          schoolDigestCount: (data.schoolDigests ?? []).length,
           users,
         };
       });
@@ -354,6 +374,30 @@ export function openFileStore(path: string): Store {
           sessions: data.sessions
             .filter((item) => item.userId === userId)
             .map(({ userId: _u, ...rest }) => rest),
+          driveCache: (data.driveFileCache ?? [])
+            .filter((row) => row.userId === userId)
+            .map((row) => ({
+              file_id: row.fileId,
+              name: row.name,
+              mime_type: row.mimeType,
+              modified_time: row.modifiedTime,
+              kind: row.kind ?? null,
+              text_chars: row.text.length,
+              text_preview: row.text.slice(0, 160),
+              extracted_at: row.extractedAt,
+            })),
+          schoolDigests: (data.schoolDigests ?? [])
+            .filter((row) => row.userId === userId)
+            .map((row) => ({
+              digest_date: row.digestDate,
+              timezone: row.timezone,
+              model: row.model,
+              digest_text: row.digestText,
+              sources: row.sources,
+              text_chars: row.digestText.length,
+              created_at: row.createdAt,
+              updated_at: row.updatedAt,
+            })),
           tokens: {
             total: tokens.length,
             active: tokens.filter((t) => !t.revokedAt && Date.parse(t.expiresAt) > nowMs).length,
@@ -417,8 +461,36 @@ export function openFileStore(path: string): Store {
                 priorities: p.priorities,
                 interaction: p.interaction,
                 has_study_memory: Boolean(p.study_memory),
-                study_memory: p.study_memory ?? null,
                 updated_at: p.updated_at,
+              })),
+            );
+          case "drive_cache":
+            return pack(
+              (data.driveFileCache ?? []).map((row) => ({
+                user_id: row.userId,
+                file_id: row.fileId,
+                name: row.name,
+                mime_type: row.mimeType,
+                kind: row.kind ?? null,
+                modified_time: row.modifiedTime,
+                text_chars: row.text.length,
+                text_preview: row.text.slice(0, 120),
+                extracted_at: row.extractedAt,
+              })),
+            );
+          case "school_digests":
+            return pack(
+              (data.schoolDigests ?? []).map((row) => ({
+                user_id: row.userId,
+                digest_date: row.digestDate,
+                timezone: row.timezone,
+                model: row.model,
+                sources: row.sources,
+                source_count: row.sources.length,
+                text_chars: row.digestText.length,
+                text_preview: row.digestText.slice(0, 120),
+                created_at: row.createdAt,
+                updated_at: row.updatedAt,
               })),
             );
           case "email_codes":
@@ -687,11 +759,89 @@ export function openFileStore(path: string): Store {
         return stored;
       });
     },
+    async getDriveFileCache(userId, fileId) {
+      return lock(async () => {
+        const data = await read();
+        return (
+          data.driveFileCache?.find(
+            (row) => row.userId === userId && row.fileId === fileId,
+          ) ?? null
+        );
+      });
+    },
+    async upsertDriveFileCache(entry) {
+      await lock(async () => {
+        const data = await read();
+        if (!data.driveFileCache) data.driveFileCache = [];
+        const clipped: DriveCachedFile = {
+          ...entry,
+          text: clipCachedText(entry.text),
+        };
+        const forUser = data.driveFileCache.filter((row) => row.userId === entry.userId);
+        const evict = new Set(driveCacheEvictFileIds(forUser, entry.fileId));
+        if (evict.size > 0) {
+          data.driveFileCache = data.driveFileCache.filter(
+            (row) => !(row.userId === entry.userId && evict.has(row.fileId)),
+          );
+        }
+        const index = data.driveFileCache.findIndex(
+          (row) => row.userId === entry.userId && row.fileId === entry.fileId,
+        );
+        if (index >= 0) data.driveFileCache[index] = clipped;
+        else data.driveFileCache.push(clipped);
+        await write(data);
+      });
+    },
+    async listDriveFileCache(userId) {
+      return lock(async () => {
+        const data = await read();
+        return (data.driveFileCache ?? []).filter((row) => row.userId === userId);
+      });
+    },
+    async clearDriveFileCache(userId) {
+      await lock(async () => {
+        const data = await read();
+        data.driveFileCache = (data.driveFileCache ?? []).filter(
+          (row) => row.userId !== userId,
+        );
+        await write(data);
+      });
+    },
+    async getSchoolDigest(userId, digestDate) {
+      return lock(async () => {
+        const data = await read();
+        return (
+          (data.schoolDigests ?? []).find(
+            (row) => row.userId === userId && row.digestDate === digestDate,
+          ) ?? null
+        );
+      });
+    },
+    async upsertSchoolDigest(digest) {
+      await lock(async () => {
+        const data = await read();
+        if (!data.schoolDigests) data.schoolDigests = [];
+        const clipped: SchoolDigest = {
+          ...digest,
+          digestText: clipDigestText(digest.digestText),
+        };
+        const index = data.schoolDigests.findIndex(
+          (row) => row.userId === clipped.userId && row.digestDate === clipped.digestDate,
+        );
+        if (index >= 0) data.schoolDigests[index] = clipped;
+        else data.schoolDigests.push(clipped);
+        await write(data);
+      });
+    },
     async clearUserData(userId, _now) {
       await lock(async () => {
         const data = await read();
         const user = data.users.find((item) => item.id === userId);
         const email = user?.email ? user.email.trim().toLowerCase() : null;
+        data.driveFileCache = (data.driveFileCache ?? []).filter(
+          (row) => row.userId !== userId,
+        );
+        data.schoolDigests = (data.schoolDigests ?? []).filter((row) => row.userId !== userId);
         data.profiles = data.profiles.filter((item) => item.userId !== userId);
         data.proficiencies = data.proficiencies.filter((item) => item.userId !== userId);
         data.paceSamples = data.paceSamples.filter((item) => item.userId !== userId);

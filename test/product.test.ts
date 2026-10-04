@@ -9,6 +9,7 @@ import { test } from "node:test";
 import type { GoogleClient } from "../src/auth/google.ts";
 import type { CalendarClient } from "../src/calendar/client.ts";
 import type { RawEvent } from "../src/calendar/classify.ts";
+import type { DriveClient, DriveFile, InventoryOptions } from "../src/drive/client.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Mailer } from "../src/mailer.ts";
 import { createApp } from "../src/server.ts";
@@ -55,7 +56,11 @@ function calendar(events: RawEvent[], inserted: unknown[] = []): CalendarClient 
   };
 }
 
-async function withApp(fn: (base: string, inbox: { code: string }[]) => Promise<void>, calendarClient = calendar([])) {
+async function withApp(
+  fn: (base: string, inbox: { code: string }[]) => Promise<void>,
+  calendarClient = calendar([]),
+  driveClient?: DriveClient,
+) {
   const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
   const sent: { code: string }[] = [];
   const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
@@ -70,6 +75,7 @@ async function withApp(fn: (base: string, inbox: { code: string }[]) => Promise<
     google: google(),
     mailer,
     calendar: calendarClient,
+    ...(driveClient ? { drive: driveClient } : {}),
     now: () => new Date("2026-10-03T18:00:00.000Z"),
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -80,6 +86,55 @@ async function withApp(fn: (base: string, inbox: { code: string }[]) => Promise<
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
   return sent;
+}
+
+/** Fake Drive holding more files than one inventory page, with no study-ish names. */
+function drive(total: number, calls: string[] = []): DriveClient {
+  const all: DriveFile[] = Array.from({ length: total }, (_, i) => ({
+    id: `f${i}`,
+    name: `file-${i}.pdf`,
+    mimeType: "application/pdf",
+    folderPath: i % 2 === 0 ? "Work" : "Personal/2026",
+    modifiedTime: new Date(Date.UTC(2026, 9, 1, 0, i)).toISOString(),
+  }));
+  return {
+    async listRecent(_token, limit) {
+      calls.push(`recent:${limit}`);
+      return all.slice(0, limit);
+    },
+    async search(_token, query, limit) {
+      calls.push(`search:${query}`);
+      return all.filter((f) => f.name.includes("3")).slice(0, limit);
+    },
+    async listFolder(_token, folderId, limit) {
+      calls.push(`folder:${folderId}`);
+      return all.slice(0, limit);
+    },
+    async findFolders(_token, query) {
+      calls.push(`folders:${query}`);
+      return [{ id: "fold1", name: "Work", mimeType: "application/vnd.google-apps.folder" }];
+    },
+    async inventory(_token, options: InventoryOptions = {}) {
+      const start = Number(options.pageToken ?? 0);
+      const size = Math.min(options.maxFiles ?? all.length, 50);
+      const files = all.slice(start, start + size);
+      const next = start + size < all.length ? String(start + size) : null;
+      calls.push(`inventory:${start}:${size}`);
+      return { files, nextPageToken: next, truncated: next !== null, folderCount: 2 };
+    },
+    async readFileText(_token, file) {
+      return { ok: true, text: `contents of ${file.name}`, kind: "pdf" };
+    },
+  };
+}
+
+async function connectGoogle(base: string, auth: Record<string, string>): Promise<void> {
+  const start = await fetch(`${base}/v1/google/connect/start`, { method: "POST", headers: auth });
+  const started = (await start.json()) as { state: string };
+  const callback = await fetch(
+    `${base}/v1/google/connect/callback?code=abc&state=${encodeURIComponent(started.state)}`,
+  );
+  assert.equal(callback.status, 200);
 }
 
 async function tokenForEmail(base: string, inbox: { code: string }[], email: string): Promise<string> {
@@ -473,6 +528,54 @@ test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini REST Flash-Lite when healt
   }
 });
 
+test("Copilot chat always uses flash-lite even with FULL CONTENTS in context", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
+  const sent: { code: string }[] = [];
+  const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  let lastModel = "";
+  const server: Server = createApp({
+    config: loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      SESSION_SECRET: SECRET,
+      PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+      GEMINI_API_KEY: "test-gemini-key",
+      GEMINI_MODEL: "gemini-3.5-flash-lite",
+      GEMINI_OVERVIEW_MODEL: "gemini-3.5-flash",
+      LOCAL_CHAT_PROVIDER: "gemini",
+    }),
+    store: openFileStore(join(dir, "store.json")),
+    google: google(),
+    mailer,
+    calendar: calendar([]),
+    liveChat: async (input) => {
+      lastModel = input.model;
+      return "Overview reply.";
+    },
+    now: () => new Date("2026-10-03T18:00:00.000Z"),
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const token = await tokenFor(base, sent);
+    const res = await fetch(`${base}/v1/gemini/chat`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: "Summarize gear",
+        history: [],
+        system:
+          "CONTEXT:\nFULL CONTENTS (120 characters):\nRope (active)\nHarness (retired)",
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(lastModel, "gemini-3.5-flash-lite");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
 test("DELETE /v1/me/data removes the user account entirely", async () => {
   await withApp(async (base, inbox) => {
     const token = await tokenFor(base, inbox);
@@ -573,34 +676,26 @@ test("calendar consent classifies the agenda and refuses edits to other events",
     assert.equal(blocked.status, 409);
     assert.equal(((await blocked.json()) as { error: { code: string } }).error.code, "calendar_not_connected");
 
-    const bundled = await fetch(`${base}/v1/google/calendar/start`, { method: "POST", headers: auth });
-    assert.equal(bundled.status, 400);
-    assert.equal(((await bundled.json()) as { error: { code: string } }).error.code, "tool_required");
-
-    const start = await fetch(`${base}/v1/tools/google_calendar/connect`, { method: "POST", headers: auth });
+    const start = await fetch(`${base}/v1/google/calendar/start`, { method: "POST", headers: auth });
     assert.equal(start.status, 200);
     const started = (await start.json()) as { authorization_url: string; state: string; poll_token: string };
     const authUrl = new URL(started.authorization_url);
-    assert.equal(authUrl.searchParams.get("scope"), "https://www.googleapis.com/auth/calendar.events");
-    assert.equal(authUrl.searchParams.get("include_granted_scopes"), "false");
+    assert.equal(
+      authUrl.searchParams.get("scope"),
+      "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly",
+    );
+    assert.equal(authUrl.searchParams.get("include_granted_scopes"), "true");
     const callback = await fetch(
       `${base}/v1/google/calendar/callback?code=abc&state=${encodeURIComponent(started.state)}`,
     );
     assert.equal(callback.status, 200);
-    assert.match(await callback.text(), /Google Calendar/);
-    const poll = await fetch(`${base}/v1/tools/google_calendar/poll?poll_token=${encodeURIComponent(started.poll_token)}`);
+    const poll = await fetch(`${base}/v1/google/calendar/poll?poll_token=${encodeURIComponent(started.poll_token)}`);
     assert.deepEqual(await poll.json(), {
       status: "complete",
-      tool_id: "google_calendar",
-      status_connection: "connected",
       calendar_connected: true,
-      google_connected: false,
-      drive_connected: false,
+      google_connected: true,
+      drive_connected: true,
     });
-
-    const driveBlocked = await fetch(`${base}/v1/drive/recent`, { headers: auth });
-    assert.equal(driveBlocked.status, 409);
-    assert.equal(((await driveBlocked.json()) as { error: { code: string } }).error.code, "drive_not_connected");
 
     const agenda = await fetch(`${base}/v1/calendar/agenda?days=14`, { headers: auth });
     const classified = (await agenda.json()) as {
@@ -640,13 +735,6 @@ test("drive connect requests only Drive and does not mark Calendar connected", a
   await withApp(async (base, inbox) => {
     const token = await tokenFor(base, inbox);
     const auth = { Authorization: `Bearer ${token}` };
-    const bundled = await fetch(`${base}/v1/google/connect/start`, { method: "POST", headers: auth });
-    assert.equal(bundled.status, 400);
-    assert.equal(
-      ((await bundled.json()) as { error: { code: string; message: string } }).error.message,
-      "Connect one tool at a time from Settings → Tools.",
-    );
-
     const start = await fetch(`${base}/v1/tools/google_drive/connect`, { method: "POST", headers: auth });
     assert.equal(start.status, 200);
     const started = (await start.json()) as { authorization_url: string; state: string; poll_token: string };
@@ -926,4 +1014,191 @@ test("clearUserData deletes session notes for that user only", async () => {
   assert.equal(kept.length, 1);
   assert.equal(kept[0]?.markdown, "other note");
   await store.close();
+});
+
+async function connectGoogleCalendar(base: string, auth: Record<string, string>): Promise<void> {
+  const start = await fetch(`${base}/v1/google/calendar/start`, { method: "POST", headers: auth });
+  assert.equal(start.status, 200);
+  const started = (await start.json()) as { state: string };
+  const callback = await fetch(
+    `${base}/v1/google/calendar/callback?code=abc&state=${encodeURIComponent(started.state)}`,
+  );
+  assert.equal(callback.status, 200);
+}
+
+function deepBriefDrive(): DriveClient {
+  const inventoryFiles: DriveFile[] = [
+    {
+      id: "gear1",
+      name: "CRCC Gear Inventory",
+      mimeType: "application/vnd.google-apps.spreadsheet",
+      folderPath: "Clubs/CRCC",
+    },
+    {
+      id: "syl1",
+      name: "BIOG 1111 Syllabus",
+      mimeType: "application/pdf",
+      folderPath: "Classes/Fall",
+    },
+  ];
+  const gearText = "CRCC gear checkout\nRow 12: harness — 3 available\nRow 18: carabiners — 12 available";
+  const syllabusText = [
+    "BIOG 1111 Introductory Biology",
+    "Week 2: Lab report due Friday Sep 12",
+    "Prelim 1: October 15",
+  ].join("\n");
+
+  return {
+    async listRecent() {
+      return inventoryFiles;
+    },
+    async search(_token, query) {
+      const q = query.toLowerCase();
+      if (/gear|crcc|inventory/.test(q)) {
+        return [inventoryFiles[0]!];
+      }
+      if (/biog|biol|1111|syllabus/.test(q)) {
+        return [inventoryFiles[1]!];
+      }
+      return [];
+    },
+    async listFolder() {
+      return [];
+    },
+    async findFolders() {
+      return [];
+    },
+    async inventory(_token, options: InventoryOptions = {}) {
+      assert.notEqual(options.includeFolderPaths, false);
+      return {
+        files: inventoryFiles,
+        nextPageToken: null,
+        truncated: false,
+        folderCount: 2,
+      };
+    },
+    async readFileText(_token, file, options) {
+      if (file.id === "gear1") {
+        return { ok: true, kind: "gsheet", text: gearText };
+      }
+      if (file.id === "syl1") {
+        assert.ok((options?.maxChars ?? 0) >= 10_000, "syllabus check should request large maxChars");
+        return { ok: true, kind: "pdf", text: syllabusText };
+      }
+      return { ok: false, reason: "missing" };
+    },
+  };
+}
+
+test("school-digest GET requires auth", async () => {
+  await withApp(async (base) => {
+    const res = await fetch(`${base}/v1/school-digest?tz=America%2FNew_York`);
+    assert.equal(res.status, 401);
+  });
+});
+
+test("companion chat injects cached school digest when present", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-digest-chat-"));
+  const store = openFileStore(join(dir, "store.json"));
+  const now = new Date("2026-10-03T18:00:00.000Z");
+  const sent: { code: string }[] = [];
+  const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  let sawSystem = "";
+  const server: Server = createApp({
+    config: loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      SESSION_SECRET: SECRET,
+      PUBLIC_BASE_URL: "http://127.0.0.1:8787",
+      GEMINI_API_KEY: "test-gemini-key",
+    }),
+    store,
+    google: google(),
+    mailer,
+    calendar: calendar([]),
+    liveChat: async (input) => {
+      sawSystem = input.system;
+      return "ok";
+    },
+    now: () => now,
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    const token = await tokenFor(base, sent);
+    const userRes = await fetch(`${base}/v1/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const me = (await userRes.json()) as { id: string };
+    await store.upsertSchoolDigest({
+      userId: me.id,
+      digestDate: "2026-10-03",
+      timezone: "America/New_York",
+      model: "gemini-3.5-flash",
+      digestText: "## THIS WEEK\n- Problem set 2 due Thu",
+      sources: [{ id: "s1", name: "Syllabus.pdf" }],
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    });
+    const res = await fetch(`${base}/v1/companion/chat`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: "What's due?",
+        context: { goals: "chem", time_zone: "America/New_York" },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(sawSystem, /SCHOOL DIGEST \(generated 2026-10-03\)/);
+    assert.match(sawSystem, /Problem set 2 due Thu/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test("deep-brief requires auth", async () => {
+  await withApp(async (base) => {
+    const res = await fetch(`${base}/v1/drive/deep-brief?q=syllabus`);
+    assert.equal(res.status, 401);
+  }, calendar([]), deepBriefDrive());
+});
+
+test("deep-brief returns calendar, inventory, and full file contents for gear and syllabus queries", async () => {
+  const events: RawEvent[] = [
+    { id: "due", summary: "CS 4820 HW3 due", start: { date: "2026-10-06" }, end: { date: "2026-10-07" } },
+  ];
+  await withApp(
+    async (base, inbox) => {
+      const token = await tokenFor(base, inbox);
+      const auth = { Authorization: `Bearer ${token}` };
+      await connectGoogleCalendar(base, auth);
+
+      const gear = await fetch(
+        `${base}/v1/drive/deep-brief?q=${encodeURIComponent("list my CRCC gear inventory")}&days=14&tz=America%2FNew_York`,
+        { headers: auth },
+      );
+      assert.equal(gear.status, 200);
+      const gearBody = (await gear.json()) as { summary: string; file_count: number; truncated?: boolean };
+      assert.equal(gearBody.file_count, 2);
+      assert.match(gearBody.summary, /DEEP BRIEF/);
+      assert.match(gearBody.summary, /CALENDAR \(window\)/);
+      assert.match(gearBody.summary, /CS 4820 HW3 due/);
+      assert.match(gearBody.summary, /CRCC Gear Inventory/);
+      assert.match(gearBody.summary, /carabiners — 12 available|carabiners/);
+      assert.match(gearBody.summary, /STRUCTURED LIST|LITE DEPTH/);
+
+      const syllabus = await fetch(
+        `${base}/v1/drive/deep-brief?q=${encodeURIComponent("run through BIOG 1111 syllabus due dates")}&days=7`,
+        { headers: auth },
+      );
+      assert.equal(syllabus.status, 200);
+      const sylBody = (await syllabus.json()) as { summary: string; file_count: number };
+      assert.match(sylBody.summary, /STRUCTURED FACTS|LITE DEPTH/);
+      assert.match(sylBody.summary, /Lab report due Friday Sep 12/);
+      assert.match(sylBody.summary, /Prelim 1: October 15/);
+    },
+    calendar(events),
+    deepBriefDrive(),
+  );
 });

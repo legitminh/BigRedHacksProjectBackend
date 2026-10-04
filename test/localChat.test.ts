@@ -28,6 +28,14 @@ test("loadConfig exposes localChatProvider from LOCAL_CHAT_PROVIDER", () => {
   assert.equal(local.localChatProvider, "ollama");
 });
 
+test("loadConfig defaults geminiOverviewModel to gemini-3.5-flash", () => {
+  const cfg = loadConfig({});
+  assert.equal(cfg.geminiModel, "gemini-3.5-flash-lite");
+  assert.equal(cfg.geminiOverviewModel, "gemini-3.5-flash");
+  const custom = loadConfig({ GEMINI_OVERVIEW_MODEL: "gemini-3.8-flash" });
+  assert.equal(custom.geminiOverviewModel, "gemini-3.8-flash");
+});
+
 test("selectChatBackend forces Ollama when LOCAL_CHAT_PROVIDER=ollama even with Gemini key", () => {
   assert.equal(
     selectChatBackend({

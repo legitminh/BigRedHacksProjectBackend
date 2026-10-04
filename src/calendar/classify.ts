@@ -3,10 +3,14 @@ const DEADLINE = /\b(due|deadline|submit|exam|quiz|prelim|midterm|final|hw|pset|
 export type RawEvent = {
   id?: string;
   summary?: string;
+  location?: string;
   htmlLink?: string;
-  start?: { date?: string; dateTime?: string };
-  end?: { date?: string; dateTime?: string };
+  start?: { date?: string; dateTime?: string; timeZone?: string };
+  end?: { date?: string; dateTime?: string; timeZone?: string };
+  status?: string;
   extendedProperties?: { private?: Record<string, string> };
+  /** Set by the client when events are merged from more than one calendar. */
+  calendarName?: string;
 };
 
 export type DeadlineItem = {

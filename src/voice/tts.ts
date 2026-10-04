@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import type { Config } from "../config.ts";
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import { HttpError, readJson, sendError, sendJson } from "../http.ts";
 
 const XAI_TTS_URL = "https://api.x.ai/v1/tts";

@@ -25,8 +25,6 @@ export const DEFAULT_RATE_RULES = {
   refreshIp: { limit: 60, windowMs: 10 * MIN },
   /** Anonymous/any status polling per IP (cheap, but unauthenticated). */
   statusIp: { limit: 60, windowMs: MIN },
-  /** Gemini ephemeral token mints per user. */
-  ephemeralUser: { limit: 20, windowMs: MIN },
   /** Pre-auth guard on /v1/coach/* per IP (blunts COACH_API_TOKEN guessing). */
   coachIp: { limit: 120, windowMs: MIN },
   /** Authenticated lock-in coach (Ollama) per identity. */

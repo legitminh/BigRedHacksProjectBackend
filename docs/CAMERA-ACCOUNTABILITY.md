@@ -38,10 +38,21 @@ Response 200:
 }
 ```
 
-- `nudge` is `null` when silent (cooldown, break, already spoken ladder step, etc.).
+Nudge `kind` values (sparse; at most one per observe):
+
+| kind | When |
+|------|------|
+| `left_desk` / `left_desk_pause` | Absence ladder (**active** only) |
+| `welcome_back` | Confirmed return after leave (**active** only) |
+| `camera_obstructed` | Lens/lighting unclear held ~30s (**active** only) |
+| `suggest_break` | Stress → voluntary five-minute break invite (primary) |
+| `stressed` | Stress breath fallback after a recent `suggest_break` |
+
+- `nudge` is `null` when silent (cooldown, `paused`/`break`, already spoken ladder step, etc.).
 - Rate limit: ~1 observe / 25s per user (429 if faster).
 - Do not persist video bytes. Process then discard.
-- If `PRESAGE_API_KEY` unset: still run presence heuristics from JPEG/first-frame when possible; vitals may be null.
+- If `PRESAGE_API_KEY` unset or Presage fails: still run presence heuristics; **`vitals` is `null`** (no invented stress). Desktop may apply local VIDEOINPUT fallback separately.
+- `vitals.stressed` from Presage when `stress_index > 150` **or** HRV/RMSSD `< 20`.
 
 ### Env
 
@@ -51,12 +62,21 @@ Response 200:
 
 - Under ~12 words for lock-in nudges; max ~25 for check-ins.
 - Absence ladder (active phase only): first callback → second → pause acknowledgment; then stay quiet.
+  - Confirm leave after sustained away (2 observes / brief hold) so glances do not chatter.
+  - Ladder clock starts at the first away candidate; with ~25–30s observe cadence a real away (~20–60s+) gets the first `left_desk` on the confirming observe.
 - Welcome-back once after confirmed return; no praise after a nudge in the same beat.
-- Stress: at most one calm line every few minutes; never speak biometric numbers.
+- Stress family (`suggest_break` ↔ `stressed`):
+  - Shared **180s** cooldown (`STRESS_COOLDOWN_MS`).
+  - Prefer `suggest_break` (“optional five-minute break”) — **suggestion only; server never starts a break**.
+  - Alternate with `stressed` (slow breath) so break offers stay sparse.
+  - Silent on `phase: "break"` / `"paused"`. Quiet-phase observes also refresh the stress cooldown clock so resume after a break does not immediately re-nudge.
+  - Never speak biometric numbers; spell out “five” (no digits in stress copy).
 - Glances / brief uncertainty: ignore (no chatter).
 
 ## Desktop
 
 - Optional toggle (existing camera signals prefs) = accountability camera on for lock-in.
 - Capture short clip → `POST /v1/camera/observe` → apply `nudge` via existing coach overlay/TTS; update vitals UI from response.
+- When `nudge.kind === "suggest_break"` → call local Tauri `suggest_break_timer` (**emit only**; Accept/Not now on desktop — do not auto-start).
+- Pass `phase: "break"` while the local break timer is running (and `"paused"` for mission pause) so the API stays silent.
 - Do **not** call Presage from the desktop when using this path.

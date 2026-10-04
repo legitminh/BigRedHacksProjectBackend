@@ -8,6 +8,7 @@ import JSZip from "jszip";
 
 import {
   createDriveClient,
+  formatDriveInventory,
   summarizeDriveFilesWithExcerpts,
   type DriveFile,
 } from "../src/drive/client.ts";
@@ -118,6 +119,120 @@ test("clipExcerpt bounds length", () => {
   assert.ok(clipExcerpt("x".repeat(100), 20).endsWith("…"));
 });
 
+test("listRecent asks Drive for recent files without assuming any folder names", async () => {
+  const queries: string[] = [];
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    queries.push(url.searchParams.get("q") ?? "");
+    return Response.json({
+      files: [
+        { id: "doc1", name: "plan", mimeType: "application/vnd.google-apps.document" },
+        { id: "pdf1", name: "week3.pdf", mimeType: "application/pdf" },
+      ],
+    });
+  }) as typeof fetch;
+
+  const files = await createDriveClient(fetchImpl).listRecent("tok", 6);
+  assert.equal(files.length, 2);
+  // The only constraints may be "not trashed" and "not a folder" — nothing name-based.
+  for (const q of queries) {
+    assert.ok(!/name contains/i.test(q), `unexpected name filter: ${q}`);
+    assert.match(q, /trashed=false/);
+  }
+});
+
+test("search builds name + fullText clauses from the query and drops stopwords", async () => {
+  const queries: string[] = [];
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    queries.push(url.searchParams.get("q") ?? "");
+    return Response.json({ files: [{ id: "f1", name: "ECON hw", mimeType: "application/pdf" }] });
+  }) as typeof fetch;
+
+  const files = await createDriveClient(fetchImpl).search("tok", "what is due for ECON 1110?", 10);
+  assert.equal(files[0]?.id, "f1");
+  const q = queries[0] ?? "";
+  assert.match(q, /name contains 'econ'/);
+  assert.match(q, /fullText contains 'econ'/);
+  assert.match(q, /name contains '1110'/);
+  assert.ok(!q.includes("'for'"), "stopwords should not become search terms");
+});
+
+test("inventory pages through Drive and resolves folder paths", async () => {
+  const seenTokens: Array<string | null> = [];
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    const q = url.searchParams.get("q") ?? "";
+    const token = url.searchParams.get("pageToken");
+    if (q.includes("mimeType='application/vnd.google-apps.folder'")) {
+      return Response.json({
+        files: [
+          { id: "root1", name: "School", mimeType: "application/vnd.google-apps.folder" },
+          {
+            id: "sub1",
+            name: "Spring",
+            mimeType: "application/vnd.google-apps.folder",
+            parents: ["root1"],
+          },
+        ],
+      });
+    }
+    seenTokens.push(token);
+    if (!token) {
+      return Response.json({
+        nextPageToken: "page-2",
+        files: [{ id: "a", name: "a.pdf", mimeType: "application/pdf", parents: ["sub1"] }],
+      });
+    }
+    return Response.json({
+      files: [{ id: "b", name: "b.docx", mimeType: "application/octet-stream" }],
+    });
+  }) as typeof fetch;
+
+  const page = await createDriveClient(fetchImpl).inventory("tok", { maxFiles: 500 });
+  assert.deepEqual(seenTokens, [null, "page-2"]);
+  assert.deepEqual(page.files.map((f) => f.id), ["a", "b"]);
+  assert.equal(page.files[0]?.folderPath, "School/Spring");
+  assert.equal(page.nextPageToken, null);
+  assert.equal(page.truncated, false);
+  assert.equal(page.folderCount, 2);
+});
+
+test("inventory reports truncation and a resume token when capped", async () => {
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if ((url.searchParams.get("q") ?? "").includes("mimeType='application/vnd.google-apps.folder'")) {
+      return Response.json({ files: [] });
+    }
+    return Response.json({
+      nextPageToken: "more",
+      files: [{ id: "a", name: "a.pdf", mimeType: "application/pdf" }],
+    });
+  }) as typeof fetch;
+
+  const page = await createDriveClient(fetchImpl).inventory("tok", { maxFiles: 1 });
+  assert.equal(page.truncated, true);
+  assert.equal(page.nextPageToken, "more");
+});
+
+test("formatDriveInventory groups by folder and honours the character budget", () => {
+  const files: DriveFile[] = [
+    { id: "1", name: "a.pdf", mimeType: "application/pdf", folderPath: "School/Spring", modifiedTime: "2026-10-03T00:00:00Z" },
+    { id: "2", name: "b.docx", mimeType: "application/octet-stream", folderPath: "School/Spring", modifiedTime: "2026-10-02T00:00:00Z" },
+    { id: "3", name: "c.txt", mimeType: "text/plain", modifiedTime: "2026-10-01T00:00:00Z" },
+  ];
+  const full = formatDriveInventory(files);
+  assert.match(full, /School\/Spring\/ — a\.pdf \(pdf\), b\.docx \(docx\)/);
+  assert.match(full, /\(My Drive root\)\/ — c\.txt \(text\)/);
+
+  // Tight budget: the most recent file survives, the rest are dropped with a
+  // pointer to search rather than silently disappearing.
+  const clipped = formatDriveInventory(files, { maxChars: 150 });
+  assert.match(clipped, /a\.pdf/);
+  assert.ok(!clipped.includes("c.txt"), "oldest file should fall outside the budget");
+  assert.match(clipped, /1 more file\(s\) not listed here/);
+});
+
 test("summarizeDriveFilesWithExcerpts downloads PDF and attaches excerpt", async () => {
   const path = join(tmpdir(), `waypoint-drive-sum-${Date.now()}.pdf`);
   writeTinyPdf(path, "Syllabus Week 3");
@@ -149,10 +264,11 @@ test("summarizeDriveFilesWithExcerpts downloads PDF and attaches excerpt", async
     "tok",
     files,
     "Drive:",
-    { maxCharsPerFile: 500 },
+    { maxCharsPerFile: 500, maxExcerptFiles: 2 },
   );
+  assert.match(summary, /FILE INVENTORY/);
   assert.match(summary, /BIOMG1350\.pdf/);
   assert.match(summary, /Syllabus Week 3/);
   assert.match(summary, /Exported Google Doc body/);
-  assert.match(summary, /google-doc|Content excerpt/i);
+  assert.match(summary, /TEXT EXCERPTS|Excerpt/i);
 });

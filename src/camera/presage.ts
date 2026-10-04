@@ -4,6 +4,11 @@ const BASE = "https://api.physiology.presagetech.com";
 const PART_CHUNK = 5 * 1024 * 1024;
 const DEFAULT_RETRIEVE_TIMEOUT_SEC = 60;
 
+/** Baevsky / Presage stress_index above this → vitals.stressed. */
+export const STRESS_INDEX_STRESSED_MIN = 150;
+/** RMSSD/HRV below this (ms) → vitals.stressed (VIDEOINPUT-aligned). */
+export const HRV_STRESSED_MAX = 20;
+
 export type FetchLike = (
   input: string | URL | Request,
   init?: RequestInit,
@@ -164,6 +169,16 @@ function asFiniteNumber(value: unknown): number | null {
   return null;
 }
 
+/** Fuzzy field match — keep short tokens like `hr` from stealing `hrv` / `hrv_rmssd`. */
+function fieldKeyMatches(fieldKey: string, want: string): boolean {
+  const lk = fieldKey.toLowerCase();
+  if (lk === want) return true;
+  if (want === "hr" && (lk === "hrv" || lk.startsWith("hrv_") || lk.includes("hrv"))) {
+    return false;
+  }
+  return lk.includes(want);
+}
+
 function firstF64(data: unknown, keys: string[]): number | null {
   if (!data || typeof data !== "object" || Array.isArray(data)) return null;
   const record = data as Record<string, unknown>;
@@ -179,8 +194,7 @@ function firstF64(data: unknown, keys: string[]): number | null {
   }
 
   for (const [k, val] of Object.entries(record)) {
-    const lk = k.toLowerCase();
-    if (!keys.some((want) => lk.includes(want))) continue;
+    if (!keys.some((want) => fieldKeyMatches(k, want))) continue;
     const n = asFiniteNumber(val);
     if (n != null) return n;
     if (Array.isArray(val)) {
@@ -209,8 +223,11 @@ export function vitalsFromResult(data: unknown): PresageVitals {
   const hrv = firstF64(data, ["hrv", "rmssd", "hrv_rmssd"]);
   const stress = firstF64(data, ["stress", "stress_index", "baevsky", "baevsky_stress_index"]);
 
+  // Dual signal (Presage scalars): high stress index OR low HRV.
+  // When Presage is unavailable, observe returns vitals=null (no invented stress).
   const stressed =
-    (stress != null && stress > 150) || (hrv != null && hrv < 20);
+    (stress != null && stress > STRESS_INDEX_STRESSED_MIN) ||
+    (hrv != null && hrv < HRV_STRESSED_MAX);
   const focusOk =
     !stressed && (hr == null || (hr >= 50 && hr <= 110));
 

@@ -3,7 +3,9 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import { verifyAccessToken } from "../auth/tokens.ts";
+import type { CalendarClient } from "../calendar/client.ts";
 import type { Config } from "../config.ts";
+import type { DriveClient } from "../drive/client.ts";
 import type { Store } from "../store/types.ts";
 import { runCompanionLiveSession } from "./liveSession.ts";
 
@@ -24,6 +26,8 @@ export type LiveUpgradeDeps = {
   config: Config;
   store: Store;
   now: () => Date;
+  drive: DriveClient;
+  calendar: CalendarClient;
   /** Override env-derived limits (tests). */
   limits?: Partial<LiveLimits>;
 };
@@ -233,7 +237,12 @@ export function attachCompanionLiveUpgrade(
         wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
           ws.once("close", releaseSlot);
           wss.emit("connection", ws, req);
-          void runCompanionLiveSession(ws, deps.config).catch((error: unknown) => {
+          void runCompanionLiveSession(ws, deps.config, {
+            userId: user.id,
+            store: deps.store,
+            drive: deps.drive,
+            calendar: deps.calendar,
+          }).catch((error: unknown) => {
             console.warn(
               "companion live session ended",
               error instanceof Error ? error.message : error,

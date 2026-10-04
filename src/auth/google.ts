@@ -36,7 +36,7 @@ export function authorizationUrl(input: {
   state: string;
   codeVerifier: string;
   scopes?: string;
-  /** Default false so a previous tool grant is not folded into this token. */
+  /** Bundled sign-in folds prior grants. Per-tool connect passes false. */
   includeGrantedScopes?: boolean;
 }): string {
   const url = new URL(AUTH_URL);
@@ -44,7 +44,7 @@ export function authorizationUrl(input: {
   url.searchParams.set("redirect_uri", input.redirectUri);
   url.searchParams.set("response_type", "code");
   url.searchParams.set("scope", input.scopes ?? "openid email profile");
-  url.searchParams.set("include_granted_scopes", input.includeGrantedScopes === true ? "true" : "false");
+  url.searchParams.set("include_granted_scopes", input.includeGrantedScopes === false ? "false" : "true");
   url.searchParams.set("state", input.state);
   url.searchParams.set("code_challenge", codeChallenge(input.codeVerifier));
   url.searchParams.set("code_challenge_method", "S256");

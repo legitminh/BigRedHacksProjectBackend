@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 import type { GoogleClient } from "../src/auth/google.ts";
 import { loadConfig, type Config } from "../src/config.ts";
-import type { FetchLike } from "../src/gemini/ephemeral.ts";
+import type { FetchLike } from "../src/http.ts";
 import { createApp } from "../src/server.ts";
 import { openFileStore } from "../src/store/file.ts";
 

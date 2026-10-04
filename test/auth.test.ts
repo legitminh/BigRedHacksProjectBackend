@@ -141,7 +141,7 @@ test("start refuses missing Google credentials and a short session secret", asyn
   );
 });
 
-test("authorization URL is identity only and does not fold in previous tool scopes", async () => {
+test("authorization URL carries PKCE, state, and bundled sign-in + Calendar + Drive scopes", async () => {
   const capture = { verifier: "" };
   await withApp(
     async (base) => {
@@ -150,8 +150,10 @@ test("authorization URL is identity only and does not fold in previous tool scop
       assert.equal(url.origin + url.pathname, "https://accounts.google.com/o/oauth2/v2/auth");
       assert.equal(url.searchParams.get("state"), started.state);
       assert.equal(url.searchParams.get("code_challenge_method"), "S256");
-      assert.equal(url.searchParams.get("scope"), "openid email profile");
-      assert.equal(url.searchParams.get("include_granted_scopes"), "false");
+      assert.equal(
+        url.searchParams.get("scope"),
+        "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly",
+      );
       assert.equal(url.searchParams.get("redirect_uri"), "http://127.0.0.1:8787/v1/auth/google/callback");
       assert.equal(started.authorization_url.includes(started.poll_token), false);
       assert.equal(started.expires_in, 600);

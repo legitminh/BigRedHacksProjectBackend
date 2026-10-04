@@ -62,9 +62,17 @@ function parseMime(value: unknown): string {
 
 function faceFromVitals(vitals: PresageVitals | null): boolean | null {
   if (!vitals) return null;
-  // Usable pulse/breath usually means a face was in frame for Presage.
-  if (vitals.heart_rate != null || vitals.breathing_rate != null) return true;
-  // Completed job with no usable pulse/breath → treat as away (ladder confirms).
+  // Any usable Presage scalar (incl. stress-only / HRV-only) means a face was in frame.
+  // Important for stress→suggest_break: do not route stressed clips into the away ladder.
+  if (
+    vitals.heart_rate != null ||
+    vitals.breathing_rate != null ||
+    vitals.stress_index != null ||
+    vitals.stressed
+  ) {
+    return true;
+  }
+  // Completed job with no usable scalars → treat as away (ladder confirms).
   return false;
 }
 

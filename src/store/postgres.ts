@@ -9,6 +9,11 @@ import { canonicalEmail } from "../auth/email.ts";
 import { hashesMatch } from "../auth/tokens.ts";
 import { legacyGoogleToolConnections } from "../tools/catalog.ts";
 import {
+  clipCachedText,
+  driveCacheEvictFileIds,
+  type DriveCachedFile,
+} from "../drive/cache.ts";
+import {
   DEFAULT_INTERACTION,
   type Interaction,
   type Level,
@@ -28,6 +33,8 @@ import type {
   GoogleProfile,
   PublicUser,
   RotateResult,
+  SchoolDigest,
+  SchoolDigestSource,
   Store,
   StoredRefreshToken,
   ToolConnection,
@@ -54,6 +61,65 @@ function toPublic(row: UserRow): PublicUser {
 
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
+}
+
+function mapDriveCacheRow(row: {
+  user_id: string;
+  file_id: string;
+  name: string;
+  mime_type: string;
+  modified_time: string;
+  text: string;
+  kind: string | null;
+  extracted_at: Date;
+}): DriveCachedFile {
+  return {
+    userId: row.user_id,
+    fileId: row.file_id,
+    name: row.name,
+    mimeType: row.mime_type,
+    modifiedTime: row.modified_time,
+    text: row.text,
+    kind: row.kind ?? undefined,
+    extractedAt: new Date(row.extracted_at).toISOString(),
+  };
+}
+
+const SCHOOL_DIGEST_MAX_TEXT = 80_000;
+
+function clipSchoolDigestText(text: string): string {
+  if (text.length <= SCHOOL_DIGEST_MAX_TEXT) return text;
+  return `${text.slice(0, SCHOOL_DIGEST_MAX_TEXT - 1).trimEnd()}…`;
+}
+
+function mapSchoolDigestRow(row: {
+  user_id: string;
+  digest_date: Date;
+  timezone: string;
+  model: string;
+  digest_text: string;
+  sources_json: SchoolDigestSource[] | string;
+  created_at: Date;
+  updated_at: Date;
+}): SchoolDigest {
+  const digestDate =
+    row.digest_date instanceof Date
+      ? row.digest_date.toISOString().slice(0, 10)
+      : String(row.digest_date).slice(0, 10);
+  const sources =
+    typeof row.sources_json === "string"
+      ? (JSON.parse(row.sources_json) as SchoolDigestSource[])
+      : row.sources_json;
+  return {
+    userId: row.user_id,
+    digestDate,
+    timezone: row.timezone,
+    model: row.model,
+    digestText: row.digest_text,
+    sources: Array.isArray(sources) ? sources : [],
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
 }
 
 const userReturning = `RETURNING id, email, email_verified, name, picture`;
@@ -389,6 +455,8 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           proficiencies: string;
           profiles: string;
           email_codes: string;
+          drive_cache: string;
+          school_digests: string;
         }>(
           `SELECT
              (SELECT COUNT(*)::text FROM users) AS users,
@@ -399,7 +467,9 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
              (SELECT COUNT(*)::text FROM pace_samples) AS pace,
              (SELECT COUNT(*)::text FROM proficiencies) AS proficiencies,
              (SELECT COUNT(*)::text FROM user_profiles) AS profiles,
-             (SELECT COUNT(*)::text FROM email_login_codes) AS email_codes`,
+             (SELECT COUNT(*)::text FROM email_login_codes) AS email_codes,
+             (SELECT COUNT(*)::text FROM drive_file_cache) AS drive_cache,
+             (SELECT COUNT(*)::text FROM school_digests) AS school_digests`,
         ),
         pool.query<{
           id: string;
@@ -426,6 +496,8 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         profileCount: Number(row?.profiles ?? 0),
         emailCodeCount: Number(row?.email_codes ?? 0),
         activeRefreshTokens: Number(row?.tokens ?? 0),
+        driveCacheCount: Number(row?.drive_cache ?? 0),
+        schoolDigestCount: Number(row?.school_digests ?? 0),
         users: users.rows.map((u) => ({
           id: u.id,
           email: u.email,
@@ -457,25 +529,41 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
       );
       const u = userResult.rows[0];
       if (!u) return null;
-      const [profile, proficiencies, pace, tasks, sessions, tokens] = await Promise.all([
-        this.getProfile(userId),
-        this.listProficiencies(userId),
-        this.listPaceSamples(userId, null),
-        pool.query(
-          `SELECT id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at
-           FROM tasks WHERE user_id = $1 ORDER BY started_at DESC LIMIT 200`,
-          [userId],
-        ),
-        this.listSessions(userId),
-        pool.query<{ total: string; active: string; revoked: string }>(
-          `SELECT
-             COUNT(*)::text AS total,
-             COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at > NOW())::text AS active,
-             COUNT(*) FILTER (WHERE revoked_at IS NOT NULL)::text AS revoked
-           FROM refresh_tokens WHERE user_id = $1`,
-          [userId],
-        ),
-      ]);
+      const [profile, proficiencies, pace, tasks, sessions, driveCache, digests, tokens] =
+        await Promise.all([
+          this.getProfile(userId),
+          this.listProficiencies(userId),
+          this.listPaceSamples(userId, null),
+          pool.query(
+            `SELECT id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at
+             FROM tasks WHERE user_id = $1 ORDER BY started_at DESC LIMIT 200`,
+            [userId],
+          ),
+          this.listSessions(userId),
+          this.listDriveFileCache(userId),
+          pool.query<{
+            digest_date: Date;
+            timezone: string;
+            model: string;
+            digest_text: string;
+            sources_json: SchoolDigestSource[] | string;
+            created_at: Date;
+            updated_at: Date;
+          }>(
+            `SELECT digest_date, timezone, model, digest_text, sources_json, created_at, updated_at
+             FROM school_digests WHERE user_id = $1
+             ORDER BY digest_date DESC LIMIT 60`,
+            [userId],
+          ),
+          pool.query<{ total: string; active: string; revoked: string }>(
+            `SELECT
+               COUNT(*)::text AS total,
+               COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at > NOW())::text AS active,
+               COUNT(*) FILTER (WHERE revoked_at IS NOT NULL)::text AS revoked
+             FROM refresh_tokens WHERE user_id = $1`,
+            [userId],
+          ),
+        ]);
       const tokenRow = tokens.rows[0];
       return {
         user: {
@@ -505,6 +593,38 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           ended_at: row.ended_at ? new Date(row.ended_at as Date).toISOString() : null,
         })),
         sessions,
+        driveCache: driveCache.map((row) => ({
+          file_id: row.fileId,
+          name: row.name,
+          mime_type: row.mimeType,
+          modified_time: row.modifiedTime,
+          kind: row.kind ?? null,
+          text_chars: row.text.length,
+          text_preview: row.text.slice(0, 160),
+          extracted_at: row.extractedAt,
+        })),
+        schoolDigests: digests.rows.map((row) => {
+          const mapped = mapSchoolDigestRow({
+            user_id: userId,
+            digest_date: row.digest_date,
+            timezone: row.timezone,
+            model: row.model,
+            digest_text: row.digest_text,
+            sources_json: row.sources_json,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+          });
+          return {
+            digest_date: mapped.digestDate,
+            timezone: mapped.timezone,
+            model: mapped.model,
+            digest_text: mapped.digestText,
+            sources: mapped.sources,
+            text_chars: mapped.digestText.length,
+            created_at: mapped.createdAt,
+            updated_at: mapped.updatedAt,
+          };
+        }),
         tokens: {
           total: Number(tokenRow?.total ?? 0),
           active: Number(tokenRow?.active ?? 0),
@@ -632,7 +752,7 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         case "profiles": {
           const result = await pool.query(
             `SELECT user_id, interests, long_term_goals, priorities, interaction,
-                    study_memory, (study_memory IS NOT NULL) AS has_study_memory, updated_at
+                    (study_memory IS NOT NULL) AS has_study_memory, updated_at
              FROM user_profiles ORDER BY updated_at DESC LIMIT $1`,
             [cap],
           );
@@ -645,6 +765,76 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
               ...r,
               updated_at: new Date(r.updated_at as Date).toISOString(),
             })),
+          );
+        }
+        case "drive_cache": {
+          const result = await pool.query<{
+            user_id: string;
+            file_id: string;
+            name: string;
+            mime_type: string;
+            modified_time: string;
+            kind: string | null;
+            text: string;
+            extracted_at: Date;
+          }>(
+            `SELECT user_id, file_id, name, mime_type, modified_time, kind, text, extracted_at
+             FROM drive_file_cache ORDER BY extracted_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM drive_file_cache`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              user_id: r.user_id,
+              file_id: r.file_id,
+              name: r.name,
+              mime_type: r.mime_type,
+              kind: r.kind,
+              modified_time: r.modified_time,
+              text_chars: r.text.length,
+              text_preview: r.text.slice(0, 120),
+              extracted_at: new Date(r.extracted_at).toISOString(),
+            })),
+          );
+        }
+        case "school_digests": {
+          const result = await pool.query<{
+            user_id: string;
+            digest_date: Date;
+            timezone: string;
+            model: string;
+            digest_text: string;
+            sources_json: SchoolDigestSource[] | string;
+            created_at: Date;
+            updated_at: Date;
+          }>(
+            `SELECT user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at
+             FROM school_digests ORDER BY digest_date DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM school_digests`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => {
+              const mapped = mapSchoolDigestRow(r);
+              return {
+                user_id: r.user_id,
+                digest_date: mapped.digestDate,
+                timezone: mapped.timezone,
+                model: mapped.model,
+                sources: mapped.sources,
+                source_count: mapped.sources.length,
+                text_chars: mapped.digestText.length,
+                text_preview: mapped.digestText.slice(0, 120),
+                created_at: mapped.createdAt,
+                updated_at: mapped.updatedAt,
+              };
+            }),
           );
         }
         case "email_codes": {
@@ -1055,6 +1245,143 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
       const row = result.rows[0];
       return row ? mapSessionNote(row) : null;
     },
+    async getDriveFileCache(userId, fileId) {
+      const result = await pool.query<{
+        user_id: string;
+        file_id: string;
+        name: string;
+        mime_type: string;
+        modified_time: string;
+        text: string;
+        kind: string | null;
+        extracted_at: Date;
+      }>(
+        `SELECT user_id, file_id, name, mime_type, modified_time, text, kind, extracted_at
+         FROM drive_file_cache WHERE user_id = $1 AND file_id = $2`,
+        [userId, fileId],
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      return mapDriveCacheRow(row);
+    },
+    async upsertDriveFileCache(entry) {
+      const clipped: DriveCachedFile = { ...entry, text: clipCachedText(entry.text) };
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const existing = await client.query<{ file_id: string; extracted_at: Date }>(
+          `SELECT file_id, extracted_at FROM drive_file_cache WHERE user_id = $1`,
+          [entry.userId],
+        );
+        const forUser = existing.rows.map((row) => ({
+          userId: entry.userId,
+          fileId: row.file_id,
+          name: "",
+          mimeType: "",
+          modifiedTime: "",
+          text: "",
+          extractedAt: new Date(row.extracted_at).toISOString(),
+        }));
+        const evict = driveCacheEvictFileIds(forUser, entry.fileId);
+        if (evict.length > 0) {
+          await client.query(
+            `DELETE FROM drive_file_cache WHERE user_id = $1 AND file_id = ANY($2::text[])`,
+            [entry.userId, evict],
+          );
+        }
+        await client.query(
+          `INSERT INTO drive_file_cache
+             (user_id, file_id, name, mime_type, modified_time, text, kind, extracted_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (user_id, file_id) DO UPDATE SET
+             name = EXCLUDED.name,
+             mime_type = EXCLUDED.mime_type,
+             modified_time = EXCLUDED.modified_time,
+             text = EXCLUDED.text,
+             kind = EXCLUDED.kind,
+             extracted_at = EXCLUDED.extracted_at`,
+          [
+            clipped.userId,
+            clipped.fileId,
+            clipped.name,
+            clipped.mimeType,
+            clipped.modifiedTime,
+            clipped.text,
+            clipped.kind ?? null,
+            clipped.extractedAt,
+          ],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    async listDriveFileCache(userId) {
+      const result = await pool.query<{
+        user_id: string;
+        file_id: string;
+        name: string;
+        mime_type: string;
+        modified_time: string;
+        text: string;
+        kind: string | null;
+        extracted_at: Date;
+      }>(
+        `SELECT user_id, file_id, name, mime_type, modified_time, text, kind, extracted_at
+         FROM drive_file_cache WHERE user_id = $1 ORDER BY extracted_at DESC`,
+        [userId],
+      );
+      return result.rows.map(mapDriveCacheRow);
+    },
+    async clearDriveFileCache(userId) {
+      await pool.query(`DELETE FROM drive_file_cache WHERE user_id = $1`, [userId]);
+    },
+    async getSchoolDigest(userId, digestDate) {
+      const result = await pool.query<{
+        user_id: string;
+        digest_date: Date;
+        timezone: string;
+        model: string;
+        digest_text: string;
+        sources_json: SchoolDigestSource[];
+        created_at: Date;
+        updated_at: Date;
+      }>(
+        `SELECT user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at
+         FROM school_digests WHERE user_id = $1 AND digest_date = $2::date`,
+        [userId, digestDate],
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      return mapSchoolDigestRow(row);
+    },
+    async upsertSchoolDigest(digest) {
+      const clipped = clipSchoolDigestText(digest.digestText);
+      await pool.query(
+        `INSERT INTO school_digests
+           (user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at)
+         VALUES ($1, $2::date, $3, $4, $5, $6::jsonb, $7::timestamptz, $8::timestamptz)
+         ON CONFLICT (user_id, digest_date) DO UPDATE SET
+           timezone = EXCLUDED.timezone,
+           model = EXCLUDED.model,
+           digest_text = EXCLUDED.digest_text,
+           sources_json = EXCLUDED.sources_json,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          digest.userId,
+          digest.digestDate,
+          digest.timezone,
+          digest.model,
+          clipped,
+          JSON.stringify(digest.sources),
+          digest.createdAt,
+          digest.updatedAt,
+        ],
+      );
+    },
     async clearUserData(userId, _now) {
       const client = await pool.connect();
       try {
@@ -1064,6 +1391,8 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           [userId],
         );
         const email = emailRow.rows[0]?.email?.trim().toLowerCase() ?? null;
+        await client.query(`DELETE FROM drive_file_cache WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM school_digests WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM session_recaps WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM session_notes WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM tasks WHERE user_id = $1`, [userId]);
