@@ -4,7 +4,51 @@ Account server for the Waypoint desktop app. **Desktop login is Google OAuth onl
 
 **Production / shared server (HTTPS, nginx, systemd, TigerData, Mac release builds):** see **[DEPLOY.md](./DEPLOY.md)**. This README is the **local developer** path.
 
-Desktop companion: [BigRedHacksProject](https://github.com/legitminh/BigRedHacksProject). **`PUBLIC_BASE_URL` on this API must match the desktop `waypoint_api_base`** in `src-tauri/secrets.toml` (same origin the Mac will call — e.g. both `http://127.0.0.1:8787` locally, or both your deployed HTTPS origin). Then `npm run app:dev` (local) or `npm run app:build` (release). A mismatch breaks Google redirects, JWT calls, coach proxy, Live WS, and status probes.
+## Run your own API (beta)
+
+Run this server on **your** machine (or VPS) with **your own** keys. Nothing is shared with the production Waypoint host.
+
+1. **Node 22+, install, copy env**
+
+   ```bash
+   cd BigRedHacksProjectBackend
+   node -v                    # must be v22+
+   npm install
+   cp .env.example .env
+   ```
+
+2. **Required keys checklist** (paste into `.env`; details in [Environment variables](#environment-variables))
+
+   | Key | Required for beta | Notes |
+   |---|---|---|
+   | `SESSION_SECRET` | **yes** | ≥32 characters — `openssl rand -base64 32` |
+   | `GOOGLE_CLIENT_ID` | **yes** | Web application OAuth client (not Desktop) |
+   | `GOOGLE_CLIENT_SECRET` | **yes** | Server-only |
+   | `GEMINI_API_KEY` | **yes** (Copilot / Live) | Unset → chat may fall back to Ollama only |
+   | `XAI_API_KEY` | **yes** (Talk / Live TTS) | Live voice has no macOS `say` fallback — [console.x.ai](https://console.x.ai/) |
+   | `PUBLIC_BASE_URL` | **yes** | Origin for OAuth redirects (e.g. `http://127.0.0.1:8787` locally; **no trailing slash**) |
+   | `PRESAGE_API_KEY` | optional | Camera vitals on `POST /v1/camera/observe`; presence still works without it |
+   | `DATABASE_URL` | optional | Empty → file store (`data/store.json`); set for Postgres / TigerData |
+
+   Google redirect URIs on that Web client must use the same `PUBLIC_BASE_URL` — see [Google Cloud client (local OAuth)](#google-cloud-client-local-oauth).
+
+3. **`PUBLIC_BASE_URL` ↔ desktop `waypoint_api_base`** — must be **identical** (scheme + host + port, no trailing slash). In the Mac repo [BigRedHacksProject](https://github.com/legitminh/BigRedHacksProject), edit `src-tauri/secrets.toml`: set `waypoint_api_base` to the same value as `PUBLIC_BASE_URL`, and `local_llm_base` to `{PUBLIC_BASE_URL}/v1/coach` (e.g. `http://127.0.0.1:8787/v1/coach`). See also [Pairing with the desktop app](#pairing-with-the-desktop-app).
+
+4. **Start the API and health-check**
+
+   ```bash
+   npm start                  # single process (beta / simple)
+   # or: npm run dev          # watch mode while hacking on this repo
+   curl -sS http://127.0.0.1:8787/health
+   # expect: {"ok":true,"service":"waypoint-api","storage":"file"}
+   #         or "storage":"postgres" when DATABASE_URL is set
+   ```
+
+   Restart after any `.env` change. Optional: `GET /v1/status` (with or without a JWT) for Gemini / Ollama / xAI / Presage probes — [docs/STATUS.md](./docs/STATUS.md).
+
+5. **Rebuild or relaunch the Mac app** — after editing `secrets.toml`, from the desktop repo run `npm run app:dev` (local HTTP), `npm run app:build:debug`, or `npm run app:build` (release needs public `https://` base). A mismatch between `PUBLIC_BASE_URL` and `waypoint_api_base` breaks Google redirects, JWT calls, coach proxy, Live WebSocket, and Settings → Connection.
+
+Desktop companion: [BigRedHacksProject](https://github.com/legitminh/BigRedHacksProject).
 
 ## Prerequisites
 
