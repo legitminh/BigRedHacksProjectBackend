@@ -33,6 +33,8 @@ export const DEFAULT_RATE_RULES = {
   ttsIp: { limit: 60, windowMs: MIN },
   /** Authenticated xAI TTS per identity (each hit costs money). */
   ttsUser: { limit: 30, windowMs: MIN },
+  /** Authenticated Grok Imagine session summaries per identity (each hit costs money). */
+  imagineUser: { limit: 6, windowMs: 60 * MIN },
   /** Gemini/companion chat per IP. */
   chatIp: { limit: 60, windowMs: MIN },
   /** Authenticated Gemini/companion chat per user (Gemini + Drive context). */

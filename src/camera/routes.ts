@@ -8,9 +8,14 @@ import type { Config } from "../config.ts";
 import { HttpError, readJson, sendJson } from "../http.ts";
 import type { PublicUser } from "../store/types.ts";
 import { analyzeClip, type PresageOptions } from "./presage.ts";
-import { isSilentCameraPhase, observePresence, type CameraPhase } from "./presence.ts";
+import {
+  isSilentCameraPhase,
+  observePresence,
+  type AttentionSignal,
+  type CameraPhase,
+} from "./presence.ts";
 import { CameraSessionStore } from "./sessionStore.ts";
-import type { PresageVitals } from "./types.ts";
+import type { ClientObserveMeta, PresageVitals } from "./types.ts";
 
 /** ~8MB decoded → ~11MB base64 + JSON envelope. */
 export const CAMERA_BODY_MAX = 12 * 1024 * 1024;
@@ -60,6 +65,61 @@ function parseMime(value: unknown): string {
   throw new HttpError(400, "invalid_mime", "mime must be video/mp4, video/webm, or image/jpeg.");
 }
 
+function parseAttention(value: unknown): AttentionSignal | null {
+  if (
+    value === "present" ||
+    value === "absent" ||
+    value === "looking_down" ||
+    value === "looking_away"
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function parseLastNudgeAck(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const ack = value.trim();
+  if (!ack || ack.length > 64) return null;
+  return ack;
+}
+
+function parseClientMeta(raw: unknown): {
+  brightness: number | null;
+  brightnessMeasured: boolean;
+  faceDetected: boolean | null;
+  attention: AttentionSignal | null;
+  hasLocalFace: boolean;
+  lastNudgeAck: string | null;
+} {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      brightness: null,
+      brightnessMeasured: false,
+      faceDetected: null,
+      attention: null,
+      hasLocalFace: false,
+      lastNudgeAck: null,
+    };
+  }
+  const meta = raw as ClientObserveMeta;
+  const b = meta.brightness;
+  const brightness = typeof b === "number" && Number.isFinite(b) ? b : null;
+  const brightnessMeasured =
+    meta.brightness_measured === true ||
+    (typeof b === "number" && Number.isFinite(b) && b > 0);
+  const hasLocalFace = typeof meta.face_detected === "boolean";
+  const faceDetected = hasLocalFace ? (meta.face_detected as boolean) : null;
+  return {
+    brightness,
+    brightnessMeasured,
+    faceDetected,
+    attention: parseAttention(meta.attention),
+    hasLocalFace,
+    lastNudgeAck: parseLastNudgeAck(meta.last_nudge_ack),
+  };
+}
+
 /**
  * Map Presage vitals → faceDetected for the presence ladder.
  * - Usable scalars / stressed → present (true)
@@ -83,6 +143,20 @@ export function faceFromVitals(vitals: PresageVitals | null): boolean | null {
   }
   // Empty success → uncertain, not proven absence.
   return null;
+}
+
+/**
+ * Local Vision is PRIMARY for desk-away when the client posts a boolean.
+ * Presage face / scalars only fill in when local face is absent from client_meta.
+ * Empty Presage success must never block a local-away signal.
+ */
+export function mergeFaceDetected(
+  clientFace: boolean | null,
+  hasLocalFace: boolean,
+  presageFace: boolean | null,
+): boolean | null {
+  if (hasLocalFace && typeof clientFace === "boolean") return clientFace;
+  return presageFace;
 }
 
 export async function handleCameraObserve(
@@ -113,28 +187,25 @@ export async function handleCameraObserve(
     throw new HttpError(400, "invalid_data", "Clip is empty or exceeds 8MB.");
   }
 
-  let brightness: number | null = null;
-  let brightnessMeasured = false;
-  if (raw.client_meta && typeof raw.client_meta === "object" && !Array.isArray(raw.client_meta)) {
-    const meta = raw.client_meta as { brightness?: unknown; brightness_measured?: unknown };
-    const b = meta.brightness;
-    if (typeof b === "number" && Number.isFinite(b)) brightness = b;
-    brightnessMeasured =
-      meta.brightness_measured === true ||
-      // Explicit positive readings are trusted; bare 0 is often a placeholder.
-      (typeof b === "number" && Number.isFinite(b) && b > 0);
-  }
+  const client = parseClientMeta(raw.client_meta);
+  const { brightness, brightnessMeasured, attention, lastNudgeAck } = client;
 
   await deps.store.withObserveLock(user.id, sessionId, async () => {
     const apiKey = deps.config.presageApiKey ?? process.env.PRESAGE_API_KEY ?? null;
     let vitals: PresageVitals | null = null;
-    let faceDetected: boolean | null = null;
+    let presageFace: boolean | null = null;
     let mimeNote: string | null = null;
 
     const isVideo = mime.startsWith("video/");
     const quietPhase = isSilentCameraPhase(phase);
-    // Privacy: do not upload face video to Presage during pause/break (presence silence only).
-    const mayUploadPresage = isVideo && Boolean(apiKey) && !quietPhase;
+    // Local Vision owns desk-away / looking_down. Skip Presage whenever the client
+    // posted a face boolean — otherwise each tick blocks ~45s on rPPG and away /
+    // look_back never confirm in a normal mission (needs 2 observes).
+    const localOwnsPresence = client.hasLocalFace;
+    // Privacy: do not upload face video to Presage during pause/break.
+    // Stress vitals via Presage are secondary; re-enable sparsely later if needed.
+    const mayUploadPresage =
+      isVideo && Boolean(apiKey) && !quietPhase && !localOwnsPresence;
 
     if (mayUploadPresage && apiKey) {
       try {
@@ -146,27 +217,40 @@ export async function handleCameraObserve(
               timeoutSec: 45,
             }));
         vitals = await analyze(apiKey, bytes, mime);
-        faceDetected = faceFromVitals(vitals);
+        presageFace = faceFromVitals(vitals);
       } catch (err) {
         console.warn(
           "[camera/observe] Presage failed:",
           err instanceof Error ? err.message : err,
         );
-        // Transport/auth/timeout errors must not mark the student away — that is how
-        // a bad API path or key produced false "away from desk" while they sat still.
-        // Real leave is face_detected=false from an explicit vendor face signal.
-        faceDetected = null;
+        // Transport/auth/timeout must not invent leave — but local Vision still can.
+        presageFace = null;
       }
+    } else if (localOwnsPresence && isVideo && !quietPhase) {
+      mimeNote = "Presage skipped — local Vision owns presence";
+      console.info(
+        "[camera/observe] local face=%s attention=%s (Presage skipped)",
+        client.faceDetected,
+        attention ?? "n/a",
+      );
     } else if (!isVideo) {
-      // JPEG-only: no Presage vitals; leave/stress accountability unavailable.
-      faceDetected = null;
-      mimeNote = "JPEG observe skips Presage — leave/stress detection requires video/mp4 or video/webm";
+      // JPEG-only: no Presage vitals; leave/stress from Presage unavailable.
+      presageFace = null;
+      mimeNote =
+        "JPEG observe skips Presage — leave/stress detection requires video/mp4 or video/webm";
     } else if (quietPhase && isVideo && apiKey) {
       mimeNote = "Presage upload skipped during pause/break";
     }
 
     // Drop pixels ASAP (locals go out of scope after response).
     bytes = Buffer.alloc(0);
+
+    // Local Vision face is PRIMARY for desk-away; Presage only when client omitted it.
+    const faceDetected = mergeFaceDetected(
+      client.faceDetected,
+      client.hasLocalFace,
+      presageFace,
+    );
 
     const presenceOut = observePresence(deps.store, {
       userId: user.id,
@@ -175,6 +259,8 @@ export async function handleCameraObserve(
       faceDetected,
       brightness,
       brightnessMeasured,
+      attention,
+      lastNudgeAck,
       stressed: vitals?.stressed ?? null,
       now: deps.now(),
     });

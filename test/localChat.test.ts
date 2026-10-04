@@ -5,7 +5,9 @@ import { loadConfig, parseLocalChatProvider } from "../src/config.ts";
 import {
   isLocalChatForced,
   selectChatBackend,
+  shouldFallbackToLocal,
 } from "../src/gemini/localChat.ts";
+import { HttpError } from "../src/http.ts";
 
 test("parseLocalChatProvider maps aliases onto ollama vs gemini", () => {
   assert.equal(parseLocalChatProvider(undefined), "gemini");
@@ -75,4 +77,22 @@ test("selectChatBackend falls back to Ollama when Gemini key missing", () => {
     }),
     "ollama",
   );
+});
+
+test("shouldFallbackToLocal allows sanitized 5xx (503) but not sanitized 4xx (502)", () => {
+  assert.equal(
+    shouldFallbackToLocal(
+      new HttpError(503, "gemini_failed", "Cloud coach failed. Try again, or keep using local lock-in coaching."),
+    ),
+    true,
+  );
+  assert.equal(
+    shouldFallbackToLocal(
+      new HttpError(502, "gemini_failed", "Cloud coach failed. Try again, or keep using local lock-in coaching."),
+    ),
+    false,
+  );
+  assert.equal(shouldFallbackToLocal(new HttpError(429, "gemini_quota", "quota")), true);
+  assert.equal(shouldFallbackToLocal(new HttpError(502, "gemini_unreachable", "down")), true);
+  assert.equal(shouldFallbackToLocal(new Error("random")), false);
 });

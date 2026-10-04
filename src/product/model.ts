@@ -31,6 +31,33 @@ export const DEFAULT_INTERACTION: Interaction = {
 
 export type Proficiency = { topic: string; level: Level };
 export type PaceCard = { topic: string; median_minutes: number; samples: number };
+export const SESSION_NOTE_KINDS = ["study", "devlog"] as const;
+export type SessionNoteKind = (typeof SESSION_NOTE_KINDS)[number];
+export const SESSION_NOTE_MARKDOWN_MAX = 32_000;
+export const SESSION_NOTE_GOALS_MAX = 2_000;
+export const SESSION_NOTE_EXCERPT_LEN = 240;
+
+export type SessionNote = {
+  id: string;
+  user_id: string;
+  session_id: string;
+  started_at: string;
+  ended_at: string;
+  goals: string;
+  kind: SessionNoteKind;
+  markdown: string;
+  created_at: string;
+};
+
+export type SessionNotePreview = {
+  id: string;
+  session_id: string;
+  ended_at: string;
+  kind: SessionNoteKind;
+  goals: string;
+  excerpt: string;
+};
+
 export type MemoryCard = {
   interests: string[];
   proficiencies: Proficiency[];
@@ -40,6 +67,7 @@ export type MemoryCard = {
   interaction: Interaction;
   updated_at: string | null;
   study_memory: StudyMemoryBlob | null;
+  recent_notes: SessionNotePreview[];
 };
 
 export type StudyMemoryBlob = {
@@ -130,6 +158,7 @@ export function emptyMemory(): MemoryCard {
     interaction: { ...DEFAULT_INTERACTION },
     updated_at: null,
     study_memory: null,
+    recent_notes: [],
   };
 }
 
@@ -401,4 +430,118 @@ export function parseSession(body: unknown): Omit<SessionRecap, "id"> {
     attention,
     note,
   };
+}
+
+const SESSION_ID_MAX = 512;
+
+/** First ~240 characters, with newlines and other whitespace runs collapsed. */
+export function sessionNoteExcerpt(markdown: string): string {
+  const collapsed = markdown.replace(/\s+/g, " ").trim();
+  return collapsed.length <= SESSION_NOTE_EXCERPT_LEN
+    ? collapsed
+    : collapsed.slice(0, SESSION_NOTE_EXCERPT_LEN);
+}
+
+export function parseSessionNote(
+  body: unknown,
+): Omit<SessionNote, "id" | "user_id" | "created_at"> {
+  if (!isRecord(body)) throw new HttpError(400, "invalid_session_note", "Expected a JSON object.");
+  rejectImagePayload(body);
+
+  const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+  if (!sessionId) {
+    throw new HttpError(400, "invalid_session_note", "session_id is required.");
+  }
+  if (sessionId.length > SESSION_ID_MAX) {
+    throw new HttpError(400, "invalid_session_note", "session_id is too long.");
+  }
+
+  const kind = oneOf(body.kind, SESSION_NOTE_KINDS);
+  if (!kind) {
+    throw new HttpError(400, "invalid_session_note", "kind must be study or devlog.");
+  }
+
+  if (typeof body.markdown !== "string" || body.markdown.trim().length === 0) {
+    throw new HttpError(400, "invalid_session_note", "markdown is required.");
+  }
+  if (body.markdown.length > SESSION_NOTE_MARKDOWN_MAX) {
+    throw new HttpError(400, "note_too_long", "markdown is over the limit.");
+  }
+
+  if (typeof body.goals !== "string") {
+    throw new HttpError(400, "invalid_session_note", "goals must be a string.");
+  }
+  if (body.goals.length > SESSION_NOTE_GOALS_MAX) {
+    throw new HttpError(400, "goals_too_long", "goals is over the limit.");
+  }
+
+  const started = parseIsoTimestamp(body.started_at);
+  const ended = parseIsoTimestamp(body.ended_at);
+  if (!started || !ended || Date.parse(ended) < Date.parse(started)) {
+    throw new HttpError(400, "invalid_session_note", "started_at and ended_at must be timestamps.");
+  }
+
+  return {
+    session_id: sessionId,
+    started_at: started,
+    ended_at: ended,
+    goals: body.goals,
+    kind,
+    markdown: body.markdown,
+  };
+}
+
+function parseIsoTimestamp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/.test(text)) {
+    return null;
+  }
+  const ms = Date.parse(text);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString();
+}
+
+function isImageField(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  return (
+    normalized === "image" ||
+    normalized === "images" ||
+    normalized === "screenshot" ||
+    normalized === "screenshots" ||
+    normalized.includes("screenshot") ||
+    normalized.includes("base64") ||
+    /(^|_)image($|_)/.test(normalized)
+  );
+}
+
+function hasBase64Blob(value: string): boolean {
+  if (/data:image\/[a-z0-9.+-]+;base64,/i.test(value)) return true;
+  if (/data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,[a-z0-9+/=]{64,}/i.test(value)) return true;
+  const compact = value.replace(/\s+/g, "");
+  // A long pure base64 string (digits or + / =), not ordinary prose.
+  return (
+    compact.length >= 256 &&
+    /^[A-Za-z0-9+/]+={0,2}$/.test(compact) &&
+    /[0-9+/=]/.test(compact)
+  );
+}
+
+export function rejectImagePayload(value: unknown, key?: string): void {
+  if (key && isImageField(key)) {
+    throw new HttpError(400, "image_not_allowed", "Image payloads are not accepted.");
+  }
+  if (typeof value === "string") {
+    if (hasBase64Blob(value)) {
+      throw new HttpError(400, "image_not_allowed", "Image payloads are not accepted.");
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) rejectImagePayload(item);
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [childKey, child] of Object.entries(value)) rejectImagePayload(child, childKey);
+  }
 }
