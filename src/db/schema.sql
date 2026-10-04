@@ -118,5 +118,8 @@ CREATE TABLE IF NOT EXISTS school_digests (
   sources_json JSONB NOT NULL DEFAULT '[]',
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL,
+  manual_refresh_at TIMESTAMPTZ,
   PRIMARY KEY (user_id, digest_date)
 );
+
+ALTER TABLE school_digests ADD COLUMN IF NOT EXISTS manual_refresh_at TIMESTAMPTZ;

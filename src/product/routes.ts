@@ -45,8 +45,10 @@ import { readFileTextCached } from "../drive/cache.ts";
 import { prepareLiteDepthContext } from "../drive/liteDepth.ts";
 import {
   ensureSchoolDigest,
+  getManualRefreshStatus,
   loadSchoolDigestForChat,
   schoolDigestContextFields,
+  schoolDigestResponseFields,
 } from "../drive/schoolDigest.ts";
 import { runDeepBriefForQuery } from "../drive/weekBrief.ts";
 import { geminiChat, type ChatTurn } from "../gemini/chat.ts";
@@ -337,14 +339,8 @@ export async function handleProduct(
       overviewModel: deps.config.geminiOverviewModel,
       fetchImpl: deps.fetch,
     });
-    sendJson(res, 200, {
-      digest: digest.digestText,
-      digest_date: digest.digestDate,
-      sources: digest.sources,
-      stale: false,
-      timezone: digest.timezone,
-      model: digest.model,
-    });
+    const refresh = await getManualRefreshStatus(deps.store, user.id, now);
+    sendJson(res, 200, schoolDigestResponseFields(digest, refresh));
     return true;
   }
   if (method === "POST" && path === "/v1/school-digest/refresh") {
@@ -367,14 +363,8 @@ export async function handleProduct(
       fetchImpl: deps.fetch,
       force: true,
     });
-    sendJson(res, 200, {
-      digest: digest.digestText,
-      digest_date: digest.digestDate,
-      sources: digest.sources,
-      stale: false,
-      timezone: digest.timezone,
-      model: digest.model,
-    });
+    const refresh = await getManualRefreshStatus(deps.store, user.id, now);
+    sendJson(res, 200, schoolDigestResponseFields(digest, refresh));
     return true;
   }
   if (method === "POST" && path === "/v1/gemini/chat") {

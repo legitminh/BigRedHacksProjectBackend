@@ -1,5 +1,6 @@
 /**
  * Once-per-local-day school digest (Gemini overview / Flash — single call per digest_date).
+ * Manual force-refresh is capped to once per rolling 24 hours per user.
  */
 
 import type { CalendarClient } from "../calendar/client.ts";
@@ -14,7 +15,7 @@ import type { Config } from "../config.ts";
 import type { DriveClient } from "../drive/client.ts";
 import { INVENTORY_DEFAULT_MAX_FILES } from "../drive/client.ts";
 import { readFileTextCached } from "../drive/cache.ts";
-import type { FetchLike } from "../http.ts";
+import { HttpError, type FetchLike } from "../http.ts";
 import { geminiChat } from "../gemini/chat.ts";
 import type { SchoolDigest, SchoolDigestSource, Store } from "../store/types.ts";
 import {
@@ -27,6 +28,15 @@ import {
 export const SCHOOL_DIGEST_WINDOW_DAYS = 21;
 export const SCHOOL_DIGEST_MAX_FILES = 12;
 export const SCHOOL_DIGEST_MAX_TEXT = 80_000;
+/** One additional user-triggered rebuild beyond the daily auto digest. */
+export const MANUAL_REFRESH_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+export type ManualRefreshStatus = {
+  available: boolean;
+  lastManualRefreshAt: string | null;
+  nextManualRefreshAt: string | null;
+  retryAfterSeconds: number;
+};
 
 const DIGEST_UTTERANCE =
   "syllabus assignments homework due dates exams grading weights this week and next three weeks all courses";
@@ -180,12 +190,94 @@ export async function buildSchoolDigest(input: BuildSchoolDigestInput): Promise<
     sources,
     createdAt: nowIso,
     updatedAt: nowIso,
+    manualRefreshAt: null,
+  };
+}
+
+export async function getManualRefreshStatus(
+  store: Store,
+  userId: string,
+  now: Date,
+): Promise<ManualRefreshStatus> {
+  const last = await store.getLatestSchoolDigestManualRefreshAt(userId);
+  if (!last) {
+    return {
+      available: true,
+      lastManualRefreshAt: null,
+      nextManualRefreshAt: null,
+      retryAfterSeconds: 0,
+    };
+  }
+  const lastMs = Date.parse(last);
+  if (!Number.isFinite(lastMs)) {
+    return {
+      available: true,
+      lastManualRefreshAt: last,
+      nextManualRefreshAt: null,
+      retryAfterSeconds: 0,
+    };
+  }
+  const nextMs = lastMs + MANUAL_REFRESH_COOLDOWN_MS;
+  const remainingMs = nextMs - now.getTime();
+  if (remainingMs <= 0) {
+    return {
+      available: true,
+      lastManualRefreshAt: last,
+      nextManualRefreshAt: null,
+      retryAfterSeconds: 0,
+    };
+  }
+  return {
+    available: false,
+    lastManualRefreshAt: last,
+    nextManualRefreshAt: new Date(nextMs).toISOString(),
+    retryAfterSeconds: Math.max(1, Math.ceil(remainingMs / 1000)),
+  };
+}
+
+export function schoolDigestResponseFields(
+  digest: SchoolDigest,
+  refresh: ManualRefreshStatus,
+): {
+  digest: string;
+  digest_date: string;
+  sources: SchoolDigestSource[];
+  stale: false;
+  timezone: string;
+  model: string;
+  manual_refresh_available: boolean;
+  last_manual_refresh_at: string | null;
+  next_manual_refresh_at: string | null;
+} {
+  return {
+    digest: digest.digestText,
+    digest_date: digest.digestDate,
+    sources: digest.sources,
+    stale: false,
+    timezone: digest.timezone,
+    model: digest.model,
+    manual_refresh_available: refresh.available,
+    last_manual_refresh_at: refresh.lastManualRefreshAt,
+    next_manual_refresh_at: refresh.nextManualRefreshAt,
   };
 }
 
 export async function ensureSchoolDigest(input: EnsureSchoolDigestInput): Promise<SchoolDigest> {
   const timeZone = normalizeTimeZone(input.timeZone);
   const digestDate = dateKeyIn(input.now, timeZone);
+
+  if (input.force) {
+    const refresh = await getManualRefreshStatus(input.store, input.userId, input.now);
+    if (!refresh.available) {
+      const error = new HttpError(
+        429,
+        "digest_manual_refresh_cooldown",
+        "Manual school digest refresh is limited to once every 24 hours.",
+      );
+      error.retryAfterSeconds = refresh.retryAfterSeconds;
+      throw error;
+    }
+  }
 
   if (!input.force) {
     const existing = await input.store.getSchoolDigest(input.userId, digestDate);
@@ -198,9 +290,14 @@ export async function ensureSchoolDigest(input: EnsureSchoolDigestInput): Promis
     : null;
   if (again && !input.force) return again;
 
-  await input.store.upsertSchoolDigest(built);
+  const nowIso = input.now.toISOString();
+  const toStore: SchoolDigest = input.force
+    ? { ...built, manualRefreshAt: nowIso, updatedAt: nowIso }
+    : built;
+
+  await input.store.upsertSchoolDigest(toStore);
   const row = await input.store.getSchoolDigest(input.userId, digestDate);
-  return row ?? built;
+  return row ?? toStore;
 }
 
 export function schoolDigestContextFields(

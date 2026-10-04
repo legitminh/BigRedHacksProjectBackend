@@ -707,6 +707,7 @@ export function openFileStore(path: string): Store {
         const clipped: SchoolDigest = {
           ...digest,
           digestText: clipDigestText(digest.digestText),
+          manualRefreshAt: digest.manualRefreshAt ?? null,
         };
         const index = data.schoolDigests.findIndex(
           (row) => row.userId === clipped.userId && row.digestDate === clipped.digestDate,
@@ -714,6 +715,21 @@ export function openFileStore(path: string): Store {
         if (index >= 0) data.schoolDigests[index] = clipped;
         else data.schoolDigests.push(clipped);
         await write(data);
+      });
+    },
+    async getLatestSchoolDigestManualRefreshAt(userId) {
+      return lock(async () => {
+        const data = await read();
+        let latestMs = Number.NEGATIVE_INFINITY;
+        let latest: string | null = null;
+        for (const row of data.schoolDigests ?? []) {
+          if (row.userId !== userId || !row.manualRefreshAt) continue;
+          const ms = Date.parse(row.manualRefreshAt);
+          if (!Number.isFinite(ms) || ms < latestMs) continue;
+          latestMs = ms;
+          latest = row.manualRefreshAt;
+        }
+        return latest;
       });
     },
     async clearUserData(userId, _now) {
