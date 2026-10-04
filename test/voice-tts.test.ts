@@ -132,6 +132,49 @@ test("voice tts proxies to xAI with coach token", async () => {
   );
 });
 
+test("voice tts extended_wait uses Live-matched speed", async () => {
+  const calls: Array<{ url: string; body: string }> = [];
+  const fakeMp3 = Buffer.from([0xff, 0xfb, 0x90, 0x00, ...Array.from({ length: 64 }, () => 1)]);
+  await withApp(
+    async (base) => {
+      const response = await fetch(`${base}/v1/voice/tts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${COACH_TOKEN}`,
+        },
+        body: JSON.stringify({
+          text: "Waypoint voice test.",
+          language: "en",
+          extended_wait: true,
+        }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("x-waypoint-tts-voice"), "eve");
+      assert.equal(calls.length, 1);
+      const payload = JSON.parse(calls[0]!.body) as {
+        voice_id: string;
+        speed: number;
+        language: string;
+      };
+      assert.equal(payload.voice_id, "eve");
+      assert.equal(payload.language, "en");
+      assert.equal(payload.speed, 1.0);
+    },
+    {
+      config: appConfig({ XAI_API_KEY: "xai-test-key", XAI_TTS_VOICE: "eve" }),
+      fetchImpl: async (input, init) => {
+        const url = typeof input === "string" ? input : input.toString();
+        calls.push({ url, body: String(init?.body ?? "") });
+        return new Response(fakeMp3, {
+          status: 200,
+          headers: { "Content-Type": "audio/mpeg" },
+        });
+      },
+    },
+  );
+});
+
 test("voice health reports configured flag", async () => {
   await withApp(async (base) => {
     const off = await fetch(`${base}/v1/voice/health`);

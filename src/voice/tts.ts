@@ -7,13 +7,23 @@ import { HttpError, readJson, sendError, sendJson } from "../http.ts";
 const XAI_TTS_URL = "https://api.x.ai/v1/tts";
 /** Keep heads-up synthesis snappy; desktop falls back to local `say` on timeout. */
 const TTS_TIMEOUT_MS = 4_000;
+/** Settings “Test speak” / cold xAI — matches desktop `TEST_SPEAK_TTS_TIMEOUT`. */
+const TTS_EXTENDED_TIMEOUT_MS = 14_000;
+/** Live companion WebSocket TTS uses speed 1.0; heads-ups stay slightly faster. */
+const TTS_HEADS_UP_SPEED = 1.1;
+const TTS_LIVE_MATCH_SPEED = 1.0;
 const MAX_TEXT_CHARS = 400;
 
 export function xaiTtsConfigured(config: Config): boolean {
   return Boolean(config.xaiApiKey);
 }
 
-function parseTtsBody(body: unknown): { text: string; voiceId: string; language: string } {
+function parseTtsBody(body: unknown): {
+  text: string;
+  voiceId: string;
+  language: string;
+  extendedWait: boolean;
+} {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "invalid_tts", "Expected a JSON object.");
   }
@@ -29,7 +39,8 @@ function parseTtsBody(body: unknown): { text: string; voiceId: string; language:
     typeof record.language === "string" && record.language.trim()
       ? record.language.trim()
       : "en";
-  return { text: clipped, voiceId, language };
+  const extendedWait = record.extended_wait === true;
+  return { text: clipped, voiceId, language, extendedWait };
 }
 
 export async function synthesizeXaiTts(input: {
@@ -37,6 +48,8 @@ export async function synthesizeXaiTts(input: {
   text: string;
   voiceId?: string;
   language?: string;
+  /** Longer xAI budget + Live-matched speed (Settings “Test speak”). */
+  extendedWait?: boolean;
   fetchImpl: FetchLike;
 }): Promise<{ bytes: Buffer; contentType: string }> {
   if (!input.config.xaiApiKey) {
@@ -49,8 +62,11 @@ export async function synthesizeXaiTts(input: {
 
   const voiceId = (input.voiceId && input.voiceId.trim()) || input.config.xaiTtsVoice;
   const language = (input.language && input.language.trim()) || "en";
+  const extendedWait = Boolean(input.extendedWait);
+  const timeoutMs = extendedWait ? TTS_EXTENDED_TIMEOUT_MS : TTS_TIMEOUT_MS;
+  const speed = extendedWait ? TTS_LIVE_MATCH_SPEED : TTS_HEADS_UP_SPEED;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let response: Response;
   try {
@@ -66,7 +82,7 @@ export async function synthesizeXaiTts(input: {
         language,
         // Prefer quicker first audio for short coach nudges.
         optimize_streaming_latency: 1,
-        speed: 1.1,
+        speed,
       }),
       signal: controller.signal,
     });
@@ -127,6 +143,7 @@ export async function handleVoiceTts(
       text: parsed.text,
       voiceId: parsed.voiceId || undefined,
       language: parsed.language,
+      extendedWait: parsed.extendedWait,
       fetchImpl,
     });
     res.writeHead(200, {
@@ -134,6 +151,7 @@ export async function handleVoiceTts(
       "Content-Length": bytes.length,
       "Cache-Control": "no-store",
       "X-Waypoint-Tts-Engine": "xai-grok",
+      "X-Waypoint-Tts-Voice": (parsed.voiceId || config.xaiTtsVoice).slice(0, 64),
     });
     res.end(bytes);
     return true;
