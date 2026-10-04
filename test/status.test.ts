@@ -144,7 +144,7 @@ function byId(body: StatusResponse, id: string) {
   return row;
 }
 
-test("GET /v1/status reports config-only for anonymous callers (no live probes)", async () => {
+test("GET /v1/status probes Gemini and Ollama without a JWT", async () => {
   let geminiHits = 0;
   let ollamaHits = 0;
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -163,18 +163,19 @@ test("GET /v1/status reports config-only for anonymous callers (no live probes)"
       assert.equal(typeof body.checked_at, "string");
       assert.equal(body.cache_ttl_seconds, 30);
       assert.equal(byId(body, "gemini").state, "ok");
-      assert.equal(byId(body, "gemini").status, "Configured");
+      assert.equal(byId(body, "gemini").status, "Connected");
       assert.equal(byId(body, "ollama").state, "ok");
-      assert.equal(byId(body, "ollama").status, "Configured");
+      assert.equal(byId(body, "ollama").status, "Connected");
       assert.equal(byId(body, "chat_provider").state, "ok");
+      assert.equal(byId(body, "chat_provider").status, "Connected");
       assert.equal(byId(body, "api").state, "ok");
+      assert.match(byId(body, "api").detail, /file storage/);
       assert.equal(byId(body, "google_oauth").state, "ok");
       assert.equal(byId(body, "account").state, "warn");
       assert.equal(byId(body, "google").state, "warn");
-      assert.equal(byId(body, "presage").state, "warn");
-      assert.equal(byId(body, "presage").status, "Degraded");
-      assert.equal(geminiHits, 0);
-      assert.equal(ollamaHits, 0);
+      assert.equal(body.services.some((service) => service.id === "presage"), false);
+      assert.equal(geminiHits, 1);
+      assert.equal(ollamaHits, 1);
     },
     { fetchImpl },
   );
@@ -277,8 +278,33 @@ test("GET /v1/status reports missing Gemini key without calling Google", async (
       assert.equal(byId(body, "gemini").state, "err");
       assert.equal(byId(body, "gemini").status, "Offline");
       assert.match(byId(body, "gemini").detail, /Cloud coach is not set up/i);
+      assert.equal(byId(body, "ollama").state, "ok");
+      assert.equal(byId(body, "ollama").status, "Connected");
+      assert.equal(byId(body, "chat_provider").state, "ok");
+      assert.equal(byId(body, "chat_provider").status, "Connected");
+      assert.match(byId(body, "chat_provider").detail, /Local Copilot \(qwen2\.5:7b\)/);
       assert.equal(geminiHits, 0);
     },
     { config: appConfig({ GEMINI_API_KEY: "" }), fetchImpl },
+  );
+});
+
+test("missing lock-in model degrades Ollama but Copilot stays on the chat model", async () => {
+  await withApp(
+    async (base) => {
+      const response = await fetch(`${base}/v1/status`);
+      const body = (await response.json()) as StatusResponse;
+      assert.equal(body.ok, true);
+      assert.equal(byId(body, "ollama").state, "warn");
+      assert.equal(byId(body, "ollama").status, "Degraded");
+      assert.match(byId(body, "ollama").detail, /pull qwen2\.5:0\.5b/);
+      assert.equal(byId(body, "chat_provider").state, "ok");
+      assert.equal(byId(body, "chat_provider").status, "Connected");
+      assert.match(byId(body, "chat_provider").detail, /Local Copilot \(qwen2\.5:7b\)/);
+    },
+    {
+      config: appConfig({ GEMINI_API_KEY: "" }),
+      fetchImpl: stubFetch({ models: ["qwen2.5:7b"] }),
+    },
   );
 });

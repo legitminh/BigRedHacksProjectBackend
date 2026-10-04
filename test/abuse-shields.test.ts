@@ -462,7 +462,7 @@ function statusFetch(hits: { gemini: number; ollama: number }): FetchLike {
   }) as FetchLike;
 }
 
-test("anonymous GET /v1/status is config-only (no Gemini or Ollama probe)", async () => {
+test("anonymous GET /v1/status still runs live probes and caches them", async () => {
   const hits = { gemini: 0, ollama: 0 };
   await withApp(
     async (base) => {
@@ -471,12 +471,13 @@ test("anonymous GET /v1/status is config-only (no Gemini or Ollama probe)", asyn
         assert.equal(res.status, 200);
         const body = (await res.json()) as StatusResponse;
         const gemini = body.services.find((s) => s.id === "gemini");
-        assert.equal(gemini?.status, "Configured");
+        assert.equal(gemini?.status, "Connected");
         assert.equal(gemini?.state, "ok");
-        assert.equal(body.services.find((s) => s.id === "ollama")?.status, "Configured");
+        assert.equal(body.services.find((s) => s.id === "ollama")?.status, "Connected");
         assert.equal(body.services.find((s) => s.id === "account")?.state, "warn");
+        assert.equal(body.services.some((service) => service.id === "presage"), false);
       }
-      assert.deepEqual(hits, { gemini: 0, ollama: 0 });
+      assert.deepEqual(hits, { gemini: 1, ollama: 1 });
     },
     { fetch: statusFetch(hits) },
   );

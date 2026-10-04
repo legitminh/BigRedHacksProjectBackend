@@ -41,6 +41,8 @@ type ProbeResult = {
   state: ServiceState;
   status: string;
   detail: string;
+  /** Ollama probe: chat model is listed and the daemon answered. */
+  chatReady?: boolean;
 };
 
 type CacheEntry = {
@@ -151,6 +153,7 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
       state: "err",
       status: "Offline",
       detail: "Lock-in coach is not set up on this server",
+      chatReady: false,
     };
     cacheSet(ollamaCache, cacheKey, result, nowMs, ttl);
     return result;
@@ -170,6 +173,7 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
         state: "err",
         status: "Offline",
         detail: `Ollama returned HTTP ${response.status}`,
+        chatReady: false,
       };
     } else {
       const lockIn = modelListed(json, config.ollamaModel);
@@ -179,24 +183,28 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
           state: "ok",
           status: "Connected",
           detail: `Coach ${config.ollamaModel} + chat fallback ${config.ollamaChatModel} ready`,
+          chatReady: true,
         };
       } else if (lockIn) {
         result = {
           state: "warn",
           status: "Degraded",
           detail: `Coach ${config.ollamaModel} ready; pull ${config.ollamaChatModel} for Copilot fallback`,
+          chatReady: false,
         };
       } else if (chat) {
         result = {
           state: "warn",
           status: "Degraded",
           detail: `Chat fallback ${config.ollamaChatModel} ready; pull ${config.ollamaModel} for lock-in`,
+          chatReady: true,
         };
       } else {
         result = {
           state: "err",
           status: "Offline",
           detail: `Ollama up but missing ${config.ollamaModel} (and ${config.ollamaChatModel})`,
+          chatReady: false,
         };
       }
     }
@@ -206,24 +214,11 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
       state: "err",
       status: "Offline",
       detail: `Could not reach Ollama at ${base} (${detail})`,
+      chatReady: false,
     };
   }
   cacheSet(ollamaCache, cacheKey, result, nowMs, ttl);
   return result;
-}
-
-/** Anonymous Gemini row — reflects configuration only (never calls Google). */
-function configOnlyGemini(config: Config): ProbeResult {
-  return config.geminiApiKey
-    ? { state: "ok", status: "Configured", detail: "Cloud coach configured — sign in for a live check" }
-    : { state: "err", status: "Offline", detail: "Cloud coach is not set up on this server" };
-}
-
-/** Anonymous Ollama row — reflects configuration only (never calls Ollama). */
-function configOnlyOllama(config: Config): ProbeResult {
-  return config.ollamaBaseUrl
-    ? { state: "ok", status: "Configured", detail: "Lock-in coach configured — sign in for a live check" }
-    : { state: "err", status: "Offline", detail: "Lock-in coach is not set up on this server" };
 }
 
 function apiIndicator(store: Store): ServiceIndicator {
@@ -232,30 +227,8 @@ function apiIndicator(store: Store): ServiceIndicator {
     label: "Waypoint API",
     state: "ok",
     status: "Connected",
-    detail: "Waypoint API is running",
+    detail: `Waypoint API is running (${store.kind} storage)`,
     optional: false,
-  };
-}
-
-/** Config-only — no outbound Presage probe (key presence only). */
-function presageIndicator(config: Config): ServiceIndicator {
-  if (config.presageApiKey) {
-    return {
-      id: "presage",
-      label: "Presage",
-      state: "ok",
-      status: "Configured",
-      detail: "Camera accountability vitals ready",
-      optional: true,
-    };
-  }
-  return {
-    id: "presage",
-    label: "Presage",
-    state: "warn",
-    status: "Degraded",
-    detail: "PRESAGE_API_KEY unset — presence heuristics only; vitals unavailable",
-    optional: true,
   };
 }
 
@@ -334,32 +307,33 @@ function chatProviderIndicator(
   ollama: ProbeResult,
 ): ServiceIndicator {
   const backend = selectChatBackend(config);
+  const chatReady = ollama.chatReady === true;
   if (backend === "ollama") {
     const forced = config.localChatProvider === "ollama";
+    // Chat health follows the chat model. A missing lock-in model degrades `ollama` only.
     return {
       id: "chat_provider",
       label: "Copilot chat",
-      state: ollama.state,
-      status: ollama.status,
+      state: chatReady ? "ok" : "err",
+      status: chatReady ? "Connected" : "Offline",
       detail: forced ? `Local Copilot · ${ollama.detail}` : `Local Copilot (${config.ollamaChatModel}) · ${ollama.detail}`,
       optional: false,
     };
   }
   // gemini primary — warn if cloud is down but local fallback is healthy
   if (gemini.state === "ok") {
-    const fallbackReady = ollama.state === "ok";
     return {
       id: "chat_provider",
       label: "Copilot chat",
-      state: fallbackReady ? "ok" : "warn",
-      status: fallbackReady ? "Connected" : "Degraded",
+      state: chatReady ? "ok" : "warn",
+      status: chatReady ? "Connected" : "Degraded",
       detail: `Gemini REST primary (${config.geminiModel}); Live voice ${config.geminiLiveModel}; Ollama fallback ${
-        fallbackReady ? "ready" : "unavailable"
+        chatReady ? "ready" : "unavailable"
       }`,
       optional: false,
     };
   }
-  if (ollama.state === "ok" || ollama.state === "warn") {
+  if (chatReady) {
     return {
       id: "chat_provider",
       label: "Copilot chat",
@@ -381,22 +355,18 @@ function chatProviderIndicator(
 
 /**
  * Aggregate live service health for the desktop Connection status panel.
- * Gemini + Ollama probes are TTL-cached and only run for signed-in users; anonymous
- * callers see config-only rows. User-scoped rows use the JWT when present.
+ * Gemini + Ollama probes always run and are TTL-cached. A JWT only enriches account and Google.
  */
 export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse> {
   const nowFn = deps.now ?? (() => new Date());
   const now = nowFn();
   const nowMs = now.getTime();
 
-  // Anonymous callers get config-only answers: no outbound Gemini/Ollama probes, so an
-  // unauthenticated client cannot burn Gemini quota or make the API host fan out requests.
-  const [gemini, ollama] = deps.user
-    ? await Promise.all([
-        probeGemini(deps.config, deps.fetch, nowMs),
-        probeOllama(deps.config, deps.fetch, nowMs),
-      ])
-    : [configOnlyGemini(deps.config), configOnlyOllama(deps.config)];
+  // Blank GEMINI_API_KEY returns before any Google call. Results are cached for the TTL.
+  const [gemini, ollama] = await Promise.all([
+    probeGemini(deps.config, deps.fetch, nowMs),
+    probeOllama(deps.config, deps.fetch, nowMs),
+  ]);
 
   const services: ServiceIndicator[] = [
     {
@@ -420,11 +390,9 @@ export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse>
     accountIndicator(deps.user),
     googleOauthIndicator(deps.config),
     apiIndicator(deps.store),
-    presageIndicator(deps.config),
   ];
 
   // Gemini-only failures do not flip ok when Copilot can fall back (chat_provider).
-  // `presage` is optional — missing key is warn/Degraded and does not flip ok.
   const critical = new Set(["api", "google_oauth", "ollama", "chat_provider"]);
   const hardDown = services.some((s) => critical.has(s.id) && s.state === "err");
   return {
