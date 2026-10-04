@@ -64,6 +64,7 @@ export async function synthesizeXaiTts(input: {
         text: input.text,
         voice_id: voiceId,
         language,
+        output_format: { codec: "mp3", sample_rate: 24000 },
         // Prefer quicker first audio for short coach nudges.
         optimize_streaming_latency: 1,
         speed: 1.1,
@@ -96,12 +97,50 @@ export async function synthesizeXaiTts(input: {
     );
   }
 
-  const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.length < 32) {
+  const raw = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get("content-type") || "audio/mpeg";
+  const decoded = decodeTtsBody(raw, contentType);
+  if (decoded.bytes.length < 32) {
     throw new HttpError(502, "xai_tts_empty", "xAI TTS returned empty audio.");
   }
-  const contentType = response.headers.get("content-type") || "audio/mpeg";
-  return { bytes, contentType };
+  return decoded;
+}
+
+/**
+ * xAI `POST /v1/tts` returns either raw audio or JSON `{ audio: base64, content_type }`.
+ * The desktop plays the bytes with afplay — a JSON envelope is silence.
+ */
+export function decodeTtsBody(
+  bytes: Buffer,
+  contentType: string,
+): { bytes: Buffer; contentType: string } {
+  const type = contentType.toLowerCase();
+  const declaredAudio = type.startsWith("audio/");
+  const declaredJson = type.includes("json") || type.startsWith("text/");
+  if (declaredAudio && !declaredJson) {
+    return { bytes, contentType };
+  }
+  if (!declaredJson && !(bytes.length > 0 && bytes[0] === 0x7b)) {
+    return { bytes, contentType: contentType || "audio/mpeg" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return { bytes, contentType: contentType || "audio/mpeg" };
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return { bytes, contentType: contentType || "audio/mpeg" };
+  }
+  const record = parsed as Record<string, unknown>;
+  const audio = typeof record.audio === "string" ? record.audio.trim() : "";
+  if (!audio) return { bytes, contentType: contentType || "audio/mpeg" };
+  const decoded = Buffer.from(audio, "base64");
+  const mime =
+    typeof record.content_type === "string" && record.content_type.trim()
+      ? record.content_type.trim()
+      : "audio/mpeg";
+  return { bytes: decoded, contentType: mime };
 }
 
 /** Study heads-up TTS proxy — JWT or coach token (same gate as /v1/coach). */

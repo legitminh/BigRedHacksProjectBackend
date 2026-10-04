@@ -110,6 +110,21 @@ export type AdminBrowseResult = {
   rows: Record<string, unknown>[];
 };
 
+export type ToolConnectionStatus = "connected" | "disconnected";
+
+export type ToolConnection = {
+  userId: string;
+  toolId: string;
+  provider: string;
+  scopes: string;
+  refreshToken: string | null;
+  status: ToolConnectionStatus;
+  connectedAt: string | null;
+  updatedAt: string;
+};
+
+export type ToolConnectionWrite = Omit<ToolConnection, "userId">;
+
 export type Store = {
   kind: "file" | "postgres";
   adminOverview(): Promise<AdminOverview>;
@@ -137,6 +152,10 @@ export type Store = {
   listPaceSamples(userId: string, topic: string | null): Promise<PaceSample[]>;
   getCalendarConnection(userId: string): Promise<CalendarConnection>;
   setCalendarGrant(userId: string, refreshToken: string | null, connected: boolean): Promise<void>;
+  listToolConnections(userId: string): Promise<ToolConnection[]>;
+  upsertToolConnection(userId: string, connection: ToolConnectionWrite): Promise<void>;
+  /** Clears that row's refresh token and sets status `disconnected`. Keeps the row. */
+  disconnectTool(userId: string, toolId: string): Promise<void>;
   createTask(userId: string, task: TaskRecord, now: Date): Promise<TaskRecord>;
   getActiveTask(userId: string): Promise<TaskRecord | null>;
   getTask(userId: string, id: string): Promise<TaskRecord | null>;

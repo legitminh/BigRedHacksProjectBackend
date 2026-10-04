@@ -15,7 +15,11 @@ import {
   type RawEvent,
 } from "../calendar/classify.ts";
 import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
-import { buildCompanionChatSystem, buildCopilotChatSystem } from "../companion/geminiLive.ts";
+import {
+  buildCompanionChatSystem,
+  buildCopilotChatSystem,
+  buildSessionNoteSystem,
+} from "../companion/geminiLive.ts";
 import {
   createDriveClient,
   summarizeDriveFilesWithExcerpts,
@@ -51,12 +55,9 @@ import {
   type Level,
 } from "./model.ts";
 import type { PublicUser, Store } from "../store/types.ts";
+import { toolById, TOOL_CATALOG, type ToolCatalogEntry } from "../tools/catalog.ts";
 import { handleCameraObserve, type CameraAnalyzeFn } from "../camera/routes.ts";
 import type { CameraSessionStore } from "../camera/sessionStore.ts";
-
-/** Calendar write + Drive read for Copilot (second consent after Waypoint Google sign-in). */
-const GOOGLE_DATA_SCOPES =
-  "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly";
 
 export type ProductDeps = {
   config: Config;
@@ -83,20 +84,65 @@ function nowSeconds(now: Date): number {
   return Math.floor(now.getTime() / 1000);
 }
 
-/** Best-effort: revoke the stored Google grant before we drop it. Never throws. */
-async function revokeStoredGoogleGrant(deps: ProductDeps, userId: string): Promise<void> {
+/** Best-effort Google revoke. Never throws. */
+async function revokeGoogleToken(deps: ProductDeps, token: string): Promise<void> {
   try {
-    const { refreshToken } = await deps.store.getCalendarConnection(userId);
-    if (!refreshToken) return;
     await deps.fetch("https://oauth2.googleapis.com/revoke", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ token: refreshToken }),
+      body: new URLSearchParams({ token }),
       signal: AbortSignal.timeout(5000),
     });
   } catch {
     // Local clear must still succeed if Google is unreachable.
   }
+}
+
+/**
+ * Revoke every distinct tool refresh token that is not the identity token, then revoke identity once.
+ * The same string is never sent to Google twice.
+ */
+async function revokeStoredGoogleGrant(deps: ProductDeps, userId: string): Promise<void> {
+  try {
+    const connections = await deps.store.listToolConnections(userId);
+    const identity = (await deps.store.getCalendarConnection(userId)).refreshToken;
+    const revoked = new Set<string>();
+    const revokeOnce = async (token: string | null) => {
+      if (!token || revoked.has(token)) return;
+      revoked.add(token);
+      await revokeGoogleToken(deps, token);
+    };
+    for (const row of connections) {
+      if (row.refreshToken && row.refreshToken !== identity) await revokeOnce(row.refreshToken);
+    }
+    await revokeOnce(identity);
+  } catch {
+    // Local clear must still succeed if Google is unreachable.
+  }
+}
+
+/** Disconnect tools and revoke a refresh token only when nothing else still stores it. */
+async function disconnectTools(deps: ProductDeps, userId: string, toolIds: string[]): Promise<void> {
+  const before = await deps.store.listToolConnections(userId);
+  const identity = (await deps.store.getCalendarConnection(userId)).refreshToken;
+  const candidates = new Set<string>();
+  for (const toolId of toolIds) {
+    const row = before.find((item) => item.toolId === toolId);
+    if (row?.refreshToken) candidates.add(row.refreshToken);
+    await deps.store.disconnectTool(userId, toolId);
+  }
+  const after = await deps.store.listToolConnections(userId);
+  for (const token of candidates) {
+    if (token === identity) continue;
+    if (after.some((item) => item.refreshToken === token)) continue;
+    await revokeGoogleToken(deps, token);
+  }
+}
+
+async function clearLegacyCalendarFlag(deps: ProductDeps, userId: string): Promise<void> {
+  const { refreshToken } = await deps.store.getCalendarConnection(userId);
+  if (refreshToken) await deps.store.setCalendarGrant(userId, refreshToken, false);
+  else await deps.store.setCalendarGrant(userId, null, false);
 }
 
 async function requireUser(deps: ProductDeps, req: IncomingMessage, now: Date): Promise<PublicUser> {
@@ -126,6 +172,8 @@ function isProductPath(path: string): boolean {
     path === "/v1/google/connect/poll" ||
     path === "/v1/google/status" ||
     path === "/v1/google/disconnect" ||
+    path === "/v1/tools" ||
+    /^\/v1\/tools\/[^/]+\/(?:connect|poll|disconnect)$/.test(path) ||
     path === "/v1/calendar/agenda" ||
     path === "/v1/calendar/summary" ||
     path === "/v1/calendar/events" ||
@@ -227,7 +275,7 @@ export async function handleProduct(
     (method === "POST" && path === "/v1/google/calendar/start") ||
     (method === "POST" && path === "/v1/google/connect/start")
   ) {
-    await startCalendar(req, res, deps, now);
+    await rejectBundledToolConnect(req, res, deps, now);
     return true;
   }
   if (
@@ -241,23 +289,46 @@ export async function handleProduct(
     (method === "GET" && path === "/v1/google/calendar/poll") ||
     (method === "GET" && path === "/v1/google/connect/poll")
   ) {
-    pollCalendar(url, res, deps, now);
+    await pollCalendar(url, res, deps, now);
     return true;
+  }
+  if (method === "GET" && path === "/v1/tools") {
+    const user = await requireUser(deps, req, now);
+    sendJson(res, 200, { tools: await publicTools(deps, user.id) });
+    return true;
+  }
+  const toolAction = /^\/v1\/tools\/([^/]+)\/(connect|poll|disconnect)$/.exec(path);
+  if (toolAction) {
+    const toolId = decodeURIComponent(toolAction[1] ?? "");
+    const action = toolAction[2];
+    if (method === "POST" && action === "connect") {
+      await startToolConnect(req, res, deps, now, toolId);
+      return true;
+    }
+    if (method === "GET" && action === "poll") {
+      requireCatalogTool(toolId);
+      await pollCalendar(url, res, deps, now);
+      return true;
+    }
+    if (method === "POST" && action === "disconnect") {
+      const user = await requireUser(deps, req, now);
+      requireCatalogTool(toolId);
+      await disconnectTools(deps, user.id, [toolId]);
+      sendEmpty(res, 204);
+      return true;
+    }
+    throw new HttpError(405, "method_not_allowed", "Method not allowed.");
   }
   if (method === "GET" && path === "/v1/google/status") {
     const user = await requireUser(deps, req, now);
-    const connection = await deps.store.getCalendarConnection(user.id);
-    sendJson(res, 200, {
-      google_connected: connection.connected,
-      calendar_connected: connection.connected,
-      drive_connected: connection.connected,
-    });
+    const tools = await publicTools(deps, user.id);
+    sendJson(res, 200, { ...connectionFlags(tools), tools });
     return true;
   }
   if (method === "POST" && path === "/v1/google/disconnect") {
     const user = await requireUser(deps, req, now);
-    await revokeStoredGoogleGrant(deps, user.id);
-    await deps.store.setCalendarGrant(user.id, null, false);
+    await disconnectTools(deps, user.id, TOOL_CATALOG.map((tool) => tool.id));
+    await clearLegacyCalendarFlag(deps, user.id);
     sendEmpty(res, 204);
     return true;
   }
@@ -293,8 +364,11 @@ export async function handleProduct(
     const record = body as Record<string, unknown>;
     const message = typeof record.message === "string" ? record.message.trim() : "";
     if (!message) throw new HttpError(400, "invalid_chat", "message is required.");
-    // Server-owned template: safety preamble first; client `system` is capped, untrusted guidance.
-    const system = buildCopilotChatSystem(record.system);
+    // Session notes must not use the Copilot role or the study-suggestion block.
+    const system =
+      record.purpose === "session_note"
+        ? buildSessionNoteSystem(record.system)
+        : buildCopilotChatSystem(record.system);
     const historyRaw = Array.isArray(record.history) ? record.history : [];
     const history = historyRaw
       .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
@@ -347,7 +421,7 @@ export async function handleProduct(
   }
   if (method === "GET" && path === "/v1/drive/recent") {
     const user = await requireUser(deps, req, now);
-    const access = await googleAccess(deps, user.id);
+    const access = await toolAccess(deps, user.id, "google_drive");
     const limit = clampInt(url.searchParams.get("limit"), 12, 1, 25);
     const files = await deps.drive.listRecent(access, limit);
     const summary = await summarizeDriveFilesWithExcerpts(
@@ -362,7 +436,7 @@ export async function handleProduct(
   }
   if (method === "GET" && path === "/v1/drive/search") {
     const user = await requireUser(deps, req, now);
-    const access = await googleAccess(deps, user.id);
+    const access = await toolAccess(deps, user.id, "google_drive");
     const q = url.searchParams.get("q") ?? "";
     const limit = clampInt(url.searchParams.get("limit"), 8, 1, 25);
     const files = await deps.drive.search(access, q, limit);
@@ -379,7 +453,7 @@ export async function handleProduct(
   if (method === "GET" && path === "/v1/calendar/summary") {
     const user = await requireUser(deps, req, now);
     const days = windowDays(url.searchParams.get("days"));
-    const access = await googleAccess(deps, user.id);
+    const access = await toolAccess(deps, user.id, "google_calendar");
     const timeMin = now.toISOString();
     const timeMax = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
     const events = await deps.calendar.listEvents(access, timeMin, timeMax);
@@ -401,7 +475,7 @@ export async function handleProduct(
   if (method === "GET" && path === "/v1/calendar/agenda") {
     const user = await requireUser(deps, req, now);
     const days = windowDays(url.searchParams.get("days"));
-    const access = await googleAccess(deps, user.id);
+    const access = await toolAccess(deps, user.id, "google_calendar");
     const timeMin = now.toISOString();
     const timeMax = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
     const events = await deps.calendar.listEvents(access, timeMin, timeMax);
@@ -410,7 +484,7 @@ export async function handleProduct(
   }
   if (method === "POST" && path === "/v1/calendar/events") {
     const user = await requireUser(deps, req, now);
-    const access = await googleAccess(deps, user.id);
+    const access = await toolAccess(deps, user.id, "google_calendar");
     const body = await readJson(req);
     const draft = eventDraft(body);
     const created = await deps.calendar.insertEvent(access, draft.google);
@@ -421,7 +495,7 @@ export async function handleProduct(
   const eventId = path.startsWith("/v1/calendar/events/") ? decodeURIComponent(path.slice("/v1/calendar/events/".length)) : null;
   if (eventId && !eventId.includes("/")) {
     const user = await requireUser(deps, req, now);
-    const access = await googleAccess(deps, user.id);
+    const access = await toolAccess(deps, user.id, "google_calendar");
     if (method === "PATCH") {
       const current = await deps.calendar.getEvent(access, eventId);
       if (!isWaypoint(current)) throw new HttpError(403, "not_waypoint_event", "Only Waypoint events can be changed.");
@@ -694,8 +768,58 @@ function clampInt(value: string | null, fallback: number, min: number, max: numb
   return Math.min(max, Math.max(min, parsed));
 }
 
-async function startCalendar(req: IncomingMessage, res: ServerResponse, deps: ProductDeps, now: Date) {
+function requireCatalogTool(toolId: string): ToolCatalogEntry {
+  const tool = toolById(toolId);
+  if (!tool) throw new HttpError(404, "unknown_tool", "Unknown tool.");
+  return tool;
+}
+
+function presentTool(tool: ToolCatalogEntry, connectedAt: string | null, connected: boolean): PublicTool {
+  return {
+    id: tool.id,
+    provider: tool.provider,
+    title: tool.title,
+    summary: tool.summary,
+    scopes: [...tool.scopes],
+    scope_labels: [...tool.scopeLabels],
+    status: connected ? "connected" : "disconnected",
+    connected_at: connected ? connectedAt : null,
+  };
+}
+
+async function publicTools(deps: ProductDeps, userId: string): Promise<PublicTool[]> {
+  const rows = await deps.store.listToolConnections(userId);
+  return TOOL_CATALOG.map((tool) => {
+    const row = rows.find((item) => item.toolId === tool.id);
+    const connected = row?.status === "connected" && Boolean(row.refreshToken);
+    return presentTool(tool, row?.connectedAt ?? null, connected);
+  });
+}
+
+function connectionFlags(tools: PublicTool[]) {
+  const calendarConnected = tools.some((tool) => tool.id === "google_calendar" && tool.status === "connected");
+  const driveConnected = tools.some((tool) => tool.id === "google_drive" && tool.status === "connected");
+  return {
+    calendar_connected: calendarConnected,
+    drive_connected: driveConnected,
+    google_connected: calendarConnected && driveConnected,
+  };
+}
+
+async function rejectBundledToolConnect(req: IncomingMessage, _res: ServerResponse, deps: ProductDeps, now: Date) {
+  await requireUser(deps, req, now);
+  throw new HttpError(400, "tool_required", "Connect one tool at a time from Settings → Tools.");
+}
+
+async function startToolConnect(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ProductDeps,
+  now: Date,
+  toolId: string,
+) {
   const user = await requireUser(deps, req, now);
+  const tool = requireCatalogTool(toolId);
   if (!googleConfigured(deps.config)) {
     throw new HttpError(503, "google_not_configured", "Google sign-in is unavailable.");
   }
@@ -708,6 +832,7 @@ async function startCalendar(req: IncomingMessage, res: ServerResponse, deps: Pr
     pollToken,
     codeVerifier,
     userId: user.id,
+    toolId: tool.id,
     expiresAt: now.getTime() + expiresIn * 1000,
     status: "pending",
   });
@@ -717,7 +842,8 @@ async function startCalendar(req: IncomingMessage, res: ServerResponse, deps: Pr
       redirectUri: deps.config.calendarRedirectUri,
       state,
       codeVerifier,
-      scopes: GOOGLE_DATA_SCOPES,
+      scopes: tool.scopes.join(" "),
+      includeGrantedScopes: false,
     }),
     state,
     poll_token: pollToken,
@@ -728,13 +854,22 @@ async function startCalendar(req: IncomingMessage, res: ServerResponse, deps: Pr
 async function calendarCallback(url: URL, res: ServerResponse, deps: ProductDeps, now: Date) {
   const claim = deps.calendarConnects.claim(url.searchParams.get("state") ?? "", now.getTime());
   if (!claim.ok) {
-    sendHtml(res, 400, page("Calendar not connected", "This link is invalid or expired. Return to Waypoint and try again."));
+    sendHtml(res, 400, page("Tool not connected", "This link is invalid or expired. Return to Waypoint and try again."));
+    return;
+  }
+  const tool = claim.pending.toolId ? toolById(claim.pending.toolId) : undefined;
+  if (!tool) {
+    deps.calendarConnects.fail(claim.pending, {
+      code: "google_exchange_failed",
+      message: "Connect one tool at a time from Settings → Tools.",
+    });
+    sendHtml(res, 400, page("Tool not connected", "Connect one tool at a time from Settings → Tools."));
     return;
   }
   const code = url.searchParams.get("code");
   if (url.searchParams.get("error") || !code) {
-    deps.calendarConnects.fail(claim.pending, { code: "google_denied", message: "Google Calendar access was cancelled." });
-    sendHtml(res, 400, page("Calendar not connected", "Google did not grant Calendar access. Return to Waypoint and try again."));
+    deps.calendarConnects.fail(claim.pending, { code: "google_denied", message: `${tool.title} access was cancelled.` });
+    sendHtml(res, 400, page(`${tool.title} not connected`, `Google did not grant ${tool.title} access. Return to Waypoint and try again.`));
     return;
   }
   try {
@@ -751,26 +886,35 @@ async function calendarCallback(url: URL, res: ServerResponse, deps: ProductDeps
     if (!tokens.refreshToken) {
       throw new GoogleExchangeError("Google did not return a refresh token.");
     }
-    await deps.store.setCalendarGrant(claim.pending.userId, tokens.refreshToken, true);
+    const nowIso = now.toISOString();
+    await deps.store.upsertToolConnection(claim.pending.userId, {
+      toolId: tool.id,
+      provider: tool.provider,
+      scopes: tool.scopes.join(" "),
+      refreshToken: tokens.refreshToken,
+      status: "connected",
+      connectedAt: nowIso,
+      updatedAt: nowIso,
+    });
     deps.calendarConnects.complete(claim.pending);
     sendHtml(
       res,
       200,
-      page("Google connected", "Calendar and Drive are linked. You can close this tab and return to Waypoint."),
+      page(`${tool.title} connected`, `${tool.title} is linked. You can close this tab and return to Waypoint.`),
     );
   } catch (error) {
-    deps.calendarConnects.fail(claim.pending, { code: "google_exchange_failed", message: "Google connection failed." });
+    deps.calendarConnects.fail(claim.pending, { code: "google_exchange_failed", message: `${tool.title} connection failed.` });
     if (!(error instanceof GoogleExchangeError) && !(error instanceof HttpError)) console.error(error);
-    sendHtml(res, 502, page("Google not connected", "Waypoint could not finish Google access. Return to the app and try again."));
+    sendHtml(res, 502, page(`${tool.title} not connected`, `Waypoint could not finish ${tool.title} access. Return to the app and try again.`));
   }
 }
 
-function pollCalendar(url: URL, res: ServerResponse, deps: ProductDeps, now: Date) {
+async function pollCalendar(url: URL, res: ServerResponse, deps: ProductDeps, now: Date) {
   const pollToken = url.searchParams.get("poll_token");
   if (!pollToken) throw new HttpError(400, "poll_token_required", "Query parameter poll_token is required.");
   const result = deps.calendarConnects.poll(pollToken, now.getTime());
-  if (result.type === "missing") throw new HttpError(404, "poll_not_found", "That Calendar connection was not found.");
-  if (result.type === "expired") throw new HttpError(410, "poll_expired", "That Calendar connection expired. Start again.");
+  if (result.type === "missing") throw new HttpError(404, "poll_not_found", "That tool connection was not found.");
+  if (result.type === "expired") throw new HttpError(410, "poll_expired", "That tool connection expired. Start again.");
   if (result.type === "pending") {
     sendJson(res, 200, { status: "pending", expires_in: result.expiresIn });
     return;
@@ -779,28 +923,47 @@ function pollCalendar(url: URL, res: ServerResponse, deps: ProductDeps, now: Dat
     sendJson(res, 200, { status: "error", error: result.error });
     return;
   }
+  if (!result.toolId) {
+    throw new HttpError(400, "tool_required", "Connect one tool at a time from Settings → Tools.");
+  }
+  const tools = await publicTools(deps, result.userId);
   sendJson(res, 200, {
     status: "complete",
-    calendar_connected: true,
-    google_connected: true,
-    drive_connected: true,
+    tool_id: result.toolId,
+    status_connection: "connected",
+    ...connectionFlags(tools),
   });
 }
 
-async function googleAccess(deps: ProductDeps, userId: string): Promise<string> {
-  const connection = await deps.store.getCalendarConnection(userId);
-  if (!connection.connected || !connection.refreshToken) {
+async function toolAccess(deps: ProductDeps, userId: string, toolId: string): Promise<string> {
+  const rows = await deps.store.listToolConnections(userId);
+  const row = rows.find((item) => item.toolId === toolId);
+  if (!row || row.status !== "connected" || !row.refreshToken) {
+    if (toolId === "google_drive") {
+      throw new HttpError(409, "drive_not_connected", "Connect Google Drive before using it.");
+    }
     throw new HttpError(409, "calendar_not_connected", "Connect Google Calendar before using it.");
   }
   if (!googleConfigured(deps.config)) {
     throw new HttpError(503, "google_not_configured", "Google sign-in is unavailable.");
   }
   return deps.calendar.refresh({
-    refreshToken: connection.refreshToken,
+    refreshToken: row.refreshToken,
     clientId: deps.config.googleClientId!,
     clientSecret: deps.config.googleClientSecret!,
   });
 }
+
+type PublicTool = {
+  id: string;
+  provider: string;
+  title: string;
+  summary: string;
+  scopes: string[];
+  scope_labels: string[];
+  status: "connected" | "disconnected";
+  connected_at: string | null;
+};
 
 function windowDays(value: string | null): number {
   if (value === null || value === "") return 14;

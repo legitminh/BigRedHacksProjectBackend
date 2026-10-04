@@ -7,6 +7,7 @@ import { Pool, type PoolClient } from "pg";
 
 import { canonicalEmail } from "../auth/email.ts";
 import { hashesMatch } from "../auth/tokens.ts";
+import { legacyGoogleToolConnections } from "../tools/catalog.ts";
 import {
   DEFAULT_INTERACTION,
   type Interaction,
@@ -29,6 +30,8 @@ import type {
   RotateResult,
   Store,
   StoredRefreshToken,
+  ToolConnection,
+  ToolConnectionWrite,
 } from "./types.ts";
 
 type UserRow = {
@@ -88,6 +91,20 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
     email: string | null,
     now: Date,
   ): Promise<PublicUser> {
+    const current = await client.query<{ calendar_connected: boolean; google_refresh_token: string | null }>(
+      `SELECT calendar_connected, google_refresh_token FROM users WHERE id = $1`,
+      [id],
+    );
+    const legacy = current.rows[0];
+    const existingTools = await client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM tool_connections WHERE user_id = $1`,
+      [id],
+    );
+    if (legacy?.calendar_connected && legacy.google_refresh_token && Number(existingTools.rows[0]?.n ?? 0) === 0) {
+      for (const connection of legacyGoogleToolConnections(id, legacy.google_refresh_token, now.toISOString())) {
+        await upsertToolRow(client, id, connection);
+      }
+    }
     const result = await client.query<UserRow>(
       `UPDATE users SET
          google_sub = $2,
@@ -825,6 +842,55 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
       }
       await pool.query(`UPDATE users SET calendar_connected = $2 WHERE id = $1`, [userId, connected]);
     },
+    async listToolConnections(userId) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const user = await client.query<{ calendar_connected: boolean; google_refresh_token: string | null }>(
+          `SELECT calendar_connected, google_refresh_token FROM users WHERE id = $1 FOR UPDATE`,
+          [userId],
+        );
+        let rows = (
+          await client.query<ToolConnectionRow>(
+            `SELECT user_id, tool_id, provider, scopes, refresh_token, status, connected_at, updated_at
+             FROM tool_connections WHERE user_id = $1`,
+            [userId],
+          )
+        ).rows;
+        const legacy = user.rows[0];
+        if (rows.length === 0 && legacy?.calendar_connected && legacy.google_refresh_token) {
+          const nowIso = new Date().toISOString();
+          for (const connection of legacyGoogleToolConnections(userId, legacy.google_refresh_token, nowIso)) {
+            await upsertToolRow(client, userId, connection);
+          }
+          rows = (
+            await client.query<ToolConnectionRow>(
+              `SELECT user_id, tool_id, provider, scopes, refresh_token, status, connected_at, updated_at
+               FROM tool_connections WHERE user_id = $1`,
+              [userId],
+            )
+          ).rows;
+        }
+        await client.query("COMMIT");
+        return rows.map(mapToolConnection);
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    async upsertToolConnection(userId, connection: ToolConnectionWrite) {
+      await upsertToolRow(pool, userId, { userId, ...connection });
+    },
+    async disconnectTool(userId, toolId) {
+      await pool.query(
+        `UPDATE tool_connections
+         SET refresh_token = NULL, status = 'disconnected', updated_at = $3
+         WHERE user_id = $1 AND tool_id = $2`,
+        [userId, toolId, new Date().toISOString()],
+      );
+    },
     async createTask(userId, task, now) {
       const client = await pool.connect();
       try {
@@ -1005,6 +1071,7 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         await client.query(`DELETE FROM proficiencies WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM user_profiles WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM tool_connections WHERE user_id = $1`, [userId]);
         if (email) {
           await client.query(`DELETE FROM email_login_codes WHERE lower(email) = $1`, [email]);
         }
@@ -1021,6 +1088,59 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
       await pool.end();
     },
   };
+}
+
+type ToolConnectionRow = {
+  user_id: string;
+  tool_id: string;
+  provider: string;
+  scopes: string;
+  refresh_token: string | null;
+  status: string;
+  connected_at: Date | string | null;
+  updated_at: Date | string;
+};
+
+function mapToolConnection(row: ToolConnectionRow): ToolConnection {
+  return {
+    userId: row.user_id,
+    toolId: row.tool_id,
+    provider: row.provider,
+    scopes: row.scopes,
+    refreshToken: row.refresh_token,
+    status: row.status === "connected" ? "connected" : "disconnected",
+    connectedAt: row.connected_at ? new Date(row.connected_at).toISOString() : null,
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+async function upsertToolRow(
+  db: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  connection: ToolConnection,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO tool_connections (
+       user_id, tool_id, provider, scopes, refresh_token, status, connected_at, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (user_id, tool_id) DO UPDATE SET
+       provider = EXCLUDED.provider,
+       scopes = EXCLUDED.scopes,
+       refresh_token = EXCLUDED.refresh_token,
+       status = EXCLUDED.status,
+       connected_at = EXCLUDED.connected_at,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      userId,
+      connection.toolId,
+      connection.provider,
+      connection.scopes,
+      connection.refreshToken,
+      connection.status,
+      connection.connectedAt,
+      connection.updatedAt,
+    ],
+  );
 }
 
 type TaskRow = {

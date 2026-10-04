@@ -434,7 +434,7 @@ function dashboardPage(config: Config, overview: AdminOverview): string {
   );
 }
 
-function userDetailPage(detail: AdminUserDetail): string {
+function userDetailPage(detail: AdminUserDetail, connectedTools = 0): string {
   const u = detail.user;
   return shell(
     `User ${u.email ?? u.id}`,
@@ -451,6 +451,7 @@ function userDetailPage(detail: AdminUserDetail): string {
         <dt>Google sub</dt><dd><code>${escapeHtml(u.google_sub ?? "—")}</code></dd>
         <dt>Picture</dt><dd>${u.picture ? `<a class="link" href="${escapeHtml(u.picture)}" target="_blank" rel="noreferrer">open</a>` : "—"}</dd>
         <dt>Calendar / Drive</dt><dd>${u.calendar_connected ? '<span class="pill ok">connected</span>' : '<span class="pill bad">not connected</span>'}</dd>
+        <dt>Tools</dt><dd>${connectedTools} connected</dd>
         <dt>Google refresh token</dt><dd>${u.has_google_refresh_token ? '<span class="pill ok">present</span>' : '<span class="pill bad">missing</span>'}</dd>
         <dt>Created</dt><dd>${escapeHtml(u.created_at ?? "—")}</dd>
         <dt>Last login</dt><dd>${escapeHtml(u.last_login_at ?? "—")}</dd>
@@ -588,7 +589,9 @@ export async function handleAdmin(
     }
     const detail = await deps.store.adminUserDetail(id);
     if (!detail) throw new HttpError(404, "user_not_found", "No user with that id.");
-    sendHtml(res, 200, userDetailPage(detail));
+    const connections = await deps.store.listToolConnections(id);
+    const connectedTools = connections.filter((row) => row.status === "connected" && row.refreshToken).length;
+    sendHtml(res, 200, userDetailPage(detail, connectedTools));
     return true;
   }
 
@@ -601,17 +604,25 @@ export async function handleAdmin(
     }
     const detail = await deps.store.adminUserDetail(id);
     if (!detail) throw new HttpError(404, "user_not_found", "No user with that id.");
-    // Best-effort Google revoke before wipe (same posture as DELETE /v1/me/data).
+    // Best-effort: revoke distinct tool grants, then the identity token once. Never double-revoke.
     try {
-      const { refreshToken } = await deps.store.getCalendarConnection(id);
-      if (refreshToken) {
+      const connections = await deps.store.listToolConnections(id);
+      const { refreshToken: identity } = await deps.store.getCalendarConnection(id);
+      const revoked = new Set<string>();
+      const revokeOnce = async (token: string | null) => {
+        if (!token || revoked.has(token)) return;
+        revoked.add(token);
         await fetch("https://oauth2.googleapis.com/revoke", {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({ token: refreshToken }),
+          body: new URLSearchParams({ token }),
           signal: AbortSignal.timeout(5000),
         });
+      };
+      for (const row of connections) {
+        if (row.refreshToken && row.refreshToken !== identity) await revokeOnce(row.refreshToken);
       }
+      await revokeOnce(identity);
     } catch {
       // Local clear must still succeed if Google is unreachable.
     }

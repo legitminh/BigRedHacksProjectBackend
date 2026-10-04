@@ -109,3 +109,15 @@ CREATE TABLE IF NOT EXISTS session_notes (
 
 CREATE INDEX IF NOT EXISTS session_notes_user_ended_idx
   ON session_notes (user_id, ended_at DESC);
+
+CREATE TABLE IF NOT EXISTS tool_connections (
+  user_id UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  tool_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  scopes TEXT NOT NULL,
+  refresh_token TEXT,
+  status TEXT NOT NULL,
+  connected_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, tool_id)
+);

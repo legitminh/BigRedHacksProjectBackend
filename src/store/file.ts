@@ -12,6 +12,7 @@ import type {
   StoredProfile,
   TaskRecord,
 } from "../product/model.ts";
+import { legacyGoogleToolConnections } from "../tools/catalog.ts";
 import type {
   AdminBrowseResult,
   AdminBrowseTable,
@@ -23,6 +24,8 @@ import type {
   RotateResult,
   Store,
   StoredRefreshToken,
+  ToolConnection,
+  ToolConnectionWrite,
 } from "./types.ts";
 
 type UserRecord = PublicUser & {
@@ -45,6 +48,7 @@ type FileData = {
   tasks: Owned<TaskRecord>[];
   sessions: Owned<SessionRecap>[];
   sessionNotes: Owned<SessionNote>[];
+  toolConnections: ToolConnection[];
 };
 
 function empty(): FileData {
@@ -58,6 +62,7 @@ function empty(): FileData {
     tasks: [],
     sessions: [],
     sessionNotes: [],
+    toolConnections: [],
   };
 }
 
@@ -97,6 +102,7 @@ export function openFileStore(path: string): Store {
         tasks: parsed.tasks ?? [],
         sessions: parsed.sessions ?? [],
         sessionNotes: parsed.sessionNotes ?? [],
+        toolConnections: parsed.toolConnections ?? [],
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
@@ -125,6 +131,15 @@ export function openFileStore(path: string): Store {
             : undefined;
         const existing = bySub ?? byEmail;
         if (existing) {
+          if (
+            existing.calendar_connected === true &&
+            existing.google_refresh_token &&
+            !data.toolConnections.some((row) => row.userId === existing.id)
+          ) {
+            data.toolConnections.push(
+              ...legacyGoogleToolConnections(existing.id, existing.google_refresh_token, now.toISOString()),
+            );
+          }
           existing.google_sub = profile.sub;
           existing.email = email;
           existing.email_verified = profile.emailVerified;
@@ -524,6 +539,42 @@ export function openFileStore(path: string): Store {
         await write(data);
       });
     },
+    async listToolConnections(userId) {
+      return lock(async () => {
+        const data = await read();
+        const mine = () => data.toolConnections.filter((row) => row.userId === userId).map((row) => ({ ...row }));
+        if (mine().length > 0) return mine();
+        const user = data.users.find((item) => item.id === userId);
+        if (user?.calendar_connected === true && user.google_refresh_token) {
+          const migrated = legacyGoogleToolConnections(userId, user.google_refresh_token, new Date().toISOString());
+          data.toolConnections.push(...migrated);
+          await write(data);
+          return migrated.map((row) => ({ ...row }));
+        }
+        return [];
+      });
+    },
+    async upsertToolConnection(userId, connection: ToolConnectionWrite) {
+      await lock(async () => {
+        const data = await read();
+        const next: ToolConnection = { userId, ...connection };
+        const index = data.toolConnections.findIndex((row) => row.userId === userId && row.toolId === connection.toolId);
+        if (index >= 0) data.toolConnections[index] = next;
+        else data.toolConnections.push(next);
+        await write(data);
+      });
+    },
+    async disconnectTool(userId, toolId) {
+      await lock(async () => {
+        const data = await read();
+        const row = data.toolConnections.find((item) => item.userId === userId && item.toolId === toolId);
+        if (!row) return;
+        row.refreshToken = null;
+        row.status = "disconnected";
+        row.updatedAt = new Date().toISOString();
+        await write(data);
+      });
+    },
     async createTask(userId, task, now) {
       await lock(async () => {
         const data = await read();
@@ -648,6 +699,7 @@ export function openFileStore(path: string): Store {
         data.sessions = data.sessions.filter((item) => item.userId !== userId);
         data.sessionNotes = data.sessionNotes.filter((item) => item.userId !== userId);
         data.refreshTokens = data.refreshTokens.filter((item) => item.userId !== userId);
+        data.toolConnections = data.toolConnections.filter((item) => item.userId !== userId);
         if (email) {
           data.emailCodes = data.emailCodes.filter(
             (item) => item.email.trim().toLowerCase() !== email,

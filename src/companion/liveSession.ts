@@ -35,6 +35,24 @@ import {
 import { SpeechQueue, type SpeechAction } from "./speechQueue.ts";
 
 const MAX_PCM_BYTES = 64 * 1024;
+
+/**
+ * `ws` delivers text frames as Buffer with `isBinary === false`.
+ * Treating every Buffer as PCM drops typed turns, so the desktop never gets a spoken reply.
+ */
+export function splitClientMessage(
+  data: WebSocket.RawData,
+  isBinary: boolean,
+): { uplink: Buffer | null; text: string | null } {
+  if (isBinary) {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+    const frame = tryDecodePcmFrame(buf);
+    if (!frame || frame.kind !== AUDIO_KIND_UPLINK) return { uplink: null, text: null };
+    return { uplink: frame.pcm, text: null };
+  }
+  const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+  return { uplink: null, text };
+}
 const SETUP_TIMEOUT_MS = 20_000;
 /** Fixed opener — no Flash-Lite spend; Grok speaks it once at Mic-on. */
 const LIVE_OPENER = "I'm here. What are you working on?";
@@ -712,15 +730,13 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
 
   client.on("message", (data, isBinary) => {
     if (closed || !gemini) return;
-    if (isBinary || Buffer.isBuffer(data)) {
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      const frame = tryDecodePcmFrame(buf);
-      if (frame && frame.kind === AUDIO_KIND_UPLINK) {
-        forwardUplinkPcm(frame.pcm);
-      }
+    const message = splitClientMessage(data, isBinary);
+    if (message.uplink) {
+      forwardUplinkPcm(message.uplink);
       return;
     }
-    const inbound = parseInbound(String(data));
+    if (isBinary || message.text == null) return;
+    const inbound = parseInbound(message.text);
     if (!inbound) return;
     if (inbound.type === "stop") {
       cleanup();

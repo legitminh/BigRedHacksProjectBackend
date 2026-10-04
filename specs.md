@@ -78,24 +78,48 @@ Move a topic one step (`learning` → `comfortable` → `strong`, or the reverse
 - `user_profiles`: `user_id` PK references `users`, `interests` text[], `long_term_goals` jsonb, `priorities` jsonb, `interaction` jsonb, `updated_at`
 - `proficiencies`: PK `(user_id, topic)`, `level`, `updated_at`
 - `pace_samples`: `id`, `user_id`, `topic`, `problem`, `planned_minutes`, `actual_minutes`, `outcome`, `task_id` nullable, `recorded_at`
+- `tool_connections`: PK `(user_id, tool_id)`, `provider`, `scopes`, `refresh_token`, `status` (`connected` or `disconnected`), `connected_at`, `updated_at`. Server-side, not device-local. The API never returns `refresh_token`.
 
 `GET /v1/memory/pace?topic=heaps` returns the samples (newest first, default 8) for the profile screen. The model does not need this route; it sees the median on the card.
 
 ## Calendar
 
-Desktop sign-in (`POST /v1/auth/google/start`) already requests the bundled scopes `openid email profile`, `calendar.events`, and `drive.readonly` in one consent. `POST /v1/google/calendar/start` is a second consent (re-connect / incremental) with `include_granted_scopes=true`, scopes `calendar.events drive.readonly`, `access_type=offline`. The new refresh token replaces `users.google_refresh_token`. Disconnecting Calendar nulls that use of the token's calendar scope by storing a flag `calendar_connected` (default false) rather than deleting the identity session.
+Waypoint Google sign-in is identity only: scopes `openid`, `email`, and `profile`. It does not request Calendar or Drive. `include_granted_scopes` is false on sign-in and on tool connect, so a tool grant is not folded into the login token.
 
-`calendar_connected` is false until a grant exists (bundled sign-in or this flow). Memory and tasks work either way.
+Tools are separate from the user's Waypoint account and from each other. Each tool has its own OAuth grant, scopes, and refresh token. The provider (today `google`) is the authentication method for that tool, not a link to `users.google_sub`. More providers can be added later as catalog entries without a new table.
 
-Limitation: pending calendar-connect state (state, PKCE verifier, poll token) is **in-memory only** with a short TTL. An API restart drops in-flight connects; the app calls `/v1/google/calendar/start` again. Completed grants are durable.
+Catalog today:
 
-### `POST /v1/google/calendar/start`
+- `google_calendar` — scope `https://www.googleapis.com/auth/calendar.events` — create and edit events
+- `google_drive` — scope `https://www.googleapis.com/auth/drive.readonly` — view files
 
-Same response shape as `POST /v1/auth/google/start`: `authorization_url`, `state`, `poll_token`, `expires_in`. Requires a Waypoint bearer token so the grant attaches to the signed-in user.
+Grants live in `tool_connections` (see Tables). Existing users with `users.calendar_connected` and a refresh token are treated as both tools connected until they disconnect one.
 
-### `GET /v1/google/calendar/poll?poll_token=`
+### `GET /v1/tools`
 
-Same pending / complete / error contract as login poll. `complete` returns `{ "status": "complete", "calendar_connected": true }` and does not issue a new Waypoint token.
+Every catalog tool: `id`, `provider`, `title`, `summary`, `scopes`, `scope_labels`, `status`, `connected_at`. No secrets.
+
+### `POST /v1/tools/:toolId/connect`
+
+Starts OAuth for that tool's scopes only. Requires a Waypoint bearer token so the grant attaches to the signed-in user. Response: `authorization_url`, `state`, `poll_token`, `expires_in`. The redirect stays `/v1/google/calendar/callback`.
+
+### `GET /v1/tools/:toolId/poll?poll_token=`
+
+`pending`, `complete`, or `error`. `complete` does not issue a Waypoint token.
+
+### `POST /v1/tools/:toolId/disconnect`
+
+Disconnects that tool only. The identity session stays. A Google refresh token is revoked only when no remaining tool row uses it and the identity token does not still use it.
+
+`POST /v1/google/connect/start` and `POST /v1/google/calendar/start` return `400` `tool_required` (no bundled consent).
+
+`GET /v1/google/status` stays. `calendar_connected` and `drive_connected` are independent. `google_connected` is true only when both are.
+
+Calendar routes return `409` `calendar_not_connected` without the calendar tool. Drive routes return `409` `drive_not_connected` without the drive tool.
+
+Memory, tasks, and Copilot work with no tools connected. Desktop unlock is Waypoint sign-in (or Guest), not Calendar or Drive consent.
+
+Settings → Tools lists each tool, its provider, the permission it asks for, and Connect or Disconnect. Settings → Permissions stays macOS privacy (screen, camera, mic, accessibility). Settings → Connection stays service health. The `google` row is optional and is not a combined required link.
 
 ### `GET /v1/calendar/agenda?days=14`
 
@@ -126,7 +150,7 @@ Server-side classification of primary-calendar events from now through `days` (1
 
 An event is a deadline when it is all-day or its title matches `(?i)\b(due|deadline|submit|exam|quiz|prelim|midterm|final|hw|pset|assignment)\b`. Everything else in the window is a block. `waypoint` is true when the event's private extended property `waypoint` is `1`.
 
-`409` `calendar_not_connected` if the user has not finished the calendar consent.
+`409` `calendar_not_connected` without the calendar tool.
 
 ### `POST /v1/calendar/events`
 

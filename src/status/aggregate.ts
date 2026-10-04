@@ -29,7 +29,8 @@ export type StatusDeps = {
   fetch: FetchLike;
   /** Present when the request carries a valid JWT. */
   user: PublicUser | null;
-  googleConnected: boolean | null;
+  /** Tool rows for the signed-in user. Null when the request has no account. */
+  googleTools: { connected: number; total: number } | null;
   now?: () => Date;
 };
 
@@ -268,35 +269,37 @@ function accountIndicator(user: PublicUser | null): ServiceIndicator {
 
 function googleDataIndicator(
   user: PublicUser | null,
-  googleConnected: boolean | null,
+  tools: { connected: number; total: number } | null,
 ): ServiceIndicator {
-  if (!user) {
+  const separate = "Calendar and Drive are separate tools in Settings";
+  if (!user || !tools) {
     return {
       id: "google",
       label: "Google",
       state: "warn",
-      status: "Offline",
-      detail: "Required — sign in with Google on the welcome screen",
-      optional: false,
+      status: "Optional",
+      detail: separate,
+      optional: true,
     };
   }
-  if (googleConnected) {
+  if (tools.connected <= 0) {
     return {
       id: "google",
       label: "Google",
       state: "ok",
-      status: "Connected",
-      detail: "Calendar and Drive linked for Copilot",
-      optional: false,
+      status: "Optional",
+      detail: separate,
+      optional: true,
     };
   }
+  const all = tools.total > 0 && tools.connected >= tools.total;
   return {
     id: "google",
     label: "Google",
-    state: "warn",
-    status: "Offline",
-    detail: "Required — re-link Calendar and Drive",
-    optional: false,
+    state: "ok",
+    status: all ? "Connected" : "Optional",
+    detail: `${tools.connected} of ${tools.total} tools connected. ${separate}`,
+    optional: true,
   };
 }
 
@@ -377,7 +380,7 @@ export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse>
       detail: gemini.detail,
       optional: false,
     },
-    googleDataIndicator(deps.user, deps.googleConnected),
+    googleDataIndicator(deps.user, deps.googleTools),
     {
       id: "ollama",
       label: "Lock-in coach",

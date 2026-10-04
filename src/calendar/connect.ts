@@ -7,6 +7,8 @@ type Pending = {
   pollToken: string;
   codeVerifier: string;
   userId: string;
+  /** Catalog tool this consent is for. Old records without it are rejected. */
+  toolId: string;
   expiresAt: number;
   status: Status;
   error?: PollError;
@@ -50,7 +52,7 @@ export class CalendarConnects {
     | { type: "missing" }
     | { type: "expired" }
     | { type: "pending"; expiresIn: number }
-    | { type: "complete" }
+    | { type: "complete"; toolId: string; userId: string }
     | { type: "error"; error: PollError } {
     const pending = this.byPoll.get(token);
     if (!pending) return { type: "missing" };
@@ -62,8 +64,10 @@ export class CalendarConnects {
       return { type: "pending", expiresIn: Math.max(0, Math.ceil((pending.expiresAt - now) / 1000)) };
     }
     if (pending.status === "complete") {
+      const toolId = pending.toolId;
+      const userId = pending.userId;
       this.remove(pending);
-      return { type: "complete" };
+      return { type: "complete", toolId, userId };
     }
     const error = pending.error ?? { code: "google_exchange_failed", message: "Calendar connection failed." };
     this.remove(pending);

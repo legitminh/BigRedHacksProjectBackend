@@ -39,7 +39,7 @@ Authorization: Bearer <access_token>   # optional — enriches account + Google 
 | `id` | Meaning |
 |---|---|
 | `gemini` | Live list-models probe against Google Generative Language using `GEMINI_API_KEY`. `Quota` on 429 / resource-exhausted. |
-| `google` | User Calendar/Drive link (`calendar_connected`). Without a JWT: sign-in prompt. |
+| `google` | Optional. `calendar_connected` and `drive_connected` are independent tool links; `google_connected` is true only when both are. Not a combined required link. Without a JWT: sign-in prompt. |
 | `ollama` | `GET {OLLAMA_BASE_URL}/api/tags` on the API host. Checks lock-in model (`OLLAMA_MODEL`) and chat model (`OLLAMA_CHAT_MODEL`). |
 | `chat_provider` | Which engine serves Copilot chat right now (from `LOCAL_CHAT_PROVIDER` + probe health). Health only — does not switch providers. |
 | `account` | Signed-in Waypoint user when `Authorization` is valid; otherwise “Sign in…”. |

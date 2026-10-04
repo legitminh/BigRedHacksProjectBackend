@@ -571,27 +571,36 @@ test("calendar consent classifies the agenda and refuses edits to other events",
     const auth = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
     const blocked = await fetch(`${base}/v1/calendar/agenda`, { headers: auth });
     assert.equal(blocked.status, 409);
+    assert.equal(((await blocked.json()) as { error: { code: string } }).error.code, "calendar_not_connected");
 
-    const start = await fetch(`${base}/v1/google/calendar/start`, { method: "POST", headers: auth });
+    const bundled = await fetch(`${base}/v1/google/calendar/start`, { method: "POST", headers: auth });
+    assert.equal(bundled.status, 400);
+    assert.equal(((await bundled.json()) as { error: { code: string } }).error.code, "tool_required");
+
+    const start = await fetch(`${base}/v1/tools/google_calendar/connect`, { method: "POST", headers: auth });
     assert.equal(start.status, 200);
     const started = (await start.json()) as { authorization_url: string; state: string; poll_token: string };
     const authUrl = new URL(started.authorization_url);
-    assert.equal(
-      authUrl.searchParams.get("scope"),
-      "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly",
-    );
-    assert.equal(authUrl.searchParams.get("include_granted_scopes"), "true");
+    assert.equal(authUrl.searchParams.get("scope"), "https://www.googleapis.com/auth/calendar.events");
+    assert.equal(authUrl.searchParams.get("include_granted_scopes"), "false");
     const callback = await fetch(
       `${base}/v1/google/calendar/callback?code=abc&state=${encodeURIComponent(started.state)}`,
     );
     assert.equal(callback.status, 200);
-    const poll = await fetch(`${base}/v1/google/calendar/poll?poll_token=${encodeURIComponent(started.poll_token)}`);
+    assert.match(await callback.text(), /Google Calendar/);
+    const poll = await fetch(`${base}/v1/tools/google_calendar/poll?poll_token=${encodeURIComponent(started.poll_token)}`);
     assert.deepEqual(await poll.json(), {
       status: "complete",
+      tool_id: "google_calendar",
+      status_connection: "connected",
       calendar_connected: true,
-      google_connected: true,
-      drive_connected: true,
+      google_connected: false,
+      drive_connected: false,
     });
+
+    const driveBlocked = await fetch(`${base}/v1/drive/recent`, { headers: auth });
+    assert.equal(driveBlocked.status, 409);
+    assert.equal(((await driveBlocked.json()) as { error: { code: string } }).error.code, "drive_not_connected");
 
     const agenda = await fetch(`${base}/v1/calendar/agenda?days=14`, { headers: auth });
     const classified = (await agenda.json()) as {
@@ -625,6 +634,54 @@ test("calendar consent classifies the agenda and refuses edits to other events",
     assert.equal(patch.status, 403);
     assert.equal(((await patch.json()) as { error: { code: string } }).error.code, "not_waypoint_event");
   }, calendar(events, inserted));
+});
+
+test("drive connect requests only Drive and does not mark Calendar connected", async () => {
+  await withApp(async (base, inbox) => {
+    const token = await tokenFor(base, inbox);
+    const auth = { Authorization: `Bearer ${token}` };
+    const bundled = await fetch(`${base}/v1/google/connect/start`, { method: "POST", headers: auth });
+    assert.equal(bundled.status, 400);
+    assert.equal(
+      ((await bundled.json()) as { error: { code: string; message: string } }).error.message,
+      "Connect one tool at a time from Settings → Tools.",
+    );
+
+    const start = await fetch(`${base}/v1/tools/google_drive/connect`, { method: "POST", headers: auth });
+    assert.equal(start.status, 200);
+    const started = (await start.json()) as { authorization_url: string; state: string; poll_token: string };
+    const authUrl = new URL(started.authorization_url);
+    assert.equal(authUrl.searchParams.get("scope"), "https://www.googleapis.com/auth/drive.readonly");
+    assert.equal(authUrl.searchParams.get("include_granted_scopes"), "false");
+    assert.equal(authUrl.searchParams.get("access_type"), "offline");
+    assert.equal(authUrl.searchParams.get("prompt"), "consent");
+    assert.equal(authUrl.searchParams.get("redirect_uri"), "http://127.0.0.1:8787/v1/google/calendar/callback");
+
+    const callback = await fetch(
+      `${base}/v1/google/connect/callback?code=abc&state=${encodeURIComponent(started.state)}`,
+    );
+    assert.equal(callback.status, 200);
+    assert.match(await callback.text(), /Google Drive/);
+    const poll = await fetch(
+      `${base}/v1/google/connect/poll?poll_token=${encodeURIComponent(started.poll_token)}`,
+    );
+    assert.deepEqual(await poll.json(), {
+      status: "complete",
+      tool_id: "google_drive",
+      status_connection: "connected",
+      calendar_connected: false,
+      drive_connected: true,
+      google_connected: false,
+    });
+
+    const agenda = await fetch(`${base}/v1/calendar/agenda`, { headers: auth });
+    assert.equal(agenda.status, 409);
+    assert.equal(((await agenda.json()) as { error: { code: string } }).error.code, "calendar_not_connected");
+
+    const unknown = await fetch(`${base}/v1/tools/not_a_tool/connect`, { method: "POST", headers: auth });
+    assert.equal(unknown.status, 404);
+    assert.equal(((await unknown.json()) as { error: { code: string } }).error.code, "unknown_tool");
+  });
 });
 
 test("session notes upsert in place, list newest first, and stay private", async () => {

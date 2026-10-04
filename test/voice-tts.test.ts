@@ -132,6 +132,38 @@ test("voice tts proxies to xAI with coach token", async () => {
   );
 });
 
+test("voice tts unwraps xAI JSON audio so the desktop can play it", async () => {
+  const mp3 = Buffer.from([0xff, 0xfb, 0x90, 0x00, ...Array.from({ length: 64 }, () => 2)]);
+  await withApp(
+    async (base) => {
+      const response = await fetch(`${base}/v1/voice/tts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${COACH_TOKEN}`,
+        },
+        body: JSON.stringify({ text: "Back to the draft." }),
+      });
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get("content-type") ?? "", /audio\/mpeg/);
+      const bytes = Buffer.from(await response.arrayBuffer());
+      assert.deepEqual(bytes, mp3);
+    },
+    {
+      config: appConfig({ XAI_API_KEY: "xai-test-key" }),
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            audio: mp3.toString("base64"),
+            content_type: "audio/mpeg",
+            duration: 0.4,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    },
+  );
+});
+
 test("voice health reports configured flag", async () => {
   await withApp(async (base) => {
     const off = await fetch(`${base}/v1/voice/health`);

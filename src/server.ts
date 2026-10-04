@@ -25,6 +25,7 @@ import { CameraSessionStore } from "./camera/sessionStore.ts";
 import { handleProduct, type ProductDeps } from "./product/routes.ts";
 import { handleVoiceHealth, handleVoiceTts } from "./voice/tts.ts";
 import { aggregateStatus } from "./status/aggregate.ts";
+import { TOOL_CATALOG } from "./tools/catalog.ts";
 import {
   HttpError,
   applyCors,
@@ -223,17 +224,23 @@ async function handle(
     limit(deps, "status", shieldIp(deps, req), "statusIp");
     const now = deps.now();
     const user = await optionalUser(deps, req, now);
-    let googleConnected: boolean | null = null;
+    let googleTools: { connected: number; total: number } | null = null;
     if (user) {
-      const connection = await deps.store.getCalendarConnection(user.id);
-      googleConnected = connection.connected;
+      const rows = await deps.store.listToolConnections(user.id);
+      const connectedIds = new Set(
+        rows.filter((row) => row.status === "connected" && row.refreshToken).map((row) => row.toolId),
+      );
+      googleTools = {
+        connected: TOOL_CATALOG.filter((tool) => connectedIds.has(tool.id)).length,
+        total: TOOL_CATALOG.length,
+      };
     }
     const body = await aggregateStatus({
       config: deps.config,
       store: deps.store,
       fetch: deps.fetch,
       user,
-      googleConnected,
+      googleTools,
       now: deps.now,
     });
     sendJson(res, 200, body);
@@ -470,9 +477,8 @@ function assertLoginReady(config: Config): void {
   }
 }
 
-/** Sign-in + Calendar + Drive in one consent (required for the desktop app). */
-const GOOGLE_LOGIN_SCOPES =
-  "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly";
+/** Identity only. Calendar and Drive are separate tool grants. */
+const GOOGLE_LOGIN_SCOPES = "openid email profile";
 
 async function startGoogle(
   res: ServerResponse,
@@ -498,6 +504,7 @@ async function startGoogle(
       state,
       codeVerifier,
       scopes: GOOGLE_LOGIN_SCOPES,
+      includeGrantedScopes: false,
     }),
     state,
     poll_token: pollToken,
@@ -543,7 +550,7 @@ async function googleCallback(
       redirectUri: deps.config.redirectUri,
     });
     if (!tokens.refreshToken) {
-      throw new GoogleExchangeError("Google did not return a refresh token for Calendar/Drive.");
+      throw new GoogleExchangeError("Google did not return a refresh token for Waypoint sign-in.");
     }
     const profile = await deps.google.fetchUserInfo(tokens.accessToken);
     const user = await deps.store.upsertGoogleUser(
@@ -557,8 +564,6 @@ async function googleCallback(
       },
       now,
     );
-    // Login grants identity + Calendar/Drive — mark Google data linked.
-    await deps.store.setCalendarGrant(user.id, tokens.refreshToken, true);
     const refresh = newRefreshRecord(user.id, now, deps.config.refreshTokenTtlSeconds);
     await deps.store.insertRefreshToken(refresh.record);
     const result: CompletedLogin = {
@@ -573,8 +578,8 @@ async function googleCallback(
       res,
       200,
       page(
-        "Waypoint connected",
-        "Google account, Calendar, and Drive are linked. You can close this tab and return to Waypoint.",
+        "Signed in to Waypoint",
+        "Waypoint sign-in is complete. You can close this tab and return to Waypoint.",
       ),
     );
   } catch (error) {

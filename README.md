@@ -35,7 +35,7 @@ The process listens on `BIND_HOST:PORT` (default `http://127.0.0.1:8787`). `GET 
 
 `storage` is `postgres` when `DATABASE_URL` is set.
 
-**Connection status panel** (desktop Settings → Connection) uses `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, and Copilot chat provider. Auth is optional (JWT enriches account + Calendar/Drive). Probe results are cached ~30s. Indicator meanings: **[docs/STATUS.md](./docs/STATUS.md)**.
+**Connection status panel** (desktop Settings → Connection) uses `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, and Copilot chat provider. Auth is optional (JWT enriches the account and which tools are connected). Probe results are cached ~30s. Indicator meanings: **[docs/STATUS.md](./docs/STATUS.md)**.
 
 **Restart limitations (single process):** in-flight Google sign-in polls and **calendar-connect** polls (`/v1/google/calendar/start` → `/poll`) live in process memory. A restart drops them; the app simply starts the connect flow again. Already-completed grants and tokens are stored durably. Run one API process (no horizontal scaling) unless these are moved to shared storage.
 
@@ -49,7 +49,7 @@ Create a **Web application** OAuth client. The desktop client already baked into
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/) and select the Waypoint project.
 2. **APIs & Services → OAuth consent screen**. App name `Waypoint`. Add the Google accounts that will sign in while the app is in testing.
-3. Scopes: the desktop **sign-in is one bundled consent**: `openid email profile` + `https://www.googleapis.com/auth/calendar.events` + `https://www.googleapis.com/auth/drive.readonly`. Add all of them on the consent screen and enable the Google Calendar and Drive APIs. The separate calendar connect flow (`/v1/google/calendar/start`) re-requests Calendar + Drive as a second consent (re-connect / incremental) with the same data scopes.
+3. Scopes: desktop **sign-in is identity only** (`openid email profile`). It does not request Calendar or Drive. `include_granted_scopes` is false on sign-in and on tool connect, so tool grants are not folded into the login token. Calendar and Drive are separate tools, each with its own grant: `google_calendar` uses `https://www.googleapis.com/auth/calendar.events` (create and edit events); `google_drive` uses `https://www.googleapis.com/auth/drive.readonly` (view files). Add those scopes on the consent screen and enable the Google Calendar and Drive APIs. Connect one tool with `POST /v1/tools/:toolId/connect` (that tool's scopes only). `POST /v1/google/connect/start` and `POST /v1/google/calendar/start` return `400` `tool_required`.
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
 5. Application type: **Web application**. Name: `Waypoint API`.
 6. Authorized redirect URI:
@@ -394,13 +394,17 @@ Load `GET /v1/memory` after sign-in and inject that card into Gemini. Call `PUT`
 
 ### Calendar
 
-Sign-in stays `openid email profile`. Calendar is a second consent.
+Google sign-in is identity only (`openid email profile`). It does not request Calendar or Drive. Each tool has its own OAuth grant, scopes, and refresh token. `include_granted_scopes` is false on sign-in and on tool connect.
 
-`POST /v1/google/calendar/start` returns the same `authorization_url`, `state`, `poll_token`, and `expires_in` shape as Google sign-in. Open the URL in the system browser. The redirect is `/v1/google/calendar/callback`.
+`GET /v1/tools` lists every catalog tool (`google_calendar` with `calendar.events`, `google_drive` with `drive.readonly`) with status and `connected_at`. No secrets.
 
-`GET /v1/google/calendar/poll?poll_token=` matches the login poll. `complete` is `{ "status": "complete", "calendar_connected": true }` and does not issue a new Waypoint token.
+`POST /v1/tools/:toolId/connect` starts OAuth for that tool's scopes only and returns `authorization_url`, `state`, `poll_token`, and `expires_in`. Open the URL in the system browser. The redirect stays `/v1/google/calendar/callback`.
 
-`GET /v1/calendar/agenda?days=14` (`days` is 1–30) classifies primary-calendar events into `deadlines` and `blocks`. An event is a deadline when it is all-day or the title matches due, deadline, submit, exam, quiz, prelim, midterm, final, hw, pset, or assignment. `waypoint` is true when the event's private extended property `waypoint` is `1`. `409` `calendar_not_connected` until the consent flow finishes.
+`GET /v1/tools/:toolId/poll?poll_token=` is `pending`, `complete`, or `error`. `complete` does not issue a Waypoint token. `POST /v1/tools/:toolId/disconnect` disconnects that tool only; the identity session stays. `POST /v1/google/connect/start` and `POST /v1/google/calendar/start` return `400` `tool_required`.
+
+Memory, tasks, and Copilot work with no tools connected.
+
+`GET /v1/calendar/agenda?days=14` (`days` is 1–30) classifies primary-calendar events into `deadlines` and `blocks`. An event is a deadline when it is all-day or the title matches due, deadline, submit, exam, quiz, prelim, midterm, final, hw, pset, or assignment. `waypoint` is true when the event's private extended property `waypoint` is `1`. `409` `calendar_not_connected` without the calendar tool. Drive routes return `409` `drive_not_connected` without the drive tool.
 
 `POST /v1/calendar/events` after the student confirms a proposal:
 

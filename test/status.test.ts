@@ -173,6 +173,8 @@ test("GET /v1/status probes Gemini and Ollama without a JWT", async () => {
       assert.equal(byId(body, "google_oauth").state, "ok");
       assert.equal(byId(body, "account").state, "warn");
       assert.equal(byId(body, "google").state, "warn");
+      assert.equal(byId(body, "google").optional, true);
+      assert.doesNotMatch(byId(body, "google").detail, /Required/);
       assert.equal(body.services.some((service) => service.id === "presage"), false);
       assert.equal(geminiHits, 1);
       assert.equal(ollamaHits, 1);
@@ -211,9 +213,12 @@ test("GET /v1/status enriches account + Google when signed in", async () => {
       const body = (await response.json()) as StatusResponse;
       assert.equal(byId(body, "account").state, "ok");
       assert.match(byId(body, "account").detail, /status@cornell\.edu/);
-      // Desktop Google sign-in also grants Calendar/Drive scopes.
+      // Sign-in does not grant Calendar or Drive. Tools stay optional.
+      assert.equal(body.ok, true);
       assert.equal(byId(body, "google").state, "ok");
-      assert.match(byId(body, "google").detail, /Calendar and Drive/i);
+      assert.equal(byId(body, "google").optional, true);
+      assert.match(byId(body, "google").detail, /separate tools in Settings/i);
+      assert.doesNotMatch(byId(body, "google").detail, /Required/);
     },
     { fetchImpl: stubFetch({ geminiOk: true, ollamaOk: true }) },
   );

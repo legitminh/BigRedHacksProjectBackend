@@ -141,7 +141,7 @@ test("start refuses missing Google credentials and a short session secret", asyn
   );
 });
 
-test("authorization URL carries PKCE, state, and bundled sign-in + Calendar + Drive scopes", async () => {
+test("authorization URL is identity only and does not fold in previous tool scopes", async () => {
   const capture = { verifier: "" };
   await withApp(
     async (base) => {
@@ -150,10 +150,8 @@ test("authorization URL carries PKCE, state, and bundled sign-in + Calendar + Dr
       assert.equal(url.origin + url.pathname, "https://accounts.google.com/o/oauth2/v2/auth");
       assert.equal(url.searchParams.get("state"), started.state);
       assert.equal(url.searchParams.get("code_challenge_method"), "S256");
-      assert.equal(
-        url.searchParams.get("scope"),
-        "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly",
-      );
+      assert.equal(url.searchParams.get("scope"), "openid email profile");
+      assert.equal(url.searchParams.get("include_granted_scopes"), "false");
       assert.equal(url.searchParams.get("redirect_uri"), "http://127.0.0.1:8787/v1/auth/google/callback");
       assert.equal(started.authorization_url.includes(started.poll_token), false);
       assert.equal(started.expires_in, 600);
@@ -187,6 +185,7 @@ test("completed login is delivered once and keeps the Google refresh token on th
     const done = await finish(base, started);
     assert.equal(done.callbackStatus, 200);
     assert.match(done.html, /return to Waypoint/);
+    assert.doesNotMatch(done.html, /Calendar|Drive/);
     assert.equal(done.pollStatus, 200);
     assert.equal(done.body.status, "complete");
     assert.equal(done.body.token_type, "Bearer");
@@ -196,10 +195,28 @@ test("completed login is delivered once and keeps the Google refresh token on th
     assert.equal(JSON.stringify(done.body).includes("google-refresh-secret"), false);
 
     const stored = JSON.parse(await readFile(storePath, "utf8")) as {
-      users: { google_refresh_token: string; email: string }[];
+      users: { google_refresh_token: string; email: string; calendar_connected?: boolean }[];
+      toolConnections?: { toolId: string; status: string }[];
     };
     assert.equal(stored.users.length, 1);
     assert.equal(stored.users[0]?.google_refresh_token, "google-refresh-secret");
+    assert.equal(stored.users[0]?.calendar_connected, false);
+    assert.deepEqual(stored.toolConnections ?? [], []);
+
+    const googleStatus = await fetch(`${base}/v1/google/status`, {
+      headers: { Authorization: `Bearer ${done.body.access_token}` },
+    });
+    assert.equal(googleStatus.status, 200);
+    const flags = (await googleStatus.json()) as {
+      calendar_connected: boolean;
+      drive_connected: boolean;
+      google_connected: boolean;
+      tools: { status: string }[];
+    };
+    assert.equal(flags.calendar_connected, false);
+    assert.equal(flags.drive_connected, false);
+    assert.equal(flags.google_connected, false);
+    assert.equal(flags.tools.every((tool) => tool.status === "disconnected"), true);
 
     const again = await fetch(
       `${base}/v1/auth/google/poll?poll_token=${encodeURIComponent(started.poll_token)}`,
