@@ -30,6 +30,7 @@ export type RotateResult =
   | { status: "reuse" }
   | { status: "invalid" };
 
+import type { DriveCachedFile } from "../drive/cache.ts";
 import type {
   CalendarConnection,
   PaceSample,
@@ -57,6 +58,22 @@ export type AdminUserRow = {
   calendar_connected?: boolean;
 };
 
+export type SchoolDigestSource = {
+  id: string;
+  name: string;
+};
+
+export type SchoolDigest = {
+  userId: string;
+  digestDate: string;
+  timezone: string;
+  model: string;
+  digestText: string;
+  sources: SchoolDigestSource[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type AdminOverview = {
   storage: "file" | "postgres";
   userCount: number;
@@ -67,7 +84,31 @@ export type AdminOverview = {
   profileCount: number;
   emailCodeCount: number;
   activeRefreshTokens: number;
+  driveCacheCount: number;
+  schoolDigestCount: number;
   users: AdminUserRow[];
+};
+
+export type AdminDriveCacheRow = {
+  file_id: string;
+  name: string;
+  mime_type: string;
+  modified_time: string;
+  kind: string | null;
+  text_chars: number;
+  text_preview: string;
+  extracted_at: string;
+};
+
+export type AdminSchoolDigestRow = {
+  digest_date: string;
+  timezone: string;
+  model: string;
+  digest_text: string;
+  sources: SchoolDigestSource[];
+  text_chars: number;
+  created_at: string;
+  updated_at: string;
 };
 
 export type AdminUserDetail = {
@@ -88,6 +129,8 @@ export type AdminUserDetail = {
   pace: import("../product/model.ts").PaceSample[];
   tasks: import("../product/model.ts").TaskRecord[];
   sessions: import("../product/model.ts").SessionRecap[];
+  driveCache: AdminDriveCacheRow[];
+  schoolDigests: AdminSchoolDigestRow[];
   tokens: { active: number; total: number; revoked: number };
 };
 
@@ -98,6 +141,8 @@ export type AdminBrowseTable =
   | "pace"
   | "proficiencies"
   | "profiles"
+  | "drive_cache"
+  | "school_digests"
   | "email_codes"
   | "refresh_tokens";
 
@@ -141,6 +186,12 @@ export type Store = {
   saveTask(userId: string, task: TaskRecord): Promise<void>;
   insertSession(userId: string, session: SessionRecap): Promise<SessionRecap>;
   listSessions(userId: string): Promise<SessionRecap[]>;
+  getDriveFileCache(userId: string, fileId: string): Promise<DriveCachedFile | null>;
+  upsertDriveFileCache(entry: DriveCachedFile): Promise<void>;
+  listDriveFileCache(userId: string): Promise<DriveCachedFile[]>;
+  clearDriveFileCache(userId: string): Promise<void>;
+  getSchoolDigest(userId: string, digestDate: string): Promise<SchoolDigest | null>;
+  upsertSchoolDigest(digest: SchoolDigest): Promise<void>;
   /** Permanently delete the user account and all synced data (admin row gone). */
   clearUserData(userId: string, now: Date): Promise<void>;
   close(): Promise<void>;

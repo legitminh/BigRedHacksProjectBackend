@@ -1,6 +1,6 @@
 import type { Config } from "../config.ts";
 import { HttpError } from "../http.ts";
-import type { FetchLike } from "./ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import type { ChatTurn } from "./chat.ts";
 
 const CHAT_TIMEOUT_MS = 180_000;

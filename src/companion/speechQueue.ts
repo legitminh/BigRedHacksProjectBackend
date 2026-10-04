@@ -59,6 +59,17 @@ export class SpeechQueue {
     return [{ type: "send", message: textDone() }];
   }
 
+  /** Speak chunks in order; each chunk is its own text.delta → text.done utterance. */
+  speakUtterances(chunks: string[]): SpeechAction[] {
+    const actions: SpeechAction[] = [];
+    for (const chunk of chunks) {
+      if (!chunk) continue;
+      actions.push(...this.speak(chunk));
+      actions.push(...this.finish());
+    }
+    return actions;
+  }
+
   cancel(): SpeechAction[] {
     if (!this.isBusy()) return [];
     this.pending = [];
@@ -88,7 +99,10 @@ export class SpeechQueue {
       case "done": {
         this.awaitingAudio = false;
         if (this.discard) return this.flushPending();
-        return [{ type: "ended", epoch: this.epoch }, ...this.flushPending()];
+        const next = this.flushPending();
+        // More utterances queued — keep speaking; only signal ended when idle.
+        if (next.length > 0) return next;
+        return [{ type: "ended", epoch: this.epoch }];
       }
       case "cleared":
         this.awaitingAudio = false;
@@ -105,12 +119,12 @@ export class SpeechQueue {
     }
   }
 
+  /** Start at most one pending utterance (delta…done); leave the rest queued. */
   private flushPending(): SpeechAction[] {
     this.discard = false;
-    const pending = this.pending;
-    this.pending = [];
     const actions: SpeechAction[] = [];
-    for (const item of pending) {
+    while (this.pending.length > 0) {
+      const item = this.pending.shift()!;
       if (item.kind === "delta") {
         this.opened = true;
         actions.push({ type: "send", message: textDelta(item.text) });
@@ -118,6 +132,7 @@ export class SpeechQueue {
         this.opened = false;
         this.awaitingAudio = true;
         actions.push({ type: "send", message: textDone() });
+        break;
       }
     }
     return actions;

@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import type { Config } from "../config.ts";
 import { HttpError, bearerToken, sendError, sendJson } from "../http.ts";
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 
 /** Max body for Ollama generate (text + rare small images). */
 export const COACH_BODY_MAX = 4 * 1024 * 1024;

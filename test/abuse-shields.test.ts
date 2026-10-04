@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { EmailCodeGuard } from "../src/auth/email.ts";
 import type { GoogleClient } from "../src/auth/google.ts";
 import { loadConfig, type Config } from "../src/config.ts";
-import type { FetchLike } from "../src/gemini/ephemeral.ts";
+import type { FetchLike } from "../src/http.ts";
 import type { LoginCodeMessage, Mailer } from "../src/mailer.ts";
 import { RateLimiter, clientIp } from "../src/security/rateLimit.ts";
 import { createApp, type AppDeps } from "../src/server.ts";

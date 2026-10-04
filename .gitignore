@@ -1,8 +1,14 @@
 node_modules/
 dist/
+coverage/
 .env
+.env.*
 data/
+logs/
 *.log
+*.ndjson
+*.jsonl
+.DS_Store
 
 # Local agent audit reports (never commit)
 *.local.md

@@ -7,8 +7,11 @@ import JSZip from "jszip";
 import mammoth from "mammoth";
 import { extractText as unpdfExtractText, getDocumentProxy } from "unpdf";
 
-export const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024;
-export const MAX_EXCERPT_CHARS = 6_000;
+export const MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024;
+/** Default clip for casual listings; intentional opens use up to MAX_FULL_FILE_CHARS. */
+export const MAX_EXCERPT_CHARS = 8_000;
+/** Hard cap for a single file’s extracted text when the student asks to open/check it. */
+export const MAX_FULL_FILE_CHARS = 100_000;
 
 export type ExtractOk = { ok: true; text: string; kind: string };
 export type ExtractFail = { ok: false; reason: string };
@@ -61,6 +64,41 @@ export function resolveExtractKind(mime: string, name: string): string {
   return "unsupported";
 }
 
+/** Short, human/LLM-friendly type label for inventory lines (`pdf`, `docx`, `sheet`, …). */
+export function shortTypeLabel(mime: string, name: string): string {
+  const lower = (mime || "").toLowerCase();
+  if (lower === "application/vnd.google-apps.folder") return "folder";
+  if (lower === "application/vnd.google-apps.shortcut") return "shortcut";
+  if (lower === "application/vnd.google-apps.form") return "gform";
+  if (lower === "application/vnd.google-apps.drawing") return "gdrawing";
+  const kind = resolveExtractKind(mime, name);
+  switch (kind) {
+    case "google-doc":
+      return "gdoc";
+    case "google-slides":
+      return "gslides";
+    case "google-sheets":
+      return "gsheet";
+    case "doc-legacy":
+      return "doc";
+    case "ppt-legacy":
+      return "ppt";
+    case "xls-legacy":
+      return "xls";
+    case "unsupported":
+      break;
+    default:
+      return kind;
+  }
+  if (lower.startsWith("image/")) return "image";
+  if (lower.startsWith("video/")) return "video";
+  if (lower.startsWith("audio/")) return "audio";
+  const ext = extensionOf(name);
+  if (ext) return ext.slice(0, 8);
+  const tail = lower.split("/").pop() ?? "";
+  return tail ? tail.slice(0, 12) : "file";
+}
+
 export function googleExportMime(kind: string): string | null {
   switch (kind) {
     case "google-doc":
@@ -83,28 +121,30 @@ export async function extractDriveText(
   mime: string,
   name: string,
   bytes: Uint8Array,
+  maxChars: number = MAX_FULL_FILE_CHARS,
 ): Promise<ExtractResult> {
   if (bytes.length === 0) return { ok: false, reason: "File was empty." };
   const kind = resolveExtractKind(mime, name);
+  const clip = (text: string) => clipExcerpt(text, maxChars);
   try {
     switch (kind) {
       case "google-doc":
       case "google-slides":
       case "google-sheets":
       case "text":
-        return { ok: true, text: clipExcerpt(decodeUtf8(bytes)), kind };
+        return { ok: true, text: clip(decodeUtf8(bytes)), kind };
       case "pdf":
-        return { ok: true, text: clipExcerpt(await extractPdf(bytes)), kind };
+        return { ok: true, text: clip(await extractPdf(bytes)), kind };
       case "docx":
-        return { ok: true, text: clipExcerpt(await extractDocx(bytes)), kind };
+        return { ok: true, text: clip(await extractDocx(bytes)), kind };
       case "pptx":
-        return { ok: true, text: clipExcerpt(await extractPptx(bytes)), kind };
+        return { ok: true, text: clip(await extractPptx(bytes)), kind };
       case "xlsx":
-        return { ok: true, text: clipExcerpt(await extractXlsx(bytes)), kind };
+        return { ok: true, text: clip(await extractXlsx(bytes)), kind };
       case "html":
-        return { ok: true, text: clipExcerpt(stripTags(decodeUtf8(bytes))), kind };
+        return { ok: true, text: clip(stripTags(decodeUtf8(bytes))), kind };
       case "rtf":
-        return { ok: true, text: clipExcerpt(stripRtf(decodeUtf8(bytes))), kind };
+        return { ok: true, text: clip(stripRtf(decodeUtf8(bytes))), kind };
       case "doc-legacy":
         return {
           ok: false,

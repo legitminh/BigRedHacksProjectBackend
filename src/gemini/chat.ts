@@ -1,5 +1,5 @@
 import { HttpError } from "../http.ts";
-import type { FetchLike } from "./ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 
 export type ChatTurn = {
   role: "user" | "assistant" | "system";

@@ -2,6 +2,12 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import type { Config } from "./config.ts";
 
+/** Injectable fetch for outbound Google / Gemini / Ollama / xAI calls. */
+export type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
 export class HttpError extends Error {
   status: number;
   code: string;

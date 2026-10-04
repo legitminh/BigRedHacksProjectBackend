@@ -152,7 +152,7 @@ test("authorization URL carries PKCE, state, and bundled sign-in + Calendar + Dr
       assert.equal(url.searchParams.get("code_challenge_method"), "S256");
       assert.equal(
         url.searchParams.get("scope"),
-        "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly",
+        "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly",
       );
       assert.equal(url.searchParams.get("redirect_uri"), "http://127.0.0.1:8787/v1/auth/google/callback");
       assert.equal(started.authorization_url.includes(started.poll_token), false);

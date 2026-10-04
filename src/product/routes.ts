@@ -14,13 +14,41 @@ import {
   studyBlockMinutes,
   type RawEvent,
 } from "../calendar/classify.ts";
-import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
-import { buildCompanionChatSystem, buildCopilotChatSystem } from "../companion/geminiLive.ts";
 import {
+  createCalendarClient,
+  listEventsAcrossCalendars,
+  type CalendarClient,
+} from "../calendar/client.ts";
+import {
+  DEFAULT_WINDOW_DAYS,
+  MAX_WINDOW_DAYS,
+  calendarWindow,
+  dateKeyIn,
+  formatCalendarSummary,
+  normalizeTimeZone,
+} from "../calendar/window.ts";
+import {
+  buildCompanionChatSystem,
+  buildCopilotChatSystem,
+  selectGeminiChatModel,
+} from "../companion/geminiLive.ts";
+import {
+  INVENTORY_DEFAULT_MAX_CHARS,
+  INVENTORY_DEFAULT_MAX_FILES,
+  INVENTORY_HARD_MAX_FILES,
   createDriveClient,
+  formatDriveInventory,
   summarizeDriveFilesWithExcerpts,
   type DriveClient,
 } from "../drive/client.ts";
+import { readFileTextCached } from "../drive/cache.ts";
+import { prepareLiteDepthContext } from "../drive/liteDepth.ts";
+import {
+  ensureSchoolDigest,
+  loadSchoolDigestForChat,
+  schoolDigestContextFields,
+} from "../drive/schoolDigest.ts";
+import { runDeepBriefForQuery } from "../drive/weekBrief.ts";
 import { geminiChat, type ChatTurn } from "../gemini/chat.ts";
 import type { LiveChatInput } from "../gemini/liveChat.ts";
 import {
@@ -29,7 +57,7 @@ import {
   selectChatBackend,
   shouldFallbackToLocal,
 } from "../gemini/localChat.ts";
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import { googleConfigured, pendingTtlSeconds, type Config } from "../config.ts";
 import { CHAT_BODY_MAX, HttpError, bearerToken, page, readJson, sendEmpty, sendHtml, sendJson } from "../http.ts";
 import type { GoogleClient } from "../auth/google.ts";
@@ -52,9 +80,13 @@ import type { PublicUser, Store } from "../store/types.ts";
 import { handleCameraObserve, type CameraAnalyzeFn } from "../camera/routes.ts";
 import type { CameraSessionStore } from "../camera/sessionStore.ts";
 
-/** Calendar write + Drive read for Copilot (second consent after Waypoint Google sign-in). */
+/**
+ * Calendar write + Drive read for Copilot (second consent after Waypoint Google sign-in).
+ * `calendar.readonly` is what lets us enumerate secondary calendars; without it we can
+ * still read `primary`, so older grants keep working.
+ */
 const GOOGLE_DATA_SCOPES =
-  "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly";
+  "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly";
 
 export type ProductDeps = {
   config: Config;
@@ -67,7 +99,7 @@ export type ProductDeps = {
   fetch: FetchLike;
   /**
    * Override cloud text chat (tests).
-   * Production uses REST generateContent with GEMINI_MODEL (Flash-Lite free tier).
+   * Production uses REST generateContent: GEMINI_MODEL (Flash-Lite) only; overview Flash is school-digest build only.
    * Live (GEMINI_LIVE_MODEL) stays for voice companion only.
    */
   liveChat?: (input: LiveChatInput) => Promise<string>;
@@ -130,6 +162,12 @@ function isProductPath(path: string): boolean {
     path.startsWith("/v1/calendar/events/") ||
     path === "/v1/drive/recent" ||
     path === "/v1/drive/search" ||
+    path === "/v1/drive/inventory" ||
+    path === "/v1/drive/folder" ||
+    path === "/v1/drive/folders" ||
+    path === "/v1/drive/deep-brief" ||
+    path === "/v1/school-digest" ||
+    path === "/v1/school-digest/refresh" ||
     path === "/v1/gemini/chat" ||
     path === "/v1/companion/chat" ||
     path === "/v1/me/data" ||
@@ -280,6 +318,65 @@ export async function handleProduct(
     sendEmpty(res, 204);
     return true;
   }
+  if (method === "GET" && path === "/v1/school-digest") {
+    const user = await requireUser(deps, req, now);
+    if (!deps.config.geminiApiKey) {
+      throw new HttpError(503, "gemini_not_configured", "School digest is unavailable.");
+    }
+    const tz = url.searchParams.get("tz");
+    const access = await googleAccess(deps, user.id);
+    const digest = await ensureSchoolDigest({
+      drive: deps.drive,
+      calendar: deps.calendar,
+      store: deps.store,
+      userId: user.id,
+      accessToken: access,
+      timeZone: tz ?? "UTC",
+      now,
+      geminiApiKey: deps.config.geminiApiKey,
+      overviewModel: deps.config.geminiOverviewModel,
+      fetchImpl: deps.fetch,
+    });
+    sendJson(res, 200, {
+      digest: digest.digestText,
+      digest_date: digest.digestDate,
+      sources: digest.sources,
+      stale: false,
+      timezone: digest.timezone,
+      model: digest.model,
+    });
+    return true;
+  }
+  if (method === "POST" && path === "/v1/school-digest/refresh") {
+    const user = await requireUser(deps, req, now);
+    if (!deps.config.geminiApiKey) {
+      throw new HttpError(503, "gemini_not_configured", "School digest is unavailable.");
+    }
+    const tz = url.searchParams.get("tz");
+    const access = await googleAccess(deps, user.id);
+    const digest = await ensureSchoolDigest({
+      drive: deps.drive,
+      calendar: deps.calendar,
+      store: deps.store,
+      userId: user.id,
+      accessToken: access,
+      timeZone: tz ?? "UTC",
+      now,
+      geminiApiKey: deps.config.geminiApiKey,
+      overviewModel: deps.config.geminiOverviewModel,
+      fetchImpl: deps.fetch,
+      force: true,
+    });
+    sendJson(res, 200, {
+      digest: digest.digestText,
+      digest_date: digest.digestDate,
+      sources: digest.sources,
+      stale: false,
+      timezone: digest.timezone,
+      model: digest.model,
+    });
+    return true;
+  }
   if (method === "POST" && path === "/v1/gemini/chat") {
     const user = await requireUser(deps, req, now);
     const body = await readJson(req, CHAT_BODY_MAX);
@@ -289,8 +386,13 @@ export async function handleProduct(
     const record = body as Record<string, unknown>;
     const message = typeof record.message === "string" ? record.message.trim() : "";
     if (!message) throw new HttpError(400, "invalid_chat", "message is required.");
+    const tz = resolveChatTimeZone(record, url);
+    const cachedDigest = await loadSchoolDigestForChat(deps.store, user.id, tz, now);
+    const digestForSystem = cachedDigest
+      ? { text: cachedDigest.digestText, date: cachedDigest.digestDate }
+      : null;
     // Server-owned template: safety preamble first; client `system` is capped, untrusted guidance.
-    const system = buildCopilotChatSystem(record.system);
+    const system = buildCopilotChatSystem(record.system, digestForSystem);
     const historyRaw = Array.isArray(record.history) ? record.history : [];
     const history = historyRaw
       .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
@@ -326,12 +428,15 @@ export async function handleProduct(
     const message = typeof record.message === "string" ? record.message.trim() : "";
     if (!message) throw new HttpError(400, "invalid_companion", "message is required.");
     const history = parseChatHistory(record.history).slice(-40);
-    // Server-owned template; any client-supplied `system` is ignored.
-    const system = buildCompanionChatSystem(
+    const ctx =
       record.context && typeof record.context === "object"
         ? (record.context as Record<string, unknown>)
-        : null,
-    );
+        : {};
+    const tz = resolveChatTimeZone(ctx, url);
+    const cachedDigest = await loadSchoolDigestForChat(deps.store, user.id, tz, now);
+    const mergedContext = { ...ctx, ...schoolDigestContextFields(cachedDigest) };
+    // Server-owned template; any client-supplied `system` is ignored.
+    const system = buildCompanionChatSystem(mergedContext);
 
     const reply = await chatWithLocalFallback(deps, {
       system,
@@ -344,14 +449,14 @@ export async function handleProduct(
   if (method === "GET" && path === "/v1/drive/recent") {
     const user = await requireUser(deps, req, now);
     const access = await googleAccess(deps, user.id);
-    const limit = clampInt(url.searchParams.get("limit"), 12, 1, 25);
+    const limit = clampInt(url.searchParams.get("limit"), 20, 1, 40);
     const files = await deps.drive.listRecent(access, limit);
     const summary = await summarizeDriveFilesWithExcerpts(
       deps.drive,
       access,
       files,
-      "Recently modified Drive files (partial listing with text excerpts):",
-      { maxFiles: limit, maxCharsPerFile: 4_000 },
+      "Recently opened or edited Drive files (partial — most recent first, not the whole Drive):",
+      { maxExcerptFiles: 4, maxCharsPerFile: 1_500 },
     );
     sendJson(res, 200, { files, summary });
     return true;
@@ -360,48 +465,222 @@ export async function handleProduct(
     const user = await requireUser(deps, req, now);
     const access = await googleAccess(deps, user.id);
     const q = url.searchParams.get("q") ?? "";
-    const limit = clampInt(url.searchParams.get("limit"), 8, 1, 25);
-    const files = await deps.drive.search(access, q, limit);
-    const summary = await summarizeDriveFilesWithExcerpts(
-      deps.drive,
-      access,
-      files,
-      `Drive search for “${q.trim() || "…"}” (with text excerpts):`,
-      { maxFiles: limit, maxCharsPerFile: 4_000 },
+    const limit = clampInt(url.searchParams.get("limit"), 12, 1, 40);
+    const excerpts = clampInt(url.searchParams.get("excerpts"), 5, 0, 20);
+    const full = ["1", "true", "yes", "on"].includes(
+      (url.searchParams.get("full") ?? "").trim().toLowerCase(),
     );
+    const maxChars = full
+      ? clampInt(url.searchParams.get("max_chars"), 80_000, 4_000, 100_000)
+      : clampInt(url.searchParams.get("max_chars"), 8_000, 500, 40_000);
+    const files = await deps.drive.search(access, q, limit);
+    if (files.length === 0) {
+      const emptyHeading = full
+        ? `LITE DEPTH for “${q.trim() || "…"}”:`
+        : `Drive search hits for “${q.trim() || "…"}” (filename + full-text match; a search result, not the student's whole Drive):`;
+      sendJson(res, 200, {
+        files,
+        summary: `${emptyHeading}\n(no files matched these keywords — try different wording, or browse the inventory)`,
+      });
+      return true;
+    }
+    // full=1: structure + Flash-Lite map-reduce — never raw FULL CONTENTS into chat.
+    if (full) {
+      const fileTexts: Array<{ name: string; mimeType: string; text: string }> = [];
+      for (const file of files.slice(0, Math.max(excerpts, 1))) {
+        const result = await readFileTextCached(
+          deps.drive,
+          deps.store,
+          user.id,
+          access,
+          file,
+          maxChars,
+        );
+        if (result.ok) {
+          fileTexts.push({ name: file.name, mimeType: file.mimeType, text: result.text });
+        }
+      }
+      const summary =
+        fileTexts.length === 0
+          ? `LITE DEPTH for “${q.trim() || "…"}”:\n(no readable text from matched files)`
+          : await prepareLiteDepthContext({
+              fileTexts,
+              utterance: q.trim() || "read these files completely",
+              geminiApiKey: deps.config.geminiApiKey,
+              liteModel: deps.config.geminiModel,
+              fetchImpl: deps.fetch,
+            });
+      sendJson(res, 200, { files, summary });
+      return true;
+    }
+    const heading = `Drive search hits for “${q.trim() || "…"}” (filename + full-text match; a search result, not the student's whole Drive):`;
+    const summary = await summarizeDriveFilesWithExcerpts(deps.drive, access, files, heading, {
+      maxExcerptFiles: excerpts,
+      maxCharsPerFile: maxChars,
+      contentLabel: "Content excerpt",
+    });
     sendJson(res, 200, { files, summary });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/drive/inventory") {
+    const user = await requireUser(deps, req, now);
+    const access = await googleAccess(deps, user.id);
+    const limit = clampInt(
+      url.searchParams.get("limit"),
+      INVENTORY_DEFAULT_MAX_FILES,
+      1,
+      INVENTORY_HARD_MAX_FILES,
+    );
+    const maxChars = clampInt(
+      url.searchParams.get("max_chars"),
+      INVENTORY_DEFAULT_MAX_CHARS,
+      500,
+      80_000,
+    );
+    const page = await deps.drive.inventory(access, {
+      maxFiles: limit,
+      pageToken: url.searchParams.get("page_token"),
+      includeFolderPaths: url.searchParams.get("paths") !== "0",
+    });
+    sendJson(res, 200, {
+      files: page.files,
+      count: page.files.length,
+      folder_count: page.folderCount,
+      truncated: page.truncated,
+      next_page_token: page.nextPageToken,
+      summary: formatDriveInventory(page.files, { maxChars, truncated: page.truncated }),
+    });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/drive/folder") {
+    const user = await requireUser(deps, req, now);
+    const access = await googleAccess(deps, user.id);
+    const folderId = (url.searchParams.get("id") ?? "").trim();
+    if (!folderId) throw new HttpError(400, "invalid_folder", "Query parameter id is required.");
+    const limit = clampInt(url.searchParams.get("limit"), 200, 1, 1_000);
+    const files = await deps.drive.listFolder(access, folderId, limit);
+    sendJson(res, 200, {
+      files,
+      count: files.length,
+      summary: formatDriveInventory(files, {
+        heading: "Contents of the requested Drive folder (names and types only):",
+      }),
+    });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/drive/folders") {
+    const user = await requireUser(deps, req, now);
+    const access = await googleAccess(deps, user.id);
+    const q = url.searchParams.get("q") ?? "";
+    const limit = clampInt(url.searchParams.get("limit"), 20, 1, 100);
+    const folders = await deps.drive.findFolders(access, q, limit);
+    sendJson(res, 200, { folders, count: folders.length });
+    return true;
+  }
+  if (method === "GET" && path === "/v1/drive/deep-brief") {
+    const user = await requireUser(deps, req, now);
+    const window = calendarWindow(
+      now,
+      windowDays(url.searchParams.get("days")),
+      url.searchParams.get("tz"),
+    );
+    const access = await googleAccess(deps, user.id);
+    const events = await listEventsAcrossCalendars(
+      deps.calendar,
+      access,
+      window.timeMin,
+      window.timeMax,
+      window.timeZone,
+    );
+    const calendarSummary = formatCalendarSummary(events, window, now);
+    const invLimit = clampInt(
+      url.searchParams.get("limit"),
+      2_000,
+      1,
+      INVENTORY_HARD_MAX_FILES,
+    );
+    const page = await deps.drive.inventory(access, {
+      maxFiles: invLimit,
+      includeFolderPaths: url.searchParams.get("paths") !== "0",
+    });
+    const q = url.searchParams.get("q") ?? "";
+    const brief = await runDeepBriefForQuery(
+      {
+        drive: deps.drive,
+        cacheStore: deps.store,
+        userId: user.id,
+        accessToken: access,
+        geminiApiKey: deps.config.geminiApiKey,
+        liteModel: deps.config.geminiModel,
+        fetchImpl: deps.fetch,
+      },
+      {
+        utterance: q,
+        calendarSummary,
+        inventoryFiles: page.files,
+        inventoryTruncated: page.truncated,
+      },
+    );
+    let cachedCount = 0;
+    for (const file of page.files.slice(0, 40)) {
+      const row = await deps.store.getDriveFileCache(user.id, file.id);
+      if (row && row.modifiedTime === (file.modifiedTime ?? "")) cachedCount += 1;
+    }
+    sendJson(res, 200, {
+      summary: brief.summary,
+      file_count: page.files.length,
+      ...(cachedCount > 0 ? { cached_count: cachedCount } : {}),
+      ...(brief.truncated ? { truncated: true } : {}),
+    });
     return true;
   }
   if (method === "GET" && path === "/v1/calendar/summary") {
     const user = await requireUser(deps, req, now);
-    const days = windowDays(url.searchParams.get("days"));
+    const window = calendarWindow(
+      now,
+      windowDays(url.searchParams.get("days")),
+      url.searchParams.get("tz"),
+    );
     const access = await googleAccess(deps, user.id);
-    const timeMin = now.toISOString();
-    const timeMax = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
-    const events = await deps.calendar.listEvents(access, timeMin, timeMax);
-    const lines = events.slice(0, 12).map((event) => {
-      const summary = event.summary ?? "(untitled)";
-      const start =
-        event.start?.dateTime ?? event.start?.date ?? "?";
-      return `- ${start}: ${summary}`;
-    });
+    const events = await listEventsAcrossCalendars(
+      deps.calendar,
+      access,
+      window.timeMin,
+      window.timeMax,
+      window.timeZone,
+    );
     sendJson(res, 200, {
-      summary:
-        lines.length === 0
-          ? `No upcoming calendar events in the next ${days} days.`
-          : `Upcoming calendar:\n${lines.join("\n")}`,
+      summary: formatCalendarSummary(events, window, now),
       count: events.length,
+      time_zone: window.timeZone,
+      time_min: window.timeMin,
+      time_max: window.timeMax,
+      today: window.todayKey,
+      tomorrow: window.tomorrowKey,
     });
     return true;
   }
   if (method === "GET" && path === "/v1/calendar/agenda") {
     const user = await requireUser(deps, req, now);
-    const days = windowDays(url.searchParams.get("days"));
+    const window = calendarWindow(
+      now,
+      windowDays(url.searchParams.get("days")),
+      url.searchParams.get("tz"),
+    );
     const access = await googleAccess(deps, user.id);
-    const timeMin = now.toISOString();
-    const timeMax = new Date(now.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
-    const events = await deps.calendar.listEvents(access, timeMin, timeMax);
-    sendJson(res, 200, classifyAgenda(events));
+    const events = await listEventsAcrossCalendars(
+      deps.calendar,
+      access,
+      window.timeMin,
+      window.timeMax,
+      window.timeZone,
+    );
+    sendJson(res, 200, {
+      ...classifyAgenda(events),
+      time_zone: window.timeZone,
+      today: window.todayKey,
+      tomorrow: window.tomorrowKey,
+    });
     return true;
   }
   if (method === "POST" && path === "/v1/calendar/events") {
@@ -602,12 +881,17 @@ async function chatWithLocalFallback(
     );
   }
 
+  const chatModel = selectGeminiChatModel(deps.config, {
+    system: input.system,
+    message: input.message,
+  });
+
   try {
-    // REST Flash-Lite (free tier). Live AUDIO is voice-only — not HTTP Copilot.
+    // REST Gemini always Flash-Lite for chat; overview Flash is digest-only (/v1/school-digest).
     if (deps.liveChat) {
       return await deps.liveChat({
         apiKey: deps.config.geminiApiKey,
-        model: deps.config.geminiModel,
+        model: chatModel,
         system: input.system,
         history: input.history,
         message: input.message,
@@ -615,7 +899,7 @@ async function chatWithLocalFallback(
     }
     return await geminiChat({
       apiKey: deps.config.geminiApiKey,
-      model: deps.config.geminiModel,
+      model: chatModel,
       system: input.system,
       history: input.history as ChatTurn[],
       message: input.message,
@@ -741,6 +1025,15 @@ function pollCalendar(url: URL, res: ServerResponse, deps: ProductDeps, now: Dat
   });
 }
 
+function resolveChatTimeZone(record: Record<string, unknown>, url: URL): string {
+  const fromBody =
+    (typeof record.time_zone === "string" && record.time_zone) ||
+    (typeof record.tz === "string" && record.tz) ||
+    (typeof record.timezone === "string" && record.timezone);
+  const fromUrl = url.searchParams.get("tz");
+  return normalizeTimeZone(fromBody ?? fromUrl);
+}
+
 async function googleAccess(deps: ProductDeps, userId: string): Promise<string> {
   const connection = await deps.store.getCalendarConnection(userId);
   if (!connection.connected || !connection.refreshToken) {
@@ -757,10 +1050,14 @@ async function googleAccess(deps: ProductDeps, userId: string): Promise<string> 
 }
 
 function windowDays(value: string | null): number {
-  if (value === null || value === "") return 14;
+  if (value === null || value === "") return DEFAULT_WINDOW_DAYS;
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 30) {
-    throw new HttpError(400, "invalid_window", "days must be an integer from 1 to 30.");
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_WINDOW_DAYS) {
+    throw new HttpError(
+      400,
+      "invalid_window",
+      `days must be an integer from 1 to ${MAX_WINDOW_DAYS}.`,
+    );
   }
   return parsed;
 }

@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import type { Config } from "./config.ts";
+import { googleConfigured, smtpConfigured, type Config } from "./config.ts";
 import { HttpError, escapeHtml, sendEmpty, sendHtml, sendJson } from "./http.ts";
 import type {
   AdminBrowseResult,
@@ -15,16 +15,34 @@ const COOKIE = "wp_admin";
 const MAX_BODY = 8 * 1024;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-const BROWSE_TABLES: { id: AdminBrowseTable; label: string }[] = [
-  { id: "users", label: "Users" },
-  { id: "profiles", label: "Profiles" },
-  { id: "tasks", label: "Tasks" },
-  { id: "sessions", label: "Sessions" },
-  { id: "pace", label: "Pace samples" },
-  { id: "proficiencies", label: "Proficiencies" },
-  { id: "refresh_tokens", label: "Refresh tokens" },
-  { id: "email_codes", label: "Email codes" },
-];
+const BROWSE_TABLES: { id: AdminBrowseTable; label: string; group: "product" | "google" | "auth" }[] =
+  [
+    { id: "users", label: "Users", group: "product" },
+    { id: "profiles", label: "Profiles", group: "product" },
+    { id: "tasks", label: "Tasks", group: "product" },
+    { id: "sessions", label: "Sessions", group: "product" },
+    { id: "pace", label: "Pace", group: "product" },
+    { id: "proficiencies", label: "Proficiencies", group: "product" },
+    { id: "drive_cache", label: "Drive cache", group: "google" },
+    { id: "school_digests", label: "School digests", group: "google" },
+    { id: "refresh_tokens", label: "Refresh tokens", group: "auth" },
+    { id: "email_codes", label: "Email codes", group: "auth" },
+  ];
+
+const PILL_KEYS = new Set([
+  "status",
+  "mode",
+  "outcome",
+  "attention",
+  "level",
+  "email_verified",
+  "calendar_connected",
+  "has_google_refresh_token",
+  "has_study_memory",
+  "has_code_hash",
+  "active",
+  "kind",
+]);
 
 export type AdminDeps = {
   config: Config;
@@ -146,6 +164,7 @@ function shell(title: string, body: string): string {
       --accent: #6ec8b0;
       --danger: #f0a0a0;
       --ok: #8fd49a;
+      --warn: #e6c07b;
     }
     * { box-sizing: border-box; }
     body {
@@ -158,10 +177,10 @@ function shell(title: string, body: string): string {
         var(--bg);
       color: var(--ink);
     }
-    main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+    main { max-width: 1180px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
     h1 { font-size: 1.55rem; margin: 0 0 0.35rem; letter-spacing: -0.02em; }
     h2 { margin: 0 0 0.85rem; font-size: 1.05rem; }
-    h3 { margin: 1.25rem 0 0.55rem; font-size: 0.95rem; color: var(--muted); font-weight: 600; }
+    h3 { margin: 0 0 0.65rem; font-size: 0.88rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
     .sub { color: var(--muted); margin: 0 0 1.5rem; }
     .panel {
       background: color-mix(in srgb, var(--panel) 92%, black);
@@ -207,28 +226,30 @@ function shell(title: string, body: string): string {
     .err { color: var(--danger); margin: 0.75rem 0 0; font-size: 0.92rem; }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 0.75rem;
+      grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+      gap: 0.65rem;
     }
     .stat {
       border: 1px solid var(--line);
       border-radius: 12px;
-      padding: 0.85rem 0.95rem;
+      padding: 0.75rem 0.85rem;
       background: rgba(0,0,0,0.18);
     }
-    .stat strong { display: block; font-size: 1.35rem; margin-top: 0.2rem; }
-    .stat span { color: var(--muted); font-size: 0.78rem; }
+    .stat strong { display: block; font-size: 1.3rem; margin-top: 0.15rem; }
+    .stat span { color: var(--muted); font-size: 0.74rem; }
+    .nav-wrap { margin: 0 0 1.1rem; display: grid; gap: 0.45rem; }
     .nav {
-      display: flex; flex-wrap: wrap; gap: 0.45rem;
-      margin: 0 0 1.1rem;
+      display: flex; flex-wrap: wrap; gap: 0.4rem;
+      align-items: center;
     }
+    .nav .group { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 0.15rem; }
     .nav a {
       color: var(--muted);
       text-decoration: none;
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 0.35rem 0.8rem;
-      font-size: 0.82rem;
+      padding: 0.3rem 0.72rem;
+      font-size: 0.8rem;
       font-weight: 600;
     }
     .nav a.active, .nav a:hover {
@@ -239,17 +260,29 @@ function shell(title: string, body: string): string {
     .scroll { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
     th, td { text-align: left; padding: 0.5rem 0.4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
-    th { color: var(--muted); font-weight: 600; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    th { color: var(--muted); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap; }
     .pill {
       display: inline-block;
-      padding: 0.15rem 0.55rem;
+      padding: 0.12rem 0.5rem;
       border-radius: 999px;
-      font-size: 0.78rem;
+      font-size: 0.76rem;
       border: 1px solid var(--line);
+      white-space: nowrap;
     }
     .pill.ok { color: var(--ok); border-color: rgba(143,212,154,0.35); }
     .pill.bad { color: var(--danger); border-color: rgba(240,160,160,0.35); }
+    .pill.warn { color: var(--warn); border-color: rgba(230,192,123,0.35); }
     .pill.soft { color: var(--muted); }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    .chip {
+      display: inline-block;
+      padding: 0.2rem 0.55rem;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid var(--line);
+      font-size: 0.8rem;
+    }
+    .flags { display: flex; flex-wrap: wrap; gap: 0.45rem; }
     code, pre {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.82em;
@@ -261,16 +294,18 @@ function shell(title: string, body: string): string {
       background: #0e1118;
       border: 1px solid var(--line);
       overflow: auto;
-      max-height: 28rem;
+      max-height: 22rem;
       white-space: pre-wrap;
       word-break: break-word;
     }
     a.link { color: var(--accent); text-decoration: none; font-weight: 600; }
     a.link:hover { text-decoration: underline; }
-    .kv { display: grid; grid-template-columns: 11rem 1fr; gap: 0.35rem 0.75rem; font-size: 0.9rem; }
+    .kv { display: grid; grid-template-columns: 10.5rem 1fr; gap: 0.35rem 0.75rem; font-size: 0.9rem; }
     .kv dt { color: var(--muted); margin: 0; }
     .kv dd { margin: 0; }
     .muted { color: var(--muted); }
+    .preview { color: var(--muted); font-size: 0.8rem; max-width: 22rem; }
+    .digest + .digest { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
   </style>
 </head>
 <body>
@@ -308,20 +343,27 @@ function flag(ok: boolean, yes = "ready", no = "missing"): string {
 }
 
 function nav(active: string): string {
-  const links = [
-    { href: "/admin", id: "overview", label: "Overview" },
-    ...BROWSE_TABLES.map((t) => ({
-      href: `/admin/data/${t.id}`,
-      id: t.id,
-      label: t.label,
-    })),
+  const groups: { id: "product" | "google" | "auth"; label: string }[] = [
+    { id: "product", label: "Product" },
+    { id: "google", label: "Google" },
+    { id: "auth", label: "Auth" },
   ];
-  return `<nav class="nav" aria-label="Admin sections">${links
-    .map(
-      (l) =>
-        `<a href="${l.href}" class="${l.id === active ? "active" : ""}">${escapeHtml(l.label)}</a>`,
-    )
-    .join("")}</nav>`;
+  const overview = `<a href="/admin" class="${active === "overview" ? "active" : ""}">Overview</a>`;
+  const sections = groups
+    .map((group) => {
+      const items = BROWSE_TABLES.filter((t) => t.group === group.id)
+        .map(
+          (t) =>
+            `<a href="/admin/data/${t.id}" class="${t.id === active ? "active" : ""}">${escapeHtml(t.label)}</a>`,
+        )
+        .join("");
+      return `<div class="nav"><span class="group">${escapeHtml(group.label)}</span>${items}</div>`;
+    })
+    .join("");
+  return `<div class="nav-wrap" aria-label="Admin sections">
+    <div class="nav">${overview}</div>
+    ${sections}
+  </div>`;
 }
 
 function headerBar(title: string, sub: string): string {
@@ -335,26 +377,89 @@ function headerBar(title: string, sub: string): string {
     </div>`;
 }
 
-function jsonBlock(value: unknown): string {
-  return `<pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>`;
+function shortId(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 8)}…` : value;
 }
 
-function cell(value: unknown): string {
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+function boolPill(value: boolean, yes = "yes", no = "no"): string {
+  return value
+    ? `<span class="pill ok">${escapeHtml(yes)}</span>`
+    : `<span class="pill soft">${escapeHtml(no)}</span>`;
+}
+
+function statusPill(value: string): string {
+  const lower = value.toLowerCase();
+  const tone =
+    lower === "active" || lower === "done" || lower === "completed" || lower === "true"
+      ? "ok"
+      : lower === "dropped" || lower === "failed" || lower === "false" || lower === "revoked"
+        ? "bad"
+        : lower === "distracted" || lower === "partial"
+          ? "warn"
+          : "soft";
+  return `<span class="pill ${tone}">${escapeHtml(value)}</span>`;
+}
+
+function chips(values: string[]): string {
+  if (values.length === 0) return `<span class="muted">—</span>`;
+  return `<div class="chips">${values
+    .map((v) => `<span class="chip">${escapeHtml(v)}</span>`)
+    .join("")}</div>`;
+}
+
+function userLink(id: string): string {
+  return `<a class="link" href="/admin/users/${escapeHtml(id)}"><code>${escapeHtml(shortId(id))}</code></a>`;
+}
+
+function cell(key: string, value: unknown, options: { linkUserIds?: boolean } = {}): string {
   if (value === null || value === undefined) return "—";
-  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "boolean") {
+    if (PILL_KEYS.has(key)) return boolPill(value);
+    return value ? "true" : "false";
+  }
+  if (Array.isArray(value)) {
+    if (value.every((item) => typeof item === "string")) {
+      return chips(value as string[]);
+    }
+    if (
+      value.every(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          "name" in item &&
+          typeof (item as { name: unknown }).name === "string",
+      )
+    ) {
+      return chips((value as { name: string }[]).map((item) => item.name));
+    }
+    const text = JSON.stringify(value);
+    return `<code title="${escapeHtml(text)}">${escapeHtml(text.slice(0, 80))}${text.length > 80 ? "…" : ""}</code>`;
+  }
   if (typeof value === "object") {
-    return `<code title="${escapeHtml(JSON.stringify(value))}">${escapeHtml(
-      JSON.stringify(value).slice(0, 80),
-    )}${JSON.stringify(value).length > 80 ? "…" : ""}</code>`;
+    const text = JSON.stringify(value);
+    return `<code title="${escapeHtml(text)}">${escapeHtml(text.slice(0, 80))}${text.length > 80 ? "…" : ""}</code>`;
   }
   const text = String(value);
-  if (/^[0-9a-f-]{36}$/i.test(text)) {
-    return `<a class="link" href="/admin/users/${escapeHtml(text)}"><code>${escapeHtml(text.slice(0, 8))}…</code></a>`;
+  if (key === "user_id" && isUuid(text)) return userLink(text);
+  if (options.linkUserIds && key === "id" && isUuid(text)) return userLink(text);
+  if (PILL_KEYS.has(key) && text.length < 40) return statusPill(text);
+  if (key === "text_preview" || key.endsWith("_preview")) {
+    return `<span class="preview" title="${escapeHtml(text)}">${escapeHtml(text || "—")}</span>`;
+  }
+  if (isUuid(text) || text.length > 36) {
+    return `<code title="${escapeHtml(text)}">${escapeHtml(shortId(text))}</code>`;
   }
   return escapeHtml(text);
 }
 
-function rowsTable(rows: Record<string, unknown>[]): string {
+function rowsTable(
+  rows: Record<string, unknown>[],
+  options: { linkUserIds?: boolean } = {},
+): string {
   if (rows.length === 0) return `<p class="sub" style="margin:0">No rows.</p>`;
   const keys = Object.keys(rows[0] ?? {});
   return `<div class="scroll"><table>
@@ -363,11 +468,54 @@ function rowsTable(rows: Record<string, unknown>[]): string {
       ${rows
         .map(
           (row) =>
-            `<tr>${keys.map((k) => `<td>${cell(row[k])}</td>`).join("")}</tr>`,
+            `<tr>${keys.map((k) => `<td>${cell(k, row[k], options)}</td>`).join("")}</tr>`,
         )
         .join("")}
     </tbody>
   </table></div>`;
+}
+
+function profilePanel(profile: NonNullable<AdminUserDetail["profile"]>): string {
+  const memory = profile.study_memory;
+  return `
+    <dl class="kv">
+      <dt>Updated</dt><dd>${escapeHtml(profile.updated_at)}</dd>
+      <dt>Interests</dt><dd>${chips(profile.interests)}</dd>
+      <dt>Long-term goals</dt><dd>${chips(profile.long_term_goals)}</dd>
+      <dt>Priorities</dt><dd>${chips(profile.priorities)}</dd>
+      <dt>Interaction</dt><dd><code>${escapeHtml(JSON.stringify(profile.interaction))}</code></dd>
+    </dl>
+    ${
+      memory
+        ? `<h3 style="margin-top:1.1rem">Study memory</h3>
+           <dl class="kv">
+             <dt>Updated</dt><dd>${escapeHtml(memory.updated_at)}</dd>
+             <dt>Stats</dt><dd><code>${escapeHtml(JSON.stringify(memory.stats ?? {}))}</code></dd>
+           </dl>
+           <pre style="margin-top:0.75rem">${escapeHtml(memory.narrative || "(empty narrative)")}</pre>`
+        : `<p class="muted" style="margin:0.85rem 0 0">No study memory blob.</p>`
+    }`;
+}
+
+function digestsPanel(digests: AdminUserDetail["schoolDigests"]): string {
+  if (digests.length === 0) return `<p class="muted" style="margin:0">No school digests.</p>`;
+  return digests
+    .map(
+      (d) => `
+      <div class="digest">
+        <dl class="kv">
+          <dt>Date</dt><dd><strong>${escapeHtml(d.digest_date)}</strong></dd>
+          <dt>Timezone</dt><dd>${escapeHtml(d.timezone)}</dd>
+          <dt>Model</dt><dd><span class="pill soft">${escapeHtml(d.model)}</span></dd>
+          <dt>Sources</dt><dd>${chips(d.sources.map((s) => s.name))}</dd>
+          <dt>Chars</dt><dd>${d.text_chars}</dd>
+          <dt>Created</dt><dd>${escapeHtml(d.created_at)}</dd>
+          <dt>Updated</dt><dd>${escapeHtml(d.updated_at)}</dd>
+        </dl>
+        <pre style="margin-top:0.75rem">${escapeHtml(d.digest_text)}</pre>
+      </div>`,
+    )
+    .join("");
 }
 
 function dashboardPage(config: Config, overview: AdminOverview): string {
@@ -377,7 +525,7 @@ function dashboardPage(config: Config, overview: AdminOverview): string {
       <tr>
         <td><a class="link" href="/admin/users/${escapeHtml(u.id)}">${escapeHtml(u.email ?? "—")}</a></td>
         <td>${escapeHtml(u.name ?? "—")}</td>
-        <td><code>${escapeHtml(u.id.slice(0, 8))}…</code></td>
+        <td><code title="${escapeHtml(u.id)}">${escapeHtml(shortId(u.id))}</code></td>
         <td>${u.calendar_connected ? '<span class="pill ok">linked</span>' : '<span class="pill soft">no</span>'}</td>
         <td>${escapeHtml(u.last_login_at ?? "—")}</td>
         <td><a class="btn soft" href="/admin/users/${escapeHtml(u.id)}">Open</a></td>
@@ -388,17 +536,26 @@ function dashboardPage(config: Config, overview: AdminOverview): string {
   return shell(
     "Waypoint Admin",
     `
-    ${headerBar("Waypoint admin", `Storage <strong>${escapeHtml(overview.storage)}</strong> · click any user for a full dump`)}
+    ${headerBar("Waypoint admin", `Storage <strong>${escapeHtml(overview.storage)}</strong> · TigerData field browser`)}
     ${nav("overview")}
 
     <div class="panel">
+      <h3>Product</h3>
       <div class="grid">
         <div class="stat"><span>Users</span><strong>${overview.userCount}</strong></div>
         <div class="stat"><span>Profiles</span><strong>${overview.profileCount}</strong></div>
-        <div class="stat"><span>Sessions</span><strong>${overview.sessionCount}</strong></div>
         <div class="stat"><span>Tasks</span><strong>${overview.taskCount}</strong></div>
+        <div class="stat"><span>Sessions</span><strong>${overview.sessionCount}</strong></div>
         <div class="stat"><span>Pace samples</span><strong>${overview.paceCount}</strong></div>
         <div class="stat"><span>Proficiencies</span><strong>${overview.proficiencyCount}</strong></div>
+      </div>
+      <h3 style="margin-top:1.1rem">Google</h3>
+      <div class="grid">
+        <div class="stat"><span>Drive cache</span><strong>${overview.driveCacheCount}</strong></div>
+        <div class="stat"><span>School digests</span><strong>${overview.schoolDigestCount}</strong></div>
+      </div>
+      <h3 style="margin-top:1.1rem">Auth</h3>
+      <div class="grid">
         <div class="stat"><span>Email codes</span><strong>${overview.emailCodeCount}</strong></div>
         <div class="stat"><span>Active refresh tokens</span><strong>${overview.activeRefreshTokens}</strong></div>
       </div>
@@ -406,20 +563,35 @@ function dashboardPage(config: Config, overview: AdminOverview): string {
 
     <div class="panel">
       <h2>Integrations</h2>
-      <table>
-        <tbody>
-          <tr><th>Google OAuth</th><td>${flag(Boolean(config.googleClientId && config.googleClientSecret))}</td></tr>
-          <tr><th>Gemini</th><td>${flag(Boolean(config.geminiApiKey), config.geminiModel, "unavailable")}</td></tr>
-          <tr><th>Lock-in coach</th><td>${flag(Boolean(config.ollamaBaseUrl), `${config.ollamaModel} · ${config.ollamaChatModel}`, "unavailable")}</td></tr>
-          <tr><th>Coach access</th><td>${flag(Boolean(config.coachApiToken))}</td></tr>
-          <tr><th>Sign-in sessions</th><td>${flag(Boolean(config.sessionSecret))}</td></tr>
-          <tr><th>Public base</th><td><span class="pill soft">${escapeHtml(config.publicBaseUrl)}</span></td></tr>
-        </tbody>
-      </table>
+      <div class="flags" style="margin-bottom:0.75rem">
+        ${flag(Boolean(config.databaseUrl), "TigerData", "TigerData (file store)")}
+        ${flag(googleConfigured(config), "Google OAuth", "Google OAuth")}
+        ${flag(Boolean(config.sessionSecret), "Sessions", "Sessions")}
+        ${flag(smtpConfigured(config), "SMTP email", "SMTP email")}
+        ${flag(Boolean(config.adminPassword), "Admin console", "Admin console")}
+      </div>
+      <h3>AI / voice / camera</h3>
+      <div class="flags" style="margin-bottom:0.75rem">
+        ${flag(Boolean(config.geminiApiKey), `Gemini chat · ${config.geminiModel}`, "Gemini chat")}
+        ${flag(Boolean(config.geminiApiKey), `Gemini overview · ${config.geminiOverviewModel}`, "Gemini overview")}
+        ${flag(Boolean(config.geminiApiKey), `Gemini Live · ${config.geminiLiveModel}`, "Gemini Live")}
+        ${flag(Boolean(config.xaiApiKey), `xAI TTS · ${config.xaiTtsVoice}`, "xAI TTS")}
+        ${flag(Boolean(config.presageApiKey), "Presage camera", "Presage camera")}
+      </div>
+      <h3>Ollama (API host)</h3>
+      <div class="flags" style="margin-bottom:0.75rem">
+        ${flag(Boolean(config.ollamaBaseUrl), config.ollamaBaseUrl ?? "Ollama", "Ollama")}
+        ${flag(Boolean(config.ollamaBaseUrl), `Lock-in · ${config.ollamaModel}`, `Lock-in · ${config.ollamaModel}`)}
+        ${flag(Boolean(config.ollamaBaseUrl), `Vision · ${config.ollamaVisionModel}`, `Vision · ${config.ollamaVisionModel}`)}
+        ${flag(Boolean(config.ollamaBaseUrl), `Chat · ${config.ollamaChatModel}`, `Chat · ${config.ollamaChatModel}`)}
+        <span class="pill soft">LOCAL_CHAT_PROVIDER=${escapeHtml(config.localChatProvider)}</span>
+        ${flag(Boolean(config.coachApiToken), "Coach token", "Coach token")}
+      </div>
+      <p class="muted" style="margin:0;font-size:0.82rem">Public base · <code>${escapeHtml(config.publicBaseUrl)}</code></p>
     </div>
 
     <div class="panel">
-      <h2>Users</h2>
+      <h2>Recent users</h2>
       ${
         overview.users.length === 0
           ? `<p class="sub" style="margin:0">No users yet.</p>`
@@ -438,28 +610,28 @@ function userDetailPage(detail: AdminUserDetail): string {
   return shell(
     `User ${u.email ?? u.id}`,
     `
-    ${headerBar(u.email ?? u.name ?? "User", `User detail · <a class="link" href="/admin">← Overview</a>`)}
+    ${headerBar(u.email ?? u.name ?? "User", `User detail · <a class="link" href="/admin">← Overview</a> · <a class="link" href="/admin/api/users/${escapeHtml(u.id)}">JSON</a>`)}
     ${nav("users")}
 
     <div class="panel">
-      <h2>Identity</h2>
+      <h2>Identity · users</h2>
       <dl class="kv">
-        <dt>Id</dt><dd><code>${escapeHtml(u.id)}</code></dd>
-        <dt>Email</dt><dd>${escapeHtml(u.email ?? "—")} ${u.email_verified ? '<span class="pill ok">verified</span>' : '<span class="pill soft">unverified</span>'}</dd>
-        <dt>Name</dt><dd>${escapeHtml(u.name ?? "—")}</dd>
-        <dt>Google sub</dt><dd><code>${escapeHtml(u.google_sub ?? "—")}</code></dd>
-        <dt>Picture</dt><dd>${u.picture ? `<a class="link" href="${escapeHtml(u.picture)}" target="_blank" rel="noreferrer">open</a>` : "—"}</dd>
-        <dt>Calendar / Drive</dt><dd>${u.calendar_connected ? '<span class="pill ok">connected</span>' : '<span class="pill bad">not connected</span>'}</dd>
-        <dt>Google refresh token</dt><dd>${u.has_google_refresh_token ? '<span class="pill ok">present</span>' : '<span class="pill bad">missing</span>'}</dd>
-        <dt>Created</dt><dd>${escapeHtml(u.created_at ?? "—")}</dd>
-        <dt>Last login</dt><dd>${escapeHtml(u.last_login_at ?? "—")}</dd>
-        <dt>Refresh tokens</dt><dd>${detail.tokens.active} active · ${detail.tokens.revoked} revoked · ${detail.tokens.total} total</dd>
+        <dt>id</dt><dd><code>${escapeHtml(u.id)}</code></dd>
+        <dt>email</dt><dd>${escapeHtml(u.email ?? "—")} ${u.email_verified ? '<span class="pill ok">verified</span>' : '<span class="pill soft">unverified</span>'}</dd>
+        <dt>name</dt><dd>${escapeHtml(u.name ?? "—")}</dd>
+        <dt>google_sub</dt><dd><code>${escapeHtml(u.google_sub ?? "—")}</code></dd>
+        <dt>picture</dt><dd>${u.picture ? `<a class="link" href="${escapeHtml(u.picture)}" target="_blank" rel="noreferrer">open</a>` : "—"}</dd>
+        <dt>calendar_connected</dt><dd>${u.calendar_connected ? '<span class="pill ok">true</span>' : '<span class="pill bad">false</span>'}</dd>
+        <dt>google_refresh_token</dt><dd>${u.has_google_refresh_token ? '<span class="pill ok">present</span>' : '<span class="pill bad">missing</span>'}</dd>
+        <dt>created_at</dt><dd>${escapeHtml(u.created_at ?? "—")}</dd>
+        <dt>last_login_at</dt><dd>${escapeHtml(u.last_login_at ?? "—")}</dd>
+        <dt>refresh_tokens</dt><dd>${detail.tokens.active} active · ${detail.tokens.revoked} revoked · ${detail.tokens.total} total</dd>
       </dl>
     </div>
 
     <div class="panel">
-      <h2>Profile / study memory</h2>
-      ${detail.profile ? jsonBlock(detail.profile) : `<p class="muted" style="margin:0">No profile row.</p>`}
+      <h2>Profile · user_profiles</h2>
+      ${detail.profile ? profilePanel(detail.profile) : `<p class="muted" style="margin:0">No profile row.</p>`}
     </div>
 
     <div class="panel">
@@ -483,12 +655,13 @@ function userDetailPage(detail: AdminUserDetail): string {
     </div>
 
     <div class="panel">
-      <h2>Raw JSON</h2>
-      <p class="sub">Full detail payload (secrets like Google refresh tokens are never included).</p>
-      ${jsonBlock(detail)}
-      <div class="row">
-        <a class="btn ghost" href="/admin/api/users/${escapeHtml(u.id)}">JSON API</a>
-      </div>
+      <h2>Drive cache (${detail.driveCache.length}) · drive_file_cache</h2>
+      ${rowsTable(detail.driveCache as unknown as Record<string, unknown>[])}
+    </div>
+
+    <div class="panel">
+      <h2>School digests (${detail.schoolDigests.length}) · school_digests</h2>
+      ${digestsPanel(detail.schoolDigests)}
     </div>
 
     <div class="panel">
@@ -512,9 +685,9 @@ function browsePage(result: AdminBrowseResult): string {
     <div class="panel">
       <div class="row" style="margin-top:0; margin-bottom:0.85rem; justify-content:space-between">
         <h2 style="margin:0">${escapeHtml(label)}</h2>
-        <a class="btn ghost" href="/admin/api/data/${escapeHtml(result.table)}">JSON API</a>
+        <a class="btn ghost" href="/admin/api/data/${escapeHtml(result.table)}">JSON</a>
       </div>
-      ${rowsTable(result.rows)}
+      ${rowsTable(result.rows, { linkUserIds: result.table === "users" })}
     </div>
     `,
   );

@@ -9,7 +9,6 @@ import { emailCodeTtlSeconds, googleConfigured, pendingTtlSeconds, type Config }
 import { CalendarConnects } from "./calendar/connect.ts";
 import { createCalendarClient, type CalendarClient } from "./calendar/client.ts";
 import { createDriveClient, type DriveClient } from "./drive/client.ts";
-import { mintEphemeralToken, type FetchLike } from "./gemini/ephemeral.ts";
 import { handleAdmin } from "./admin.ts";
 import { coachTokenOk, handleCoach } from "./coach/ollama.ts";
 import { attachCompanionLiveUpgrade } from "./companion/liveUpgrade.ts";
@@ -27,6 +26,7 @@ import { handleVoiceHealth, handleVoiceTts } from "./voice/tts.ts";
 import { aggregateStatus } from "./status/aggregate.ts";
 import {
   HttpError,
+  type FetchLike,
   applyCors,
   bearerToken,
   page,
@@ -199,6 +199,8 @@ export function createApp(deps: AppDeps): Server {
   attachCompanionLiveUpgrade(server, {
     config: deps.config,
     store: deps.store,
+    drive,
+    calendar,
     now: nowFn,
   });
 
@@ -279,17 +281,6 @@ async function handle(
     sendJson(res, 200, user);
     return;
   }
-  if (method === "POST" && path === "/v1/session/ephemeral-token") {
-    if (!deps.config.ephemeralTokenEnabled) {
-      throw new HttpError(
-        404,
-        "ephemeral_token_disabled",
-        "This feature is not available on this server.",
-      );
-    }
-    await issueEphemeralToken(req, res, deps);
-    return;
-  }
   if (
     await handleCoach(method, path, req, res, deps.config, deps.fetch, () =>
       // Baked desktop coach token OR signed-in Waypoint JWT.
@@ -344,7 +335,6 @@ async function handle(
     path === "/v1/me" ||
     path === "/v1/auth/google/callback" ||
     path === "/v1/auth/google/poll" ||
-    (deps.config.ephemeralTokenEnabled && path === "/v1/session/ephemeral-token") ||
     path === "/v1/status" ||
     path === "/v1/voice/tts" ||
     path === "/v1/voice/health" ||
@@ -472,7 +462,7 @@ function assertLoginReady(config: Config): void {
 
 /** Sign-in + Calendar + Drive in one consent (required for the desktop app). */
 const GOOGLE_LOGIN_SCOPES =
-  "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly";
+  "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly";
 
 async function startGoogle(
   res: ServerResponse,
@@ -655,29 +645,6 @@ async function refresh(
     access_token: issueAccessToken(deps.config, rotated.user, now),
     refresh_token: next.token,
     expires_in: deps.config.accessTokenTtlSeconds,
-  });
-}
-
-async function issueEphemeralToken(
-  req: IncomingMessage,
-  res: ServerResponse,
-  deps: Required<Pick<AppDeps, "config" | "store" | "now" | "fetch">>,
-): Promise<void> {
-  const now = deps.now();
-  await requireUser(deps, req, now);
-  await readJson(req);
-  if (!deps.config.geminiApiKey) {
-    throw new HttpError(503, "gemini_not_configured", "Cloud voice is unavailable.");
-  }
-  const minted = await mintEphemeralToken({
-    apiKey: deps.config.geminiApiKey,
-    now,
-    fetchImpl: deps.fetch,
-  });
-  sendJson(res, 200, {
-    token: minted.token,
-    expire_time: minted.expireTime,
-    model: deps.config.geminiModel,
   });
 }
 

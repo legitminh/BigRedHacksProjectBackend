@@ -91,7 +91,12 @@ test("correct password sets cookie and opens dashboard", async () => {
     const html = await dash.text();
     assert.match(html, /Waypoint admin/);
     assert.match(html, /Integrations/);
-    assert.match(html, /Users/);
+    assert.match(html, /TigerData/);
+    assert.match(html, /xAI TTS/);
+    assert.match(html, /Presage camera/);
+    assert.match(html, /Vision ·/);
+    assert.match(html, /Drive cache/);
+    assert.match(html, /School digests/);
     assert.match(html, /Pace samples/);
   });
 });
@@ -132,11 +137,60 @@ test("admin data browse and user detail work after login", async () => {
     assert.equal(body.table, "tasks");
     assert.ok(Array.isArray(body.rows));
 
+    for (const table of ["drive_cache", "school_digests"] as const) {
+      const page = await fetch(`${base}/admin/data/${table}`, {
+        headers: { Cookie: cookie },
+      });
+      assert.equal(page.status, 200);
+      const json = await fetch(`${base}/admin/api/data/${table}`, {
+        headers: { Cookie: cookie },
+      });
+      assert.equal(json.status, 200);
+      const payload = (await json.json()) as { table: string; rows: unknown[] };
+      assert.equal(payload.table, table);
+      assert.ok(Array.isArray(payload.rows));
+    }
+
     const missing = await fetch(
       `${base}/admin/users/00000000-0000-4000-8000-000000000000`,
       { headers: { Cookie: cookie } },
     );
     assert.equal(missing.status, 404);
+  });
+});
+
+test("refresh token ids are not linked as user lookups", async () => {
+  await withApp(async (base, store) => {
+    const user = await store.upsertGoogleUser(
+      {
+        sub: "google-sub-token-link",
+        email: "token-link@example.com",
+        emailVerified: true,
+        name: "Token Link",
+        picture: null,
+        googleRefreshToken: null,
+      },
+      new Date("2026-10-03T12:00:00.000Z"),
+    );
+    const tokenId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    await store.insertRefreshToken({
+      id: tokenId,
+      userId: user.id,
+      tokenHash: "hash-for-admin-link-test",
+      expiresAt: "2026-11-01T00:00:00.000Z",
+      revokedAt: null,
+      replacedBy: null,
+      createdAt: "2026-10-03T12:00:00.000Z",
+    });
+
+    const cookie = adminSetCookie(await adminLogin(base)).split(";")[0];
+    const page = await fetch(`${base}/admin/data/refresh_tokens`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    assert.doesNotMatch(html, new RegExp(`/admin/users/${tokenId}`));
+    assert.match(html, new RegExp(`/admin/users/${user.id}`));
   });
 });
 

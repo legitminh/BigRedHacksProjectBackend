@@ -2,7 +2,7 @@
 
 Account login is already specified in `devplan.md` and `README.md`. This file is the next product surface: a durable student profile, Google Calendar deadlines and confirmed event writes, and the task record the desktop app uses for advise vs pair.
 
-The app sends `Authorization: Bearer <access_token>` on every route below. The client never writes Postgres. Gemini Live is proxied by this server (`WS /v1/companion/live`); the legacy client-side ephemeral token (`POST /v1/session/ephemeral-token`) is off unless `ENABLE_EPHEMERAL_TOKEN=1`. These routes are the tools' side effects.
+The app sends `Authorization: Bearer <access_token>` on every route below. The client never writes Postgres. Gemini Live is proxied by this server (`WS /v1/companion/live`). These routes are the tools' side effects.
 
 Errors keep the existing shape:
 

@@ -6,7 +6,19 @@
 import WebSocket from "ws";
 
 import type { Config } from "../config.ts";
+import { googleConfigured } from "../config.ts";
+import type { CalendarClient } from "../calendar/client.ts";
+import type { DriveClient } from "../drive/client.ts";
+import {
+  DEEP_BRIEF_DEFAULT_INVENTORY_MAX,
+  isDeepOverviewIntent,
+  isDigestCoversTurnIntent,
+  runDeepBriefForQuery,
+} from "../drive/weekBrief.ts";
+import { loadSchoolDigestForChat, schoolDigestContextFields } from "../drive/schoolDigest.ts";
+import { fetchDriveExcerptsForTurn } from "../drive/turnSearch.ts";
 import { geminiChat, type ChatTurn } from "../gemini/chat.ts";
+import type { Store } from "../store/types.ts";
 import {
   AUDIO_KIND_UPLINK,
   AUDIO_PROTOCOL,
@@ -18,6 +30,7 @@ import {
   audioStreamEndMessage,
   buildCompanionListenSystem,
   buildCompanionVoiceReplySystem,
+  selectGeminiChatModel,
   denyToolResponse,
   errorMessage,
   liveWsUrl,
@@ -36,8 +49,6 @@ import { SpeechQueue, type SpeechAction } from "./speechQueue.ts";
 
 const MAX_PCM_BYTES = 64 * 1024;
 const SETUP_TIMEOUT_MS = 20_000;
-/** Fixed opener — no Flash-Lite spend; Grok speaks it once at Mic-on. */
-const LIVE_OPENER = "I'm here. What are you working on?";
 /** Hold outbound frames if the client socket is backed up; never drop samples. */
 const MAX_DOWNLINK_BUFFERED_BYTES = 256 * 1024;
 /** WAYPOINT_LIVE_AUDIO_DEBUG=1 logs Gemini chunk timing vs wire delivery. */
@@ -54,6 +65,8 @@ export type Inbound =
   | { type: "audio"; pcm: string }
   | { type: "text"; text: string }
   | { type: "barge" }
+  /** Explicit client interrupt — stop TTS only; keep Live + mic open. */
+  | { type: "stop_speech" }
   | { type: "stop" }
   | {
       /** Legacy client reply — ignored; server never requests screencap. */
@@ -69,6 +82,12 @@ type Outbound =
   | { type: "ready"; model: string; audio_protocol?: string; voice?: string }
   | { type: "user"; text: string; final: boolean }
   | { type: "assistant"; text: string; final: boolean }
+  | {
+      type: "study_suggest";
+      goals: string;
+      duration_mins: number;
+      reason: string;
+    }
   | { type: "audio"; pcm: string; sample_rate: number; epoch: number; seq?: number }
   | { type: "audio_end"; epoch: number }
   | { type: "clear_audio"; epoch: number }
@@ -76,13 +95,112 @@ type Outbound =
   | { type: "speak_local"; text: string }
   | { type: "error"; message: string };
 
-function clipForTts(text: string): string {
-  const trimmed = text.trim().replace(/\s+/g, " ");
-  if (trimmed.length <= GROK_TTS_MAX_CHARS) return trimmed;
-  return `${trimmed.slice(0, GROK_TTS_MAX_CHARS - 1).trimEnd()}…`;
+const STUDY_SUGGEST_START = "<<<STUDY_SUGGEST>>>";
+const STUDY_SUGGEST_END = "<<<END_STUDY_SUGGEST>>>";
+
+export type StudySuggestPayload = {
+  goals: string;
+  duration_mins: number;
+  reason: string;
+};
+
+/** Strip STUDY_SUGGEST marker from model prose; return visible text + optional payload. */
+export function stripStudySuggestBlock(raw: string): {
+  content: string;
+  suggestion: StudySuggestPayload | null;
+} {
+  const startIdx = raw.indexOf(STUDY_SUGGEST_START);
+  if (startIdx < 0) return { content: raw, suggestion: null };
+  const afterStart = startIdx + STUDY_SUGGEST_START.length;
+  const relEnd = raw.slice(afterStart).indexOf(STUDY_SUGGEST_END);
+  if (relEnd < 0) {
+    return { content: raw.slice(0, startIdx).trimEnd(), suggestion: null };
+  }
+  const jsonSlice = raw.slice(afterStart, afterStart + relEnd).trim();
+  const endIdx = afterStart + relEnd + STUDY_SUGGEST_END.length;
+  let content = raw.slice(0, startIdx).trimEnd();
+  const trailing = raw.slice(endIdx).trim();
+  if (trailing) content = content ? `${content}\n${trailing}` : trailing;
+
+  let suggestion: StudySuggestPayload | null = null;
+  try {
+    const cleaned = jsonSlice
+      .trim()
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/, "")
+      .replace(/```$/, "")
+      .trim();
+    const parsed = JSON.parse(cleaned) as Record<string, unknown>;
+    const goals = String(parsed.goals ?? "").trim() || "General study session";
+    const durationRaw = Number(parsed.duration_mins ?? parsed.durationMins ?? 25);
+    const duration_mins = Number.isFinite(durationRaw)
+      ? Math.min(180, Math.max(1, Math.round(durationRaw)))
+      : 25;
+    const reason =
+      String(parsed.reason ?? "").trim() ||
+      "A short lock-in would help you focus right now.";
+    suggestion = { goals, duration_mins, reason };
+  } catch {
+    suggestion = null;
+  }
+  return { content, suggestion };
 }
 
-class TurnBridge {
+/** Collapse whitespace for TTS; used by clip + chunk helpers. */
+export function normalizeTtsText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Lossy single-string clip (ellipsis). Kept for speak_local fallback when Grok fails;
+ * primary Grok path uses {@link chunkForTts} instead.
+ */
+export function clipForTts(text: string, maxChars = GROK_TTS_MAX_CHARS): string {
+  const trimmed = normalizeTtsText(text);
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, maxChars - 1).trimEnd()}…`;
+}
+
+/**
+ * Split spoken prose into sequential chunks at or under maxChars (sentence → clause → word).
+ * Preserves full content — no ellipsis truncation.
+ */
+export function chunkForTts(text: string, maxChars = GROK_TTS_MAX_CHARS): string[] {
+  const trimmed = normalizeTtsText(text);
+  if (!trimmed) return [];
+  if (trimmed.length <= maxChars) return [trimmed];
+
+  const chunks: string[] = [];
+  let remaining = trimmed;
+  while (remaining.length > maxChars) {
+    const window = remaining.slice(0, maxChars);
+    let splitAt = findTtsSplit(window);
+    if (splitAt <= 0) splitAt = maxChars;
+    const piece = remaining.slice(0, splitAt).trim();
+    if (piece) chunks.push(piece);
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+/** Prefer sentence, then soft punctuation, then whitespace — never mid-word when avoidable. */
+function findTtsSplit(window: string): number {
+  const patterns = [/[.!?]["']?\s+/g, /;\s+/g, /,\s+/g, /\s+/g];
+  for (const re of patterns) {
+    let last = -1;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(window)) !== null) {
+      const end = match.index + match[0].length;
+      if (end > 0 && end <= window.length) last = end;
+    }
+    if (last > 0) return last;
+  }
+  return -1;
+}
+
+/** Exported for unit tests — merges Gemini STT partials into one user bubble per turn. */
+export class TurnBridge {
   assistant = "";
   lastFragment = "";
   userCommitted = "";
@@ -107,6 +225,13 @@ class TurnBridge {
       case "audio":
         return [];
     }
+  }
+
+  /** Cascade path: Gemini never finishes a spoken turn, so clear STT after we reply. */
+  clearUserTurn(): void {
+    this.userCommitted = "";
+    this.userInterim = "";
+    this.userSentFinal = false;
   }
 
   private interimUser(text: string): Outbound[] {
@@ -232,7 +357,8 @@ function sendError(client: WebSocket, message: string): void {
   send(client, { type: "error", message: message.slice(0, 500) });
 }
 
-function parseInbound(raw: string): Inbound | null {
+/** Exported for unit tests — client → live session JSON messages. */
+export function parseInbound(raw: string): Inbound | null {
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
     const type = value.type;
@@ -258,6 +384,7 @@ function parseInbound(raw: string): Inbound | null {
       return { type: "text", text: value.text };
     }
     if (type === "barge") return { type: "barge" };
+    if (type === "stop_speech") return { type: "stop_speech" };
     if (type === "stop") return { type: "stop" };
     if (type === "screencap" && typeof value.id === "string") {
       return {
@@ -385,7 +512,18 @@ export async function connectGemini(
   return gemini;
 }
 
-export async function runCompanionLiveSession(client: WebSocket, config: Config): Promise<void> {
+export type LiveSessionExtras = {
+  userId: string;
+  store: Store;
+  drive: DriveClient;
+  calendar: CalendarClient;
+};
+
+export async function runCompanionLiveSession(
+  client: WebSocket,
+  config: Config,
+  extras?: LiveSessionExtras,
+): Promise<void> {
   if (!config.geminiApiKey) {
     sendError(client, "Live voice isn’t available right now. Try again later.");
     client.close();
@@ -421,7 +559,6 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   );
   const bridge = new TurnBridge();
   const liveModel = config.geminiLiveModel;
-  const chatModel = config.geminiModel;
   const voiceId = config.xaiTtsVoice;
   let sessionContext: Record<string, unknown> | null = null;
 
@@ -517,11 +654,26 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   };
 
   const speakReply = (text: string) => {
-    const clipped = clipForTts(text);
-    if (!clipped) return;
-    lastSpokenText = clipped;
-    applySpeechActions(speech.speak(clipped));
-    applySpeechActions(speech.finish());
+    const chunks = chunkForTts(text);
+    if (!chunks.length) return;
+    // Full spoken text for speak_local fallback (still clipped there if needed).
+    lastSpokenText = chunks.join(" ");
+    applySpeechActions(speech.speakUtterances(chunks));
+  };
+
+  const googleAccessForUser = async (): Promise<string | null> => {
+    if (!extras || !googleConfigured(config)) return null;
+    try {
+      const connection = await extras.store.getCalendarConnection(extras.userId);
+      if (!connection.connected || !connection.refreshToken) return null;
+      return extras.calendar.refresh({
+        refreshToken: connection.refreshToken,
+        clientId: config.googleClientId!,
+        clientSecret: config.googleClientSecret!,
+      });
+    } catch {
+      return null;
+    }
   };
 
   const replyToUser = async (userText: string) => {
@@ -531,7 +683,90 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     send(client, { type: "status", phase: "thinking" });
     cancelSpeech();
     try {
-      const system = buildCompanionVoiceReplySystem(sessionContext);
+      // Per-turn Drive load — open/check/syllabi pulls FULL file text into this turn.
+      let turnContext = sessionContext;
+      if (extras) {
+        const tz =
+          sessionContext && typeof sessionContext.time_zone === "string"
+            ? sessionContext.time_zone
+            : sessionContext && typeof sessionContext.tz === "string"
+              ? sessionContext.tz
+              : "UTC";
+        const cachedDigest = await loadSchoolDigestForChat(
+          extras.store,
+          extras.userId,
+          tz,
+          new Date(),
+        );
+        if (cachedDigest) {
+          turnContext = { ...(turnContext ?? {}), ...schoolDigestContextFields(cachedDigest) };
+        }
+        const access = await googleAccessForUser();
+        const digestPresent =
+          typeof turnContext?.school_digest === "string" &&
+          turnContext.school_digest.trim().length > 0;
+        const skipDriveForDigest =
+          digestPresent && isDigestCoversTurnIntent(trimmed);
+        if (access && !skipDriveForDigest) {
+          const inventory =
+            typeof sessionContext?.drive_inventory === "string"
+              ? sessionContext.drive_inventory
+              : "";
+          const calendarSummary =
+            typeof sessionContext?.calendar_summary === "string"
+              ? sessionContext.calendar_summary
+              : "";
+          let driveTurnBlock = "";
+          if (isDeepOverviewIntent(trimmed)) {
+            const page = await extras.drive.inventory(access, {
+              maxFiles: DEEP_BRIEF_DEFAULT_INVENTORY_MAX,
+              includeFolderPaths: true,
+            });
+            const brief = await runDeepBriefForQuery(
+              {
+                drive: extras.drive,
+                accessToken: access,
+                cacheStore: extras.store,
+                userId: extras.userId,
+                geminiApiKey: config.geminiApiKey,
+                liteModel: config.geminiModel,
+                fetchImpl: globalThis.fetch.bind(globalThis),
+              },
+              {
+                utterance: trimmed,
+                calendarSummary,
+                inventoryFiles: page.files,
+                inventoryTruncated: page.truncated,
+                priorTurns: history,
+              },
+            );
+            driveTurnBlock = brief.summary;
+          } else {
+            driveTurnBlock = await fetchDriveExcerptsForTurn(
+              {
+                drive: extras.drive,
+                accessToken: access,
+                cacheStore: extras.store,
+                userId: extras.userId,
+                geminiApiKey: config.geminiApiKey,
+                liteModel: config.geminiModel,
+                fetchImpl: globalThis.fetch.bind(globalThis),
+              },
+              trimmed,
+              history,
+              { inventory },
+            );
+          }
+          if (driveTurnBlock.trim()) {
+            turnContext = {
+              ...(turnContext ?? sessionContext ?? {}),
+              drive_summary: driveTurnBlock,
+            };
+          }
+        }
+      }
+      const system = buildCompanionVoiceReplySystem(turnContext);
+      const chatModel = selectGeminiChatModel(config, { system, message: trimmed });
       const reply = await geminiChat({
         apiKey: config.geminiApiKey!,
         model: chatModel,
@@ -541,12 +776,23 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
         fetchImpl: globalThis.fetch.bind(globalThis),
       });
       if (closed || gen !== replyGen) return;
-      const spoken = clipForTts(reply);
+      // Keep full prose in history + chat UI. Strip STUDY_SUGGEST so TTS never
+      // speaks the marker; desktop starts the real lock-in from study_suggest.
+      const { content: visibleReply, suggestion } = stripStudySuggestBlock(reply.trim());
+      const fullReply = visibleReply.trim() || reply.trim();
       history.push({ role: "user", content: trimmed });
-      history.push({ role: "assistant", content: spoken });
+      history.push({ role: "assistant", content: fullReply });
       while (history.length > 12) history.shift();
-      send(client, { type: "assistant", text: spoken, final: true });
-      speakReply(spoken);
+      send(client, { type: "assistant", text: fullReply, final: true });
+      if (suggestion) {
+        send(client, {
+          type: "study_suggest",
+          goals: suggestion.goals,
+          duration_mins: suggestion.duration_mins,
+          reason: suggestion.reason,
+        });
+      }
+      speakReply(fullReply);
     } catch (error) {
       if (closed || gen !== replyGen) return;
       const message =
@@ -632,15 +878,14 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     client.close();
   });
 
+  // Reply model is always Flash-Lite (selectGeminiChatModel); ready label matches that.
   send(client, {
     type: "ready",
-    model: `${chatModel}+grok-tts`,
+    model: `${config.geminiModel}+grok-tts`,
     audio_protocol: useBinaryAudio ? AUDIO_PROTOCOL : undefined,
     voice: voiceId,
   });
   send(client, { type: "status", phase: "listening" });
-  send(client, { type: "assistant", text: LIVE_OPENER, final: true });
-  speakReply(LIVE_OPENER);
 
   gemini.on("message", (data) => {
     if (closed) return;
@@ -684,14 +929,22 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
         for (const event of bridge.handle(signal)) {
           send(client, event);
           if (event.type === "user" && event.final) {
+            // STT-only cascade never gets a Gemini turn_complete that clears the bridge,
+            // so without this every new utterance appends onto the previous one in the UI.
+            bridge.clearUserTurn();
             void replyToUser(event.text);
           }
         }
         continue;
       }
-      // generation_complete / turn_complete / interrupted: no Gemini audio path.
-      if (signal.kind === "interrupted" && speech.isBusy()) {
-        cancelSpeech();
+      if (signal.kind === "turn_complete" || signal.kind === "interrupted") {
+        for (const event of bridge.handle(signal)) {
+          send(client, event);
+        }
+        if (signal.kind === "interrupted" && speech.isBusy()) {
+          cancelSpeech();
+        }
+        continue;
       }
     }
   });
@@ -740,12 +993,20 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     if (inbound.type === "text") {
       const text = inbound.text.trim();
       if (!text) return;
+      bridge.clearUserTurn();
       send(client, { type: "user", text, final: true });
       void replyToUser(text);
       return;
     }
-    if (inbound.type === "barge") {
+    if (inbound.type === "barge" || inbound.type === "stop_speech") {
+      // Drop any in-flight Flash-Lite reply so Stop during "thinking" does not
+      // resume speaking after the button already returned to listening.
+      replyGen += 1;
       cancelSpeech();
+      // cancelSpeech only emits clear_audio/listening when TTS is busy.
+      if (!speech.isBusy()) {
+        send(client, { type: "status", phase: "listening" });
+      }
       return;
     }
     // Legacy screencap replies: ignore.
