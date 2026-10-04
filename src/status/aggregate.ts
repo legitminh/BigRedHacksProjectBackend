@@ -1,5 +1,5 @@
 import { googleConfigured, type Config } from "../config.ts";
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import { selectChatBackend } from "../gemini/localChat.ts";
 import type { PublicUser, Store } from "../store/types.ts";
 
@@ -142,7 +142,7 @@ async function probeGemini(config: Config, fetchImpl: FetchLike, nowMs: number):
 
 async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number): Promise<ProbeResult> {
   const ttl = DEFAULT_TTL_SECONDS;
-  const cacheKey = `${config.ollamaBaseUrl ?? ""}|${config.ollamaModel}|${config.ollamaChatModel}`;
+  const cacheKey = `${config.ollamaBaseUrl ?? ""}|${config.ollamaModel}|${config.ollamaVisionModel}|${config.ollamaChatModel}`;
   const cached = cacheGet(ollamaCache, cacheKey, nowMs);
   if (cached) return cached;
 
@@ -173,30 +173,30 @@ async function probeOllama(config: Config, fetchImpl: FetchLike, nowMs: number):
       };
     } else {
       const lockIn = modelListed(json, config.ollamaModel);
+      const vision = modelListed(json, config.ollamaVisionModel);
       const chat = modelListed(json, config.ollamaChatModel);
-      if (lockIn && chat) {
+      const missing = [
+        !lockIn ? config.ollamaModel : null,
+        !vision ? config.ollamaVisionModel : null,
+        !chat ? config.ollamaChatModel : null,
+      ].filter((name): name is string => Boolean(name));
+      if (missing.length === 0) {
         result = {
           state: "ok",
           status: "Connected",
-          detail: `Coach ${config.ollamaModel} + chat fallback ${config.ollamaChatModel} ready`,
+          detail: `Coach ${config.ollamaModel} · vision ${config.ollamaVisionModel} · chat ${config.ollamaChatModel}`,
         };
-      } else if (lockIn) {
+      } else if (lockIn || chat) {
         result = {
           state: "warn",
           status: "Degraded",
-          detail: `Coach ${config.ollamaModel} ready; pull ${config.ollamaChatModel} for Copilot fallback`,
-        };
-      } else if (chat) {
-        result = {
-          state: "warn",
-          status: "Degraded",
-          detail: `Chat fallback ${config.ollamaChatModel} ready; pull ${config.ollamaModel} for lock-in`,
+          detail: `Ollama missing ${missing.join(", ")}`,
         };
       } else {
         result = {
           state: "err",
           status: "Offline",
-          detail: `Ollama up but missing ${config.ollamaModel} (and ${config.ollamaChatModel})`,
+          detail: `Ollama up but missing ${missing.join(", ")}`,
         };
       }
     }
@@ -256,6 +256,49 @@ function presageIndicator(config: Config): ServiceIndicator {
     status: "Degraded",
     detail: "PRESAGE_API_KEY unset — presence heuristics only; vitals unavailable",
     optional: true,
+  };
+}
+
+/** Config-only — Grok TTS key presence (desktop falls back to macOS say). */
+function xaiIndicator(config: Config): ServiceIndicator {
+  if (config.xaiApiKey) {
+    return {
+      id: "xai_tts",
+      label: "Grok voice",
+      state: "ok",
+      status: "Configured",
+      detail: `Study heads-up TTS ready (${config.xaiTtsVoice})`,
+      optional: true,
+    };
+  }
+  return {
+    id: "xai_tts",
+    label: "Grok voice",
+    state: "warn",
+    status: "Degraded",
+    detail: "XAI_API_KEY unset — Live voice needs it; heads-ups fall back to macOS say",
+    optional: true,
+  };
+}
+
+function storageIndicator(config: Config): ServiceIndicator {
+  if (config.databaseUrl) {
+    return {
+      id: "storage",
+      label: "TigerData",
+      state: "ok",
+      status: "Configured",
+      detail: "Postgres / TigerData URL set",
+      optional: false,
+    };
+  }
+  return {
+    id: "storage",
+    label: "TigerData",
+    state: "warn",
+    status: "Local file",
+    detail: "DATABASE_URL unset — using local file store",
+    optional: false,
   };
 }
 
@@ -417,14 +460,16 @@ export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse>
       optional: false,
     },
     chatProviderIndicator(deps.config, gemini, ollama),
+    xaiIndicator(deps.config),
     accountIndicator(deps.user),
     googleOauthIndicator(deps.config),
     apiIndicator(deps.store),
+    storageIndicator(deps.config),
     presageIndicator(deps.config),
   ];
 
   // Gemini-only failures do not flip ok when Copilot can fall back (chat_provider).
-  // `presage` is optional — missing key is warn/Degraded and does not flip ok.
+  // Optional rows (presage, xai_tts) warn when unset and do not flip ok.
   const critical = new Set(["api", "google_oauth", "ollama", "chat_provider"]);
   const hardDown = services.some((s) => critical.has(s.id) && s.state === "err");
   return {

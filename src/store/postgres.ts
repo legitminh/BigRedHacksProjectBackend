@@ -437,6 +437,8 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           proficiencies: string;
           profiles: string;
           email_codes: string;
+          drive_cache: string;
+          school_digests: string;
         }>(
           `SELECT
              (SELECT COUNT(*)::text FROM users) AS users,
@@ -447,7 +449,9 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
              (SELECT COUNT(*)::text FROM pace_samples) AS pace,
              (SELECT COUNT(*)::text FROM proficiencies) AS proficiencies,
              (SELECT COUNT(*)::text FROM user_profiles) AS profiles,
-             (SELECT COUNT(*)::text FROM email_login_codes) AS email_codes`,
+             (SELECT COUNT(*)::text FROM email_login_codes) AS email_codes,
+             (SELECT COUNT(*)::text FROM drive_file_cache) AS drive_cache,
+             (SELECT COUNT(*)::text FROM school_digests) AS school_digests`,
         ),
         pool.query<{
           id: string;
@@ -474,6 +478,8 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         profileCount: Number(row?.profiles ?? 0),
         emailCodeCount: Number(row?.email_codes ?? 0),
         activeRefreshTokens: Number(row?.tokens ?? 0),
+        driveCacheCount: Number(row?.drive_cache ?? 0),
+        schoolDigestCount: Number(row?.school_digests ?? 0),
         users: users.rows.map((u) => ({
           id: u.id,
           email: u.email,
@@ -505,25 +511,41 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
       );
       const u = userResult.rows[0];
       if (!u) return null;
-      const [profile, proficiencies, pace, tasks, sessions, tokens] = await Promise.all([
-        this.getProfile(userId),
-        this.listProficiencies(userId),
-        this.listPaceSamples(userId, null),
-        pool.query(
-          `SELECT id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at
-           FROM tasks WHERE user_id = $1 ORDER BY started_at DESC LIMIT 200`,
-          [userId],
-        ),
-        this.listSessions(userId),
-        pool.query<{ total: string; active: string; revoked: string }>(
-          `SELECT
-             COUNT(*)::text AS total,
-             COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at > NOW())::text AS active,
-             COUNT(*) FILTER (WHERE revoked_at IS NOT NULL)::text AS revoked
-           FROM refresh_tokens WHERE user_id = $1`,
-          [userId],
-        ),
-      ]);
+      const [profile, proficiencies, pace, tasks, sessions, driveCache, digests, tokens] =
+        await Promise.all([
+          this.getProfile(userId),
+          this.listProficiencies(userId),
+          this.listPaceSamples(userId, null),
+          pool.query(
+            `SELECT id, title, mode, status, planned_minutes, deadline_event_id, outcome, started_at, ended_at
+             FROM tasks WHERE user_id = $1 ORDER BY started_at DESC LIMIT 200`,
+            [userId],
+          ),
+          this.listSessions(userId),
+          this.listDriveFileCache(userId),
+          pool.query<{
+            digest_date: Date;
+            timezone: string;
+            model: string;
+            digest_text: string;
+            sources_json: SchoolDigestSource[] | string;
+            created_at: Date;
+            updated_at: Date;
+          }>(
+            `SELECT digest_date, timezone, model, digest_text, sources_json, created_at, updated_at
+             FROM school_digests WHERE user_id = $1
+             ORDER BY digest_date DESC LIMIT 60`,
+            [userId],
+          ),
+          pool.query<{ total: string; active: string; revoked: string }>(
+            `SELECT
+               COUNT(*)::text AS total,
+               COUNT(*) FILTER (WHERE revoked_at IS NULL AND expires_at > NOW())::text AS active,
+               COUNT(*) FILTER (WHERE revoked_at IS NOT NULL)::text AS revoked
+             FROM refresh_tokens WHERE user_id = $1`,
+            [userId],
+          ),
+        ]);
       const tokenRow = tokens.rows[0];
       return {
         user: {
@@ -553,6 +575,38 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           ended_at: row.ended_at ? new Date(row.ended_at as Date).toISOString() : null,
         })),
         sessions,
+        driveCache: driveCache.map((row) => ({
+          file_id: row.fileId,
+          name: row.name,
+          mime_type: row.mimeType,
+          modified_time: row.modifiedTime,
+          kind: row.kind ?? null,
+          text_chars: row.text.length,
+          text_preview: row.text.slice(0, 160),
+          extracted_at: row.extractedAt,
+        })),
+        schoolDigests: digests.rows.map((row) => {
+          const mapped = mapSchoolDigestRow({
+            user_id: userId,
+            digest_date: row.digest_date,
+            timezone: row.timezone,
+            model: row.model,
+            digest_text: row.digest_text,
+            sources_json: row.sources_json,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+          });
+          return {
+            digest_date: mapped.digestDate,
+            timezone: mapped.timezone,
+            model: mapped.model,
+            digest_text: mapped.digestText,
+            sources: mapped.sources,
+            text_chars: mapped.digestText.length,
+            created_at: mapped.createdAt,
+            updated_at: mapped.updatedAt,
+          };
+        }),
         tokens: {
           total: Number(tokenRow?.total ?? 0),
           active: Number(tokenRow?.active ?? 0),
@@ -659,7 +713,7 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         case "profiles": {
           const result = await pool.query(
             `SELECT user_id, interests, long_term_goals, priorities, interaction,
-                    study_memory, (study_memory IS NOT NULL) AS has_study_memory, updated_at
+                    (study_memory IS NOT NULL) AS has_study_memory, updated_at
              FROM user_profiles ORDER BY updated_at DESC LIMIT $1`,
             [cap],
           );
@@ -672,6 +726,76 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
               ...r,
               updated_at: new Date(r.updated_at as Date).toISOString(),
             })),
+          );
+        }
+        case "drive_cache": {
+          const result = await pool.query<{
+            user_id: string;
+            file_id: string;
+            name: string;
+            mime_type: string;
+            modified_time: string;
+            kind: string | null;
+            text: string;
+            extracted_at: Date;
+          }>(
+            `SELECT user_id, file_id, name, mime_type, modified_time, kind, text, extracted_at
+             FROM drive_file_cache ORDER BY extracted_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM drive_file_cache`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              user_id: r.user_id,
+              file_id: r.file_id,
+              name: r.name,
+              mime_type: r.mime_type,
+              kind: r.kind,
+              modified_time: r.modified_time,
+              text_chars: r.text.length,
+              text_preview: r.text.slice(0, 120),
+              extracted_at: new Date(r.extracted_at).toISOString(),
+            })),
+          );
+        }
+        case "school_digests": {
+          const result = await pool.query<{
+            user_id: string;
+            digest_date: Date;
+            timezone: string;
+            model: string;
+            digest_text: string;
+            sources_json: SchoolDigestSource[] | string;
+            created_at: Date;
+            updated_at: Date;
+          }>(
+            `SELECT user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at
+             FROM school_digests ORDER BY digest_date DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM school_digests`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => {
+              const mapped = mapSchoolDigestRow(r);
+              return {
+                user_id: r.user_id,
+                digest_date: mapped.digestDate,
+                timezone: mapped.timezone,
+                model: mapped.model,
+                sources: mapped.sources,
+                source_count: mapped.sources.length,
+                text_chars: mapped.digestText.length,
+                text_preview: mapped.digestText.slice(0, 120),
+                created_at: mapped.createdAt,
+                updated_at: mapped.updatedAt,
+              };
+            }),
           );
         }
         case "email_codes": {

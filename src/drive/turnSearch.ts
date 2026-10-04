@@ -4,7 +4,7 @@
  * then loads full file text (not a tease / not a promise to fetch later).
  */
 
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import type { Store } from "../store/types.ts";
 import type { DriveClient, DriveFile } from "./client.ts";
 import { summarizeDriveFilesWithExcerpts } from "./client.ts";

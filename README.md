@@ -215,35 +215,6 @@ During a lock-in, the desktop opens a **thin** WebSocket to this API only:
 
 Protocol mirrors [gemini_live_demo](https://github.com/legitminh/gemini_live_demo): `start` → mic `audio` / typed `text` / `barge` / `stop`. This server holds `GEMINI_API_KEY`, opens Gemini Live upstream, and streams transcripts + native audio back. Optional study context is sent on `start`. Typed fallback (no Live): `POST /v1/companion/chat`.
 
-### 6b. Gemini Live ephemeral token (legacy / other clients)
-
-> **Legacy and disabled by default.** The desktop uses the server-side Live proxy in step 6. `POST /v1/session/ephemeral-token` returns `404` `ephemeral_token_disabled` unless the server sets `ENABLE_EPHEMERAL_TOKEN=1` (also `true`, `yes`, `on`). Enable it only for older or third-party clients that talk to Gemini Live directly.
-
-The desktop app must not ship `GEMINI_API_KEY`. Sign in first (steps 1–2) so the app holds a Waypoint access token. Then ask this server for a Gemini credential and use that token for Gemini Live instead of a key baked into the app.
-
-`POST /v1/session/ephemeral-token`
-
-Auth required: `Authorization: Bearer ACCESS_TOKEN`. Body is optional (`{}` or empty).
-
-```bash
-curl -s -X POST http://127.0.0.1:8787/v1/session/ephemeral-token \
-  -H "Authorization: Bearer ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-```json
-{
-  "token": "auth_tokens/...",
-  "expire_time": "2026-10-03T17:02:00.000Z",
-  "model": "gemini-flash-latest"
-}
-```
-
-`token` is single-use and lasts about 30 minutes (`expire_time`). Pass it to the Gemini Live client where an API key would go. Live sessions that use this token need the `v1alpha` API. `model` is `GEMINI_MODEL`, or `gemini-flash-latest` when that variable is blank. Mint a new token for each Live session. Do not log it.
-
-`401` `unauthorized` means the Waypoint bearer token is missing or invalid. Refresh it (step 4) or sign in again, then retry. `503` `gemini_not_configured` means `GEMINI_API_KEY` is blank on the server. `502` `gemini_token_failed` means Google did not issue a token. This response never includes the long-lived Gemini API key.
-
 ## Rust sketch
 
 This is the shape of a Tauri command that replaces `sign_in_waypoint`. It is not wired into the app in this branch.
@@ -366,7 +337,7 @@ For local development, leave `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`,
 
 ## Memory, tasks, calendar, and session recap
 
-Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the full contract. The client never writes Postgres. Live Gemini runs through the server-side proxy (`WS /v1/companion/live`); the ephemeral token route is legacy and off by default (see 6b).
+Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the full contract. The client never writes Postgres. Live Gemini runs through the server-side proxy (`WS /v1/companion/live`).
 
 ### Memory
 

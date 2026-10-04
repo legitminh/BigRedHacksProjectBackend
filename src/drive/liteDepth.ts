@@ -11,7 +11,7 @@
  * into the chat model.
  */
 
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import { geminiChat } from "../gemini/chat.ts";
 
 /** Soft cap per Lite map call — leaves room for system + JSON reply. */

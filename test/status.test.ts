@@ -128,7 +128,9 @@ function stubFetch(handlers: {
       if (handlers.ollamaOk === false) {
         throw new Error("ECONNREFUSED");
       }
-      const models = (handlers.models ?? ["qwen2.5:0.5b", "qwen2.5:7b"]).map((name) => ({ name }));
+      const models = (handlers.models ?? ["qwen2.5:0.5b", "moondream", "qwen2.5:7b"]).map((name) => ({
+        name,
+      }));
       return new Response(JSON.stringify({ models }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -173,6 +175,8 @@ test("GET /v1/status reports config-only for anonymous callers (no live probes)"
       assert.equal(byId(body, "google").state, "warn");
       assert.equal(byId(body, "presage").state, "warn");
       assert.equal(byId(body, "presage").status, "Degraded");
+      assert.equal(byId(body, "xai_tts").state, "warn");
+      assert.equal(byId(body, "storage").status, "Local file");
       assert.equal(geminiHits, 0);
       assert.equal(ollamaHits, 0);
     },
@@ -230,10 +234,15 @@ test("GET /v1/status caches Gemini probe within TTL when signed in", async () =>
       });
     }
     if (url.includes("/api/tags")) {
-      return new Response(JSON.stringify({ models: [{ name: "qwen2.5:0.5b" }, { name: "qwen2.5:7b" }] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          models: [{ name: "qwen2.5:0.5b" }, { name: "moondream" }, { name: "qwen2.5:7b" }],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
     }
     return fetch(input, init);
   }) as typeof fetch;
@@ -262,10 +271,15 @@ test("GET /v1/status reports missing Gemini key without calling Google", async (
       geminiHits += 1;
     }
     if (url.includes("/api/tags")) {
-      return new Response(JSON.stringify({ models: [{ name: "qwen2.5:0.5b" }, { name: "qwen2.5:7b" }] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          models: [{ name: "qwen2.5:0.5b" }, { name: "moondream" }, { name: "qwen2.5:7b" }],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
     }
     return fetch(input, init);
   }) as typeof fetch;

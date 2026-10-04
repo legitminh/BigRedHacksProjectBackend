@@ -3,7 +3,7 @@
  * Callers attach the returned block to study context so the model answers from file rows.
  */
 
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import type { Store } from "../store/types.ts";
 import { readFileTextCached } from "./cache.ts";
 import { prepareLiteDepthContext } from "./liteDepth.ts";

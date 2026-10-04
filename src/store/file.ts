@@ -306,6 +306,8 @@ export function openFileStore(path: string): Store {
           activeRefreshTokens: data.refreshTokens.filter(
             (t) => !t.revokedAt && Date.parse(t.expiresAt) > nowMs,
           ).length,
+          driveCacheCount: (data.driveFileCache ?? []).length,
+          schoolDigestCount: (data.schoolDigests ?? []).length,
           users,
         };
       });
@@ -353,6 +355,30 @@ export function openFileStore(path: string): Store {
           sessions: data.sessions
             .filter((item) => item.userId === userId)
             .map(({ userId: _u, ...rest }) => rest),
+          driveCache: (data.driveFileCache ?? [])
+            .filter((row) => row.userId === userId)
+            .map((row) => ({
+              file_id: row.fileId,
+              name: row.name,
+              mime_type: row.mimeType,
+              modified_time: row.modifiedTime,
+              kind: row.kind ?? null,
+              text_chars: row.text.length,
+              text_preview: row.text.slice(0, 160),
+              extracted_at: row.extractedAt,
+            })),
+          schoolDigests: (data.schoolDigests ?? [])
+            .filter((row) => row.userId === userId)
+            .map((row) => ({
+              digest_date: row.digestDate,
+              timezone: row.timezone,
+              model: row.model,
+              digest_text: row.digestText,
+              sources: row.sources,
+              text_chars: row.digestText.length,
+              created_at: row.createdAt,
+              updated_at: row.updatedAt,
+            })),
           tokens: {
             total: tokens.length,
             active: tokens.filter((t) => !t.revokedAt && Date.parse(t.expiresAt) > nowMs).length,
@@ -408,8 +434,36 @@ export function openFileStore(path: string): Store {
                 priorities: p.priorities,
                 interaction: p.interaction,
                 has_study_memory: Boolean(p.study_memory),
-                study_memory: p.study_memory ?? null,
                 updated_at: p.updated_at,
+              })),
+            );
+          case "drive_cache":
+            return pack(
+              (data.driveFileCache ?? []).map((row) => ({
+                user_id: row.userId,
+                file_id: row.fileId,
+                name: row.name,
+                mime_type: row.mimeType,
+                kind: row.kind ?? null,
+                modified_time: row.modifiedTime,
+                text_chars: row.text.length,
+                text_preview: row.text.slice(0, 120),
+                extracted_at: row.extractedAt,
+              })),
+            );
+          case "school_digests":
+            return pack(
+              (data.schoolDigests ?? []).map((row) => ({
+                user_id: row.userId,
+                digest_date: row.digestDate,
+                timezone: row.timezone,
+                model: row.model,
+                sources: row.sources,
+                source_count: row.sources.length,
+                text_chars: row.digestText.length,
+                text_preview: row.digestText.slice(0, 120),
+                created_at: row.createdAt,
+                updated_at: row.updatedAt,
               })),
             );
           case "email_codes":

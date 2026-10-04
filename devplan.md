@@ -240,7 +240,7 @@ Documented in `README.md` with curl and a Rust sketch. The app changes are not p
 Product contract: `specs.md`. These are on `main`:
 
 1. Email code login and SMTP, with the same Waypoint token format as Google.
-2. `POST /v1/session/ephemeral-token` so the app does not embed `GEMINI_API_KEY`. **Legacy:** superseded by the server-side Live proxy (`WS /v1/companion/live`); off by default, enable with `ENABLE_EPHEMERAL_TOKEN=1`.
+2. Server-side Live proxy (`WS /v1/companion/live`) so the app does not embed `GEMINI_API_KEY`.
 3. Memory profile: `GET` / `PUT /v1/memory`, pace samples, and one-step proficiency.
 4. Tasks (`advise`, `pair`, `ask`) and `POST /v1/sessions` for the lock-in recap.
 5. Incremental Calendar consent, agenda classification, and create/update/delete only for events Waypoint created.

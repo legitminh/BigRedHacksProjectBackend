@@ -57,7 +57,7 @@ import {
   selectChatBackend,
   shouldFallbackToLocal,
 } from "../gemini/localChat.ts";
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import { googleConfigured, pendingTtlSeconds, type Config } from "../config.ts";
 import { CHAT_BODY_MAX, HttpError, bearerToken, page, readJson, sendEmpty, sendHtml, sendJson } from "../http.ts";
 import type { GoogleClient } from "../auth/google.ts";

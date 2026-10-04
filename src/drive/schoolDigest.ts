@@ -14,7 +14,7 @@ import type { Config } from "../config.ts";
 import type { DriveClient } from "../drive/client.ts";
 import { INVENTORY_DEFAULT_MAX_FILES } from "../drive/client.ts";
 import { readFileTextCached } from "../drive/cache.ts";
-import type { FetchLike } from "../gemini/ephemeral.ts";
+import type { FetchLike } from "../http.ts";
 import { geminiChat } from "../gemini/chat.ts";
 import type { SchoolDigest, SchoolDigestSource, Store } from "../store/types.ts";
 import {

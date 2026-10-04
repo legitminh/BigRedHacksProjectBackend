@@ -228,7 +228,6 @@ sudo systemctl status waypoint-api
 
 **Admin cookie:** `wp_admin` gets the `Secure` attribute automatically when `PUBLIC_BASE_URL` is `https://…`.
 
-**Legacy ephemeral token:** `POST /v1/session/ephemeral-token` is disabled (404) unless `ENABLE_EPHEMERAL_TOKEN=1`. Leave it off; the desktop uses `WS /v1/companion/live`.
 
 After **any** code or `.env` change: restart the service (`systemctl restart waypoint-api`).
 
