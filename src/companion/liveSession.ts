@@ -1,12 +1,12 @@
 /**
- * Client WebSocket ↔ Gemini Live proxy.
- * Behavior mirrors legitminh/gemini_live_demo (session.rs), without Grok TTS —
- * Gemini native audio is forwarded to the client for playback.
+ * Client WebSocket ↔ Gemini Live (STT) + Flash-Lite (reply) + Grok TTS (voice).
+ * Gemini assistant PCM is discarded; spoken audio comes from streaming Grok TTS.
  */
 
 import WebSocket from "ws";
 
 import type { Config } from "../config.ts";
+import { geminiChat, type ChatTurn } from "../gemini/chat.ts";
 import {
   AUDIO_KIND_UPLINK,
   AUDIO_PROTOCOL,
@@ -16,20 +16,28 @@ import {
 import {
   audioMessage,
   audioStreamEndMessage,
-  buildCompanionSystem,
+  buildCompanionListenSystem,
+  buildCompanionVoiceReplySystem,
   denyToolResponse,
   errorMessage,
   liveWsUrl,
-  sampleRateFromMime,
   setupMessage,
   signalsFromMessage,
-  textTurnMessage,
   toolCallsFromMessage,
   type LiveSignal,
 } from "./geminiLive.ts";
+import {
+  connectGrokTts,
+  GROK_TTS_MAX_CHARS,
+  GROK_TTS_SAMPLE_RATE,
+  parseGrokEvent,
+} from "./grokTts.ts";
+import { SpeechQueue, type SpeechAction } from "./speechQueue.ts";
 
 const MAX_PCM_BYTES = 64 * 1024;
 const SETUP_TIMEOUT_MS = 20_000;
+/** Fixed opener — no Flash-Lite spend; Grok speaks it once at Mic-on. */
+const LIVE_OPENER = "I'm here. What are you working on?";
 /** Hold outbound frames if the client socket is backed up; never drop samples. */
 const MAX_DOWNLINK_BUFFERED_BYTES = 256 * 1024;
 /** WAYPOINT_LIVE_AUDIO_DEBUG=1 logs Gemini chunk timing vs wire delivery. */
@@ -58,13 +66,21 @@ export type Inbound =
 
 type Outbound =
   | { type: "status"; phase: string }
-  | { type: "ready"; model: string; audio_protocol?: string }
+  | { type: "ready"; model: string; audio_protocol?: string; voice?: string }
   | { type: "user"; text: string; final: boolean }
   | { type: "assistant"; text: string; final: boolean }
   | { type: "audio"; pcm: string; sample_rate: number; epoch: number; seq?: number }
   | { type: "audio_end"; epoch: number }
   | { type: "clear_audio"; epoch: number }
+  /** Desktop should speak locally (macOS say) when Grok TTS fails. */
+  | { type: "speak_local"; text: string }
   | { type: "error"; message: string };
+
+function clipForTts(text: string): string {
+  const trimmed = text.trim().replace(/\s+/g, " ");
+  if (trimmed.length <= GROK_TTS_MAX_CHARS) return trimmed;
+  return `${trimmed.slice(0, GROK_TTS_MAX_CHARS - 1).trimEnd()}…`;
+}
 
 class TurnBridge {
   assistant = "";
@@ -375,16 +391,23 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     client.close();
     return;
   }
+  if (!config.xaiApiKey) {
+    sendError(
+      client,
+      "Grok voice isn’t configured on the API (set XAI_API_KEY). Live mic needs it to speak.",
+    );
+    client.close();
+    return;
+  }
 
   let gemini: WebSocket | null = null;
+  let grok: WebSocket | null = null;
   let closed = false;
-  let epoch = 1;
-  let geminiGenerating = false;
-  let announcedReply = false;
   let useBinaryAudio = false;
-  let turnStartedAt = Date.now();
-  let endPending = false;
-  let turnEndAnnounced = false;
+  let replyGen = 0;
+  let clearTimer: ReturnType<typeof setTimeout> | null = null;
+  const history: ChatTurn[] = [];
+  const speech = new SpeechQueue();
   const downlink = new LiveDownlink(
     (frame) => {
       if (closed || client.readyState !== WebSocket.OPEN) return;
@@ -397,17 +420,26 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     },
   );
   const bridge = new TurnBridge();
-  const model = config.geminiLiveModel;
+  const liveModel = config.geminiLiveModel;
+  const chatModel = config.geminiModel;
+  const voiceId = config.xaiTtsVoice;
+  let sessionContext: Record<string, unknown> | null = null;
 
-  /** Never forward screencap to the desktop — deny any unexpected tool call upstream. */
   const denyUnexpectedTool = (call: { id: string; name: string }) => {
     if (!gemini || gemini.readyState !== WebSocket.OPEN) return;
     gemini.send(JSON.stringify(denyToolResponse(call)));
   };
 
+  const clearClearTimer = () => {
+    if (clearTimer == null) return;
+    clearTimeout(clearTimer);
+    clearTimer = null;
+  };
+
   const cleanup = () => {
     if (closed) return;
     closed = true;
+    clearClearTimer();
     downlink.reset();
     const upstream = gemini;
     if (upstream && upstream.readyState === WebSocket.OPEN) {
@@ -418,53 +450,115 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
       }
     }
     closeQuietly(upstream);
+    closeQuietly(grok);
     gemini = null;
+    grok = null;
   };
 
-  const forwardDownlinkPcm = (pcmBase64: string, sampleRate: number) => {
-    // More speech for this epoch, so the turn is audibly open again: re-arm the
-    // end announcement. Guards against a stray chunk arriving after
-    // generationComplete and leaving that audio with no audio_end behind it.
-    turnEndAnnounced = false;
-    if (useBinaryAudio) {
-      downlink.push(pcmBase64, sampleRate);
-      return;
-    }
-    send(client, {
-      type: "audio",
-      pcm: pcmBase64,
-      sample_rate: sampleRate,
-      epoch,
-    });
-  };
-
-  /**
-   * Collapse generationComplete + turnComplete into one audio_end after every
-   * sample for this reply is on the wire. The desktop may still be playing from
-   * its queue — mic mute must key off that queue, not this signal.
-   */
-  const endTurnWhenDrained = () => {
-    if (endPending || turnEndAnnounced) return;
-    if (!useBinaryAudio) {
-      turnEndAnnounced = true;
-      send(client, { type: "audio_end", epoch });
-      send(client, { type: "status", phase: "listening" });
-      return;
-    }
-    endPending = true;
-    const turnEpoch = epoch;
-    downlink.endStream(() => {
-      endPending = false;
-      if (closed || turnEpoch !== epoch) return;
-      turnEndAnnounced = true;
-      if (audioDebug) {
-        console.log(
-          `[live-audio] turn end epoch=${turnEpoch} sent_ms=${Math.round(downlink.sentMs())}`,
-        );
+  const applySpeechActions = (actions: SpeechAction[]) => {
+    for (const action of actions) {
+      switch (action.type) {
+        case "send":
+          if (grok && grok.readyState === WebSocket.OPEN) {
+            grok.send(action.message);
+          }
+          break;
+        case "audio": {
+          if (speech.notePlayback(action.epoch)) {
+            send(client, { type: "status", phase: "speaking" });
+          }
+          // Keep client epoch aligned with speech queue epoch.
+          if (action.epoch !== downlinkEpoch()) {
+            syncDownlinkEpoch(action.epoch);
+          }
+          downlink.push(action.bytes.toString("base64"), GROK_TTS_SAMPLE_RATE);
+          break;
+        }
+        case "ended": {
+          const turnEpoch = action.epoch;
+          downlink.endStream(() => {
+            if (closed || turnEpoch !== speech.epoch) return;
+            send(client, { type: "audio_end", epoch: turnEpoch });
+            send(client, { type: "status", phase: "listening" });
+          });
+          break;
+        }
+        case "cleared":
+          syncDownlinkEpoch(action.epoch);
+          send(client, { type: "clear_audio", epoch: action.epoch });
+          send(client, { type: "status", phase: "listening" });
+          clearClearTimer();
+          clearTimer = setTimeout(() => {
+            clearTimer = null;
+            if (closed) return;
+            applySpeechActions(speech.forceReady());
+          }, 2_000);
+          break;
+        case "failed":
+          if (audioDebug) console.warn("[live-audio] grok tts failed", action.message);
+          send(client, { type: "speak_local", text: clipForTts(lastSpokenText) });
+          send(client, { type: "status", phase: "listening" });
+          break;
       }
-      send(client, { type: "audio_end", epoch: turnEpoch });
+    }
+  };
+
+  let downlinkEpochValue = 1;
+  const downlinkEpoch = () => downlinkEpochValue;
+  const syncDownlinkEpoch = (next: number) => {
+    downlinkEpochValue = next;
+    downlink.setEpoch(next);
+  };
+
+  let lastSpokenText = "";
+
+  const cancelSpeech = () => {
+    applySpeechActions(speech.cancel());
+  };
+
+  const speakReply = (text: string) => {
+    const clipped = clipForTts(text);
+    if (!clipped) return;
+    lastSpokenText = clipped;
+    applySpeechActions(speech.speak(clipped));
+    applySpeechActions(speech.finish());
+  };
+
+  const replyToUser = async (userText: string) => {
+    const trimmed = userText.trim();
+    if (!trimmed || closed) return;
+    const gen = (replyGen += 1);
+    send(client, { type: "status", phase: "thinking" });
+    cancelSpeech();
+    try {
+      const system = buildCompanionVoiceReplySystem(sessionContext);
+      const reply = await geminiChat({
+        apiKey: config.geminiApiKey!,
+        model: chatModel,
+        system,
+        history,
+        message: trimmed,
+        fetchImpl: globalThis.fetch.bind(globalThis),
+      });
+      if (closed || gen !== replyGen) return;
+      const spoken = clipForTts(reply);
+      history.push({ role: "user", content: trimmed });
+      history.push({ role: "assistant", content: spoken });
+      while (history.length > 12) history.shift();
+      send(client, { type: "assistant", text: spoken, final: true });
+      speakReply(spoken);
+    } catch (error) {
+      if (closed || gen !== replyGen) return;
+      const message =
+        error instanceof Error ? error.message : "Could not get a voice reply.";
+      sendError(
+        client,
+        /quota|429|exhausted/i.test(message)
+          ? "Cloud chat hit a free-tier limit. Try again in a bit, or type."
+          : "Couldn’t get a voice reply. Try again or type a message.",
+      );
       send(client, { type: "status", phase: "listening" });
-    });
+    }
   };
 
   client.on("close", cleanup);
@@ -483,17 +577,18 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   }
 
   useBinaryAudio = first.audio_protocol === AUDIO_PROTOCOL;
+  sessionContext =
+    first.context && typeof first.context === "object" ? first.context : null;
   send(client, { type: "status", phase: "connecting" });
-  const system = buildCompanionSystem(first.context);
+
+  const listenSystem = buildCompanionListenSystem(sessionContext);
   try {
-    const upstream = await connectGemini(config.geminiApiKey, model, system, {
-      // Assign before awaiting so cleanup() can close the socket mid-setup.
+    const upstream = await connectGemini(config.geminiApiKey, liveModel, listenSystem, {
       onSocket: (socket) => {
         gemini = socket;
       },
     });
     if (closed) {
-      // Client left while Gemini was connecting.
       closeQuietly(upstream);
       return;
     }
@@ -512,12 +607,40 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     return;
   }
 
+  try {
+    grok = await connectGrokTts(config.xaiApiKey, voiceId, "en");
+  } catch {
+    sendError(client, "Could not connect Grok voice. Check XAI_API_KEY and try again.");
+    cleanup();
+    client.close();
+    return;
+  }
+  if (closed) {
+    cleanup();
+    return;
+  }
+
+  grok.on("message", (data) => {
+    if (closed) return;
+    const raw = typeof data === "string" ? data : data.toString();
+    applySpeechActions(speech.onGrok(parseGrokEvent(raw)));
+  });
+  grok.on("close", () => {
+    if (closed) return;
+    sendError(client, "Grok voice disconnected. Tap Mic to start again.");
+    cleanup();
+    client.close();
+  });
+
   send(client, {
     type: "ready",
-    model,
+    model: `${chatModel}+grok-tts`,
     audio_protocol: useBinaryAudio ? AUDIO_PROTOCOL : undefined,
+    voice: voiceId,
   });
   send(client, { type: "status", phase: "listening" });
+  send(client, { type: "assistant", text: LIVE_OPENER, final: true });
+  speakReply(LIVE_OPENER);
 
   gemini.on("message", (data) => {
     if (closed) return;
@@ -536,7 +659,7 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     }
     const record = payload as Record<string, unknown>;
     if (record.goAway != null || record.go_away != null) {
-      sendError(client, "Live voice ended this session. Tap Talk to start again.");
+      sendError(client, "Live voice ended this session. Tap Mic to start again.");
       cleanup();
       client.close();
       return;
@@ -548,61 +671,34 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
 
     const signals = signalsFromMessage(payload);
     for (const signal of signals) {
+      // STT only — never forward Gemini assistant PCM (Grok speaks instead).
       if (signal.kind === "audio") {
-        forwardDownlinkPcm(signal.pcmBase64, sampleRateFromMime(signal.mimeType));
-        if (audioDebug) {
-          const rate = sampleRateFromMime(signal.mimeType);
-          const chunkMs = Math.round(((signal.pcmBase64.length * 3) / 4 / 2 / rate) * 1000);
-          console.log(
-            `[live-audio] +${chunkMs}ms from Gemini at t=${Date.now() - turnStartedAt}ms; held=${Math.round(downlink.bufferedMs())}ms sent=${Math.round(downlink.sentMs())}ms`,
-          );
-        }
-        if (!announcedReply) {
-          announcedReply = true;
-          send(client, { type: "status", phase: "speaking" });
-        }
+        if (audioDebug) console.log("[live-audio] discard Gemini PCM chunk");
         continue;
       }
       if (signal.kind === "assistant_fragment") {
-        geminiGenerating = true;
-        if (!announcedReply) {
-          announcedReply = true;
-          turnStartedAt = Date.now();
-          send(client, { type: "status", phase: "thinking" });
-        }
+        // Ignore Gemini's spoken draft; Flash-Lite owns the reply text.
+        continue;
       }
-      for (const event of bridge.handle(signal)) {
-        send(client, event);
-      }
-      if (
-        signal.kind === "interrupted" ||
-        signal.kind === "generation_complete" ||
-        signal.kind === "turn_complete"
-      ) {
-        if (signal.kind === "interrupted") {
-          // Only a reply that is actually in flight can be interrupted. Bumping
-          // the epoch on a stray flag would clear audio the user is mid-way
-          // through hearing — the exact "it skipped" symptom.
-          if (announcedReply || geminiGenerating || downlink.hasPendingAudio()) {
-            endPending = false;
-            turnEndAnnounced = false;
-            epoch += 1;
-            downlink.setEpoch(epoch);
-            send(client, { type: "clear_audio", epoch });
-            send(client, { type: "status", phase: "listening" });
+      if (signal.kind === "interim_user" || signal.kind === "final_user") {
+        for (const event of bridge.handle(signal)) {
+          send(client, event);
+          if (event.type === "user" && event.final) {
+            void replyToUser(event.text);
           }
-        } else {
-          endTurnWhenDrained();
         }
-        geminiGenerating = false;
-        announcedReply = false;
+        continue;
+      }
+      // generation_complete / turn_complete / interrupted: no Gemini audio path.
+      if (signal.kind === "interrupted" && speech.isBusy()) {
+        cancelSpeech();
       }
     }
   });
 
   gemini.on("close", () => {
     if (closed) return;
-    sendError(client, "Live voice disconnected. Tap Talk to start again.");
+    sendError(client, "Live voice disconnected. Tap Mic to start again.");
     cleanup();
     client.close();
   });
@@ -617,9 +713,7 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   client.on("message", (data, isBinary) => {
     if (closed || !gemini) return;
     if (isBinary || Buffer.isBuffer(data)) {
-      const buf = Buffer.isBuffer(data)
-        ? data
-        : Buffer.from(data as ArrayBuffer);
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
       const frame = tryDecodePcmFrame(buf);
       if (frame && frame.kind === AUDIO_KIND_UPLINK) {
         forwardUplinkPcm(frame.pcm);
@@ -646,26 +740,15 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     if (inbound.type === "text") {
       const text = inbound.text.trim();
       if (!text) return;
-      if (gemini.readyState === WebSocket.OPEN) {
-        gemini.send(JSON.stringify(textTurnMessage(text)));
-      }
       send(client, { type: "user", text, final: true });
-      send(client, { type: "status", phase: "thinking" });
+      void replyToUser(text);
       return;
     }
     if (inbound.type === "barge") {
-      endPending = false;
-      turnEndAnnounced = false;
-      epoch += 1;
-      downlink.setEpoch(epoch);
-      send(client, { type: "clear_audio", epoch });
-      if (geminiGenerating) {
-        // Gemini activityHandling already interrupts on speech; clear local playback.
-      }
-      send(client, { type: "status", phase: "listening" });
+      cancelSpeech();
       return;
     }
-    // Legacy screencap replies: ignore — server never initiates screencap_request.
+    // Legacy screencap replies: ignore.
   });
 }
 
