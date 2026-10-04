@@ -523,7 +523,7 @@ function hasBase64Blob(value: string): boolean {
   );
 }
 
-function rejectImagePayload(value: unknown, key?: string): void {
+export function rejectImagePayload(value: unknown, key?: string): void {
   if (key && isImageField(key)) {
     throw new HttpError(400, "image_not_allowed", "Image payloads are not accepted.");
   }

@@ -256,6 +256,26 @@ The first POST returns `201` with the stored row (`id`, `user_id`, `session_id`,
 
 `session_notes`: `id`, `user_id`, `session_id`, `started_at`, `ended_at`, `goals`, `kind`, `markdown`, `created_at`. Unique on `(user_id, session_id)`. Indexed on `(user_id, ended_at DESC)`.
 
+## Concept map
+
+`POST /v1/concept-map` draws one concept map for the lock-in final review. Signed-in users only. The desktop sends the session note, not a free-form prompt.
+
+```json
+{ "markdown": "## Lock-in\n\nFinished push on the priority queue." }
+```
+
+`markdown` is required. Empty text is `400` `invalid_concept_map`. Text longer than 8,000 characters is clipped to that length. Fields named like `image` or `screenshot`, and base64 image payloads, are rejected with `400` `image_not_allowed`. The route does not store the image, and session notes still reject images.
+
+The server writes the prompt. It asks Grok Imagine for a labeled concept map of only the topics in the note, and it drops any study-suggestion block before the call. The upstream request is `POST https://api.x.ai/v1/images/generations` with model `grok-imagine-image-2.0`, `n` 1, `aspect_ratio` `16:9`, `resolution` `1k`, `quality` `low`, and `response_format` `b64_json`. The key is `XAI_API_KEY`. If it is unset, the route returns `503` `imagine_not_configured`.
+
+Success is `200`:
+
+```json
+{ "content_type": "image/jpeg", "image_base64": "<raw base64, no data: prefix>" }
+```
+
+`content_type` is `image/jpeg`, `image/png`, or `image/webp`, sniffed from the bytes. A signed-in user may request at most 6 maps per hour (`429`).
+
 ## What stays on the client
 
 - Gemini tool loop and the advise vs pair reply policy
