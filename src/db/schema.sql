@@ -94,6 +94,22 @@ CREATE TABLE IF NOT EXISTS session_recaps (
   note TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_notes (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users (id),
+  session_id TEXT NOT NULL,
+  started_at TIMESTAMPTZ NOT NULL,
+  ended_at TIMESTAMPTZ NOT NULL,
+  goals TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  markdown TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (user_id, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS session_notes_user_ended_idx
+  ON session_notes (user_id, ended_at DESC);
+
 CREATE TABLE IF NOT EXISTS drive_file_cache (
   user_id UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
   file_id TEXT NOT NULL,

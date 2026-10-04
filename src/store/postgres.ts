@@ -17,6 +17,7 @@ import {
   type Interaction,
   type Level,
   type PaceSample,
+  type SessionNote,
   type SessionRecap,
   type StoredProfile,
   type StudyMemoryBlob,
@@ -680,6 +681,27 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
             })),
           );
         }
+        case "session_notes": {
+          const result = await pool.query(
+            `SELECT id, user_id, session_id, started_at, ended_at, goals, kind,
+                    char_length(markdown) AS markdown_chars, created_at
+             FROM session_notes ORDER BY ended_at DESC LIMIT $1`,
+            [cap],
+          );
+          const total = await pool.query<{ n: string }>(
+            `SELECT COUNT(*)::text AS n FROM session_notes`,
+          );
+          return pack(
+            Number(total.rows[0]?.n ?? 0),
+            result.rows.map((r) => ({
+              ...r,
+              started_at: new Date(r.started_at as Date).toISOString(),
+              ended_at: new Date(r.ended_at as Date).toISOString(),
+              created_at: new Date(r.created_at as Date).toISOString(),
+              markdown_chars: Number(r.markdown_chars),
+            })),
+          );
+        }
         case "pace": {
           const result = await pool.query(
             `SELECT id, user_id, topic, problem, planned_minutes, actual_minutes, outcome, task_id, recorded_at
@@ -1106,6 +1128,61 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         note: row.note,
       }));
     },
+    async upsertSessionNote(userId, note) {
+      try {
+        await pool.query(
+          `INSERT INTO session_notes
+             (id, user_id, session_id, started_at, ended_at, goals, kind, markdown, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            note.id,
+            userId,
+            note.session_id,
+            note.started_at,
+            note.ended_at,
+            note.goals,
+            note.kind,
+            note.markdown,
+            note.created_at,
+          ],
+        );
+        return { note: { ...note, user_id: userId }, created: true };
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+      }
+      const result = await pool.query<SessionNoteRow>(
+        `UPDATE session_notes
+           SET started_at = $3, ended_at = $4, goals = $5, kind = $6, markdown = $7
+         WHERE user_id = $1 AND session_id = $2
+         RETURNING id, user_id, session_id, started_at, ended_at, goals, kind, markdown, created_at`,
+        [userId, note.session_id, note.started_at, note.ended_at, note.goals, note.kind, note.markdown],
+      );
+      const row = result.rows[0];
+      if (!row) throw new Error("Session note update returned no row.");
+      return { note: mapSessionNote(row), created: false };
+    },
+    async listSessionNotes(userId, limit) {
+      const cap = Math.min(50, Math.max(0, limit));
+      const result = await pool.query<SessionNoteRow>(
+        `SELECT id, user_id, session_id, started_at, ended_at, goals, kind, markdown, created_at
+         FROM session_notes
+         WHERE user_id = $1
+         ORDER BY ended_at DESC, created_at DESC
+         LIMIT $2`,
+        [userId, cap],
+      );
+      return result.rows.map(mapSessionNote);
+    },
+    async getSessionNote(userId, id) {
+      const result = await pool.query<SessionNoteRow>(
+        `SELECT id, user_id, session_id, started_at, ended_at, goals, kind, markdown, created_at
+         FROM session_notes
+         WHERE user_id = $1 AND id = $2`,
+        [userId, id],
+      );
+      const row = result.rows[0];
+      return row ? mapSessionNote(row) : null;
+    },
     async getDriveFileCache(userId, fileId) {
       const result = await pool.query<{
         user_id: string;
@@ -1268,6 +1345,7 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         await client.query(`DELETE FROM drive_file_cache WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM school_digests WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM session_recaps WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM session_notes WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM tasks WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM pace_samples WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM proficiencies WHERE user_id = $1`, [userId]);
@@ -1302,6 +1380,32 @@ type TaskRow = {
   started_at: Date | string;
   ended_at: Date | string | null;
 };
+
+type SessionNoteRow = {
+  id: string;
+  user_id: string;
+  session_id: string;
+  started_at: Date | string;
+  ended_at: Date | string;
+  goals: string;
+  kind: SessionNote["kind"];
+  markdown: string;
+  created_at: Date | string;
+};
+
+function mapSessionNote(row: SessionNoteRow): SessionNote {
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    session_id: row.session_id,
+    started_at: new Date(row.started_at).toISOString(),
+    ended_at: new Date(row.ended_at).toISOString(),
+    goals: row.goals,
+    kind: row.kind,
+    markdown: row.markdown,
+    created_at: new Date(row.created_at).toISOString(),
+  };
+}
 
 function mapTask(row: TaskRow): TaskRecord {
   return {

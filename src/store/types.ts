@@ -35,6 +35,7 @@ import type {
   CalendarConnection,
   PaceSample,
   Proficiency,
+  SessionNote,
   SessionRecap,
   StoredProfile,
   TaskRecord,
@@ -140,6 +141,7 @@ export type AdminBrowseTable =
   | "users"
   | "tasks"
   | "sessions"
+  | "session_notes"
   | "pace"
   | "proficiencies"
   | "profiles"
@@ -188,6 +190,13 @@ export type Store = {
   saveTask(userId: string, task: TaskRecord): Promise<void>;
   insertSession(userId: string, session: SessionRecap): Promise<SessionRecap>;
   listSessions(userId: string): Promise<SessionRecap[]>;
+  /** Insert or replace the note for (userId, session_id). `created` is false on replace. */
+  upsertSessionNote(
+    userId: string,
+    note: SessionNote,
+  ): Promise<{ note: SessionNote; created: boolean }>;
+  listSessionNotes(userId: string, limit: number): Promise<SessionNote[]>;
+  getSessionNote(userId: string, id: string): Promise<SessionNote | null>;
   getDriveFileCache(userId: string, fileId: string): Promise<DriveCachedFile | null>;
   upsertDriveFileCache(entry: DriveCachedFile): Promise<void>;
   listDriveFileCache(userId: string): Promise<DriveCachedFile[]>;

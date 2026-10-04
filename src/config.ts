@@ -32,7 +32,8 @@ export type Config = {
   /** Gemini Live model for study companion WebSocket proxy (`/v1/companion/live`). */
   geminiLiveModel: string;
   /**
-   * xAI / Grok API key for study heads-up TTS (`POST /v1/voice/tts` → api.x.ai/v1/tts).
+   * xAI / Grok API key for study heads-up TTS (`POST /v1/voice/tts`) and the
+   * final-review session summary image (`POST /v1/concept-map` → Grok Imagine).
    * Stays on this server only — never bake into Waypoint.app.
    */
   xaiApiKey: string | null;

@@ -28,7 +28,7 @@ Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_
 |---|---|---|---|
 | Copilot / companion **text** | `GEMINI_MODEL` (default `gemini-3.5-flash-lite`) | REST `generateContent` via `POST /v1/gemini/chat` + `/v1/companion/chat` | Default `LOCAL_CHAT_PROVIDER=gemini` tries Gemini REST first; silent Ollama fallback (`OLLAMA_CHAT_MODEL`, default `qwen2.5:7b`) on quota/outage. A Gemini **429 on chat is REST quota**, not a Live WebSocket failure. |
 | School digest / deep Drive | `GEMINI_OVERVIEW_MODEL` | REST overview | Once/day digest + optional Lite depth (`LITE_DEPTH_USE_LLM=1`). |
-| Talk / Live **voice** | `GEMINI_LIVE_MODEL` + **`XAI_API_KEY`** | `WS /v1/companion/live` | Live WebSocket only. Heads-up TTS (`POST /v1/voice/tts`) can fall back to macOS `say`; **Live cannot**. |
+| Talk / Live **voice** | `GEMINI_LIVE_MODEL` + **`XAI_API_KEY`** | `WS /v1/companion/live` | Live WebSocket only. Heads-up TTS (`POST /v1/voice/tts`) can fall back to macOS `say`; **Live cannot**. The same `XAI_API_KEY` draws the final-review session summary image (`POST /v1/concept-map` → Grok Imagine). |
 
 Set `LOCAL_CHAT_PROVIDER=ollama` (aliases: `llama`, `local`) to force local Llama and never call Gemini for chat. Set `PRESAGE_API_KEY` on this API for camera accountability vitals (`POST /v1/camera/observe`); the desktop uploads short clips here and never holds the Presage key on that path.
 
@@ -357,8 +357,8 @@ The shipping Mac app calls a **narrow** authenticated surface. Other product rou
 |---|---|
 | Auth Google start/poll/refresh, `DELETE /v1/me/data` | Email OTP auth |
 | `GET /v1/status` | `/v1/memory*`, `/v1/voice/health` |
-| `POST /v1/gemini/chat`, `/v1/companion/chat`, `WS /v1/companion/live` | `/v1/tasks*`, `/v1/sessions` |
-| `/v1/coach/api/*`, `POST /v1/voice/tts` | Calendar write/agenda, Drive folders |
+| `POST /v1/gemini/chat`, `/v1/companion/chat`, `WS /v1/companion/live` | `/v1/tasks*`, `/v1/sessions`, `/v1/session-notes*` |
+| `/v1/coach/api/*`, `POST /v1/voice/tts`, `POST /v1/concept-map` | Calendar write/agenda, Drive folders |
 | Google connect summary, Drive search/inventory/deep-brief | Synonyms: `google/calendar/*` ≈ `google/connect/*` |
 | `GET/PUT /v1/study-memory`, school-digest | — |
 | `POST /v1/camera/observe` | — |
@@ -427,3 +427,7 @@ Sign-in stays `openid email profile`. Calendar is a second consent.
 `attention` is `steady`, `recovered`, or `dropped`. This log does not change the profile card. Task completion already wrote the pace sample.
 
 `GET /v1/sessions` returns `{ "sessions": [...] }` newest first.
+
+### Session notes
+
+`POST /v1/session-notes` upserts the Markdown lock-in note for `(user, session_id)`. `GET /v1/session-notes` lists up to 50 newest; `GET /v1/session-notes/:id` returns one. `GET /v1/memory` includes up to five `recent_notes` excerpts. Chat with `purpose=session_note` uses the note writer template (not Copilot). `POST /v1/concept-map` draws a Grok Imagine shareable session-summary graphic from note markdown (6/hour per user). See `specs.md`.

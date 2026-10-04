@@ -22,6 +22,7 @@ import {
 } from "./security/rateLimit.ts";
 import { CameraSessionStore } from "./camera/sessionStore.ts";
 import { handleProduct, type ProductDeps } from "./product/routes.ts";
+import { handleConceptMap } from "./imagine/conceptMap.ts";
 import { handleVoiceHealth, handleVoiceTts } from "./voice/tts.ts";
 import { aggregateStatus } from "./status/aggregate.ts";
 import {
@@ -309,6 +310,14 @@ async function handle(
   ) {
     return;
   }
+  if (
+    await handleConceptMap(method, path, req, res, deps.config, deps.fetch, async () => {
+      const user = await requireUser(deps, req, deps.now());
+      limit(deps, "imagine", user.id, "imagineUser");
+    })
+  ) {
+    return;
+  }
   if (method === "POST" && (path === "/v1/gemini/chat" || path === "/v1/companion/chat")) {
     limit(deps, "chat", shieldIp(deps, req), "chatIp");
     const chatUser = await optionalUser(deps, req, deps.now());
@@ -354,6 +363,7 @@ async function handle(
     path === "/v1/status" ||
     path === "/v1/voice/tts" ||
     path === "/v1/voice/health" ||
+    path === "/v1/concept-map" ||
     path === "/health"
   ) {
     throw new HttpError(405, "method_not_allowed", "Method not allowed.");

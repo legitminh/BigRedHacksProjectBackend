@@ -33,6 +33,7 @@ const BROWSE_TABLES: { id: AdminBrowseTable; label: string; group: "product" | "
     { id: "profiles", label: "Profiles", group: "product" },
     { id: "tasks", label: "Tasks", group: "product" },
     { id: "sessions", label: "Sessions", group: "product" },
+    { id: "session_notes", label: "Session notes", group: "product" },
     { id: "pace", label: "Pace", group: "product" },
     { id: "proficiencies", label: "Proficiencies", group: "product" },
     { id: "drive_cache", label: "Drive cache", group: "google" },
