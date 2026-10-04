@@ -10,7 +10,7 @@ import type { Config } from "../config.ts";
 import {
   AUDIO_KIND_UPLINK,
   AUDIO_PROTOCOL,
-  PacedDownlinkStreamer,
+  LiveDownlink,
   tryDecodePcmFrame,
 } from "./audioProtocol.ts";
 import {
@@ -30,6 +30,12 @@ import {
 
 const MAX_PCM_BYTES = 64 * 1024;
 const SETUP_TIMEOUT_MS = 20_000;
+/** Hold outbound frames if the client socket is backed up; never drop samples. */
+const MAX_DOWNLINK_BUFFERED_BYTES = 256 * 1024;
+/** WAYPOINT_LIVE_AUDIO_DEBUG=1 logs Gemini chunk timing vs wire delivery. */
+const audioDebug = ["1", "true", "yes", "on"].includes(
+  (process.env.WAYPOINT_LIVE_AUDIO_DEBUG ?? "").trim().toLowerCase(),
+);
 
 export type Inbound =
   | {
@@ -376,10 +382,20 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   let geminiGenerating = false;
   let announcedReply = false;
   let useBinaryAudio = false;
-  const downlink = new PacedDownlinkStreamer((frame) => {
-    if (closed || client.readyState !== WebSocket.OPEN) return;
-    client.send(frame);
-  });
+  let turnStartedAt = Date.now();
+  let endPending = false;
+  let turnEndAnnounced = false;
+  const downlink = new LiveDownlink(
+    (frame) => {
+      if (closed || client.readyState !== WebSocket.OPEN) return;
+      client.send(frame);
+    },
+    {
+      ready: () =>
+        client.readyState === WebSocket.OPEN &&
+        client.bufferedAmount <= MAX_DOWNLINK_BUFFERED_BYTES,
+    },
+  );
   const bridge = new TurnBridge();
   const model = config.geminiLiveModel;
 
@@ -406,6 +422,10 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
   };
 
   const forwardDownlinkPcm = (pcmBase64: string, sampleRate: number) => {
+    // More speech for this epoch, so the turn is audibly open again: re-arm the
+    // end announcement. Guards against a stray chunk arriving after
+    // generationComplete and leaving that audio with no audio_end behind it.
+    turnEndAnnounced = false;
     if (useBinaryAudio) {
       downlink.push(pcmBase64, sampleRate);
       return;
@@ -415,6 +435,35 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
       pcm: pcmBase64,
       sample_rate: sampleRate,
       epoch,
+    });
+  };
+
+  /**
+   * Collapse generationComplete + turnComplete into one audio_end after every
+   * sample for this reply is on the wire. The desktop may still be playing from
+   * its queue — mic mute must key off that queue, not this signal.
+   */
+  const endTurnWhenDrained = () => {
+    if (endPending || turnEndAnnounced) return;
+    if (!useBinaryAudio) {
+      turnEndAnnounced = true;
+      send(client, { type: "audio_end", epoch });
+      send(client, { type: "status", phase: "listening" });
+      return;
+    }
+    endPending = true;
+    const turnEpoch = epoch;
+    downlink.endStream(() => {
+      endPending = false;
+      if (closed || turnEpoch !== epoch) return;
+      turnEndAnnounced = true;
+      if (audioDebug) {
+        console.log(
+          `[live-audio] turn end epoch=${turnEpoch} sent_ms=${Math.round(downlink.sentMs())}`,
+        );
+      }
+      send(client, { type: "audio_end", epoch: turnEpoch });
+      send(client, { type: "status", phase: "listening" });
     });
   };
 
@@ -501,6 +550,13 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
     for (const signal of signals) {
       if (signal.kind === "audio") {
         forwardDownlinkPcm(signal.pcmBase64, sampleRateFromMime(signal.mimeType));
+        if (audioDebug) {
+          const rate = sampleRateFromMime(signal.mimeType);
+          const chunkMs = Math.round(((signal.pcmBase64.length * 3) / 4 / 2 / rate) * 1000);
+          console.log(
+            `[live-audio] +${chunkMs}ms from Gemini at t=${Date.now() - turnStartedAt}ms; held=${Math.round(downlink.bufferedMs())}ms sent=${Math.round(downlink.sentMs())}ms`,
+          );
+        }
         if (!announcedReply) {
           announcedReply = true;
           send(client, { type: "status", phase: "speaking" });
@@ -511,6 +567,7 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
         geminiGenerating = true;
         if (!announcedReply) {
           announcedReply = true;
+          turnStartedAt = Date.now();
           send(client, { type: "status", phase: "thinking" });
         }
       }
@@ -523,14 +580,19 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
         signal.kind === "turn_complete"
       ) {
         if (signal.kind === "interrupted") {
-          epoch += 1;
-          downlink.setEpoch(epoch);
-          send(client, { type: "clear_audio", epoch });
-          send(client, { type: "status", phase: "listening" });
-        } else if (signal.kind === "generation_complete" || signal.kind === "turn_complete") {
-          downlink.forceFlush();
-          send(client, { type: "audio_end", epoch });
-          send(client, { type: "status", phase: "listening" });
+          // Only a reply that is actually in flight can be interrupted. Bumping
+          // the epoch on a stray flag would clear audio the user is mid-way
+          // through hearing — the exact "it skipped" symptom.
+          if (announcedReply || geminiGenerating || downlink.hasPendingAudio()) {
+            endPending = false;
+            turnEndAnnounced = false;
+            epoch += 1;
+            downlink.setEpoch(epoch);
+            send(client, { type: "clear_audio", epoch });
+            send(client, { type: "status", phase: "listening" });
+          }
+        } else {
+          endTurnWhenDrained();
         }
         geminiGenerating = false;
         announcedReply = false;
@@ -592,6 +654,8 @@ export async function runCompanionLiveSession(client: WebSocket, config: Config)
       return;
     }
     if (inbound.type === "barge") {
+      endPending = false;
+      turnEndAnnounced = false;
       epoch += 1;
       downlink.setEpoch(epoch);
       send(client, { type: "clear_audio", epoch });

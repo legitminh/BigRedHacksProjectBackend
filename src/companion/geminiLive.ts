@@ -229,6 +229,11 @@ export function signalsFromMessage(value: unknown): LiveSignal[] {
   if (!content) return [];
 
   const signals: LiveSignal[] = [];
+  // `interrupted` retires the *previous* generation, so it has to be seen before
+  // any audio in this same message — otherwise the epoch reset it triggers throws
+  // away the new turn's first chunk.
+  const interrupted = flag(content, ["interrupted"]);
+  if (interrupted) signals.push({ kind: "interrupted" });
   const interim = transcriptText(content, ["interimInputTranscription", "interim_input_transcription"]);
   if (interim) signals.push({ kind: "interim_user", text: interim });
   const finalUser = transcriptText(content, ["inputTranscription", "input_transcription"]);
@@ -263,8 +268,7 @@ export function signalsFromMessage(value: unknown): LiveSignal[] {
     }
   }
 
-  if (flag(content, ["interrupted"])) signals.push({ kind: "interrupted" });
-  else if (flag(content, ["generationComplete", "generation_complete"])) {
+  if (!interrupted && flag(content, ["generationComplete", "generation_complete"])) {
     signals.push({ kind: "generation_complete" });
   }
   if (flag(content, ["turnComplete", "turn_complete"])) signals.push({ kind: "turn_complete" });

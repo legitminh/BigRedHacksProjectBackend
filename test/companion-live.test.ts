@@ -135,6 +135,22 @@ test("parses transcript and completion signals", () => {
   );
 });
 
+test("interrupted is reported before audio in the same message", () => {
+  // The epoch reset that `interrupted` triggers must not swallow the first
+  // chunk of the reply that replaces the interrupted one.
+  const signals = signalsFromMessage({
+    serverContent: {
+      interrupted: true,
+      generationComplete: true,
+      modelTurn: { parts: [{ inlineData: { data: "AAAA", mimeType: "audio/pcm;rate=24000" } }] },
+    },
+  });
+  assert.deepEqual(
+    signals.map((s) => s.kind),
+    ["interrupted", "audio"],
+  );
+});
+
 test("study context lands in companion system prompt", () => {
   const system = buildCompanionSystem({
     goals: "CS 2110 heaps",
