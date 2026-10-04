@@ -1,92 +1,238 @@
 # Waypoint API
 
-Account server for the Waypoint desktop app. **Desktop login is Google OAuth only** — Google identity is upserted to a Waypoint `user.id`, then the app stores a JWT. A one-time email code path remains for API/dev tests only (not exposed in the desktop UI). The Google client secret and the Gemini key stay here. The app uses its Waypoint access token for memory, tasks, calendar/Drive, and Copilot chat.
+Account server for the Waypoint desktop app. **Desktop login is Google OAuth only** — Google identity is upserted to a Waypoint `user.id`, then the app stores a JWT. A one-time email code path remains for API/dev tests only (not exposed in the desktop UI). Secrets (Google client secret, Gemini, xAI, Presage, admin password) live **only** on this API. The desktop uses its Waypoint access token for memory, tasks, calendar/Drive, Copilot chat, and coach proxy calls.
 
-**Deploy on any powerful server (HTTPS, Ollama, TigerData, systemd, point Mac builds at it):** see **[DEPLOY.md](./DEPLOY.md)**.
+**Production / shared server (HTTPS, nginx, systemd, TigerData, Mac release builds):** see **[DEPLOY.md](./DEPLOY.md)**. This README is the **local developer** path.
 
-Desktop companion: [BigRedHacksProject](https://github.com/legitminh/BigRedHacksProject) — set `waypoint_api_base` in `src-tauri/secrets.toml` to this API’s `PUBLIC_BASE_URL`, then `npm run app:build`.
+Desktop companion: [BigRedHacksProject](https://github.com/legitminh/BigRedHacksProject). **`PUBLIC_BASE_URL` on this API must match the desktop `waypoint_api_base`** in `src-tauri/secrets.toml` (same origin the Mac will call — e.g. both `http://127.0.0.1:8787` locally, or both your deployed HTTPS origin). Then `npm run app:dev` (local) or `npm run app:build` (release). A mismatch breaks Google redirects, JWT calls, coach proxy, Live WS, and status probes.
 
-## Run (local laptop)
+## Prerequisites
+
+- **Node.js ≥ 22** (`engines.node` in `package.json`). Check with `node -v`.
+- **npm** (ships with Node).
+- Optional but recommended for Copilot fallback + lock-in coach: [Ollama](https://ollama.com/download) on the same machine.
+- Optional: TigerData / Postgres URL when you want multi-device storage instead of the local file store.
+
+## Quick start (local)
 
 ```bash
 cd BigRedHacksProjectBackend
+node -v                    # must be v22+
 npm install
 cp .env.example .env
 ```
 
-There is no `.env` with real keys in the repo. Fill `.env` before trying a real Google login:
+There is **no** committed `.env` with real keys. Generate a session secret and paste it into `.env`:
 
 ```bash
-openssl rand -base64 32
+openssl rand -base64 32    # → SESSION_SECRET (≥32 characters)
 ```
 
-Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup. Leave the SMTP variables blank for local email login; the code is written to `data/outbox.jsonl`.
+Minimum for Google sign-in: `SESSION_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (Web client below). Leave `DATABASE_URL` empty for file storage. See [Environment variables](#environment-variables) for the full list.
+
+```bash
+npm run dev                # watch mode (restarts on file changes)
+# or: npm start            # single process, no watch
+```
+
+Health check (default bind `BIND_HOST:PORT` → `http://127.0.0.1:8787`):
+
+```bash
+curl -sS http://127.0.0.1:8787/health
+# expect: {"ok":true,"service":"waypoint-api","storage":"file"}
+#         or "storage":"postgres" when DATABASE_URL is set
+```
+
+After any `.env` change, **restart** the process (`npm run dev` restarts on code edits; env changes still need a manual restart).
+
+## Environment variables
+
+Copy from `.env.example`. Values below are **placeholders / defaults only** — never commit real secrets.
+
+### Server bind & public URL
+
+| Variable | Required | Default / example | Notes |
+|---|---|---|---|
+| `PORT` | no | `8787` | HTTP listen port. |
+| `BIND_HOST` | no | `127.0.0.1` | Keep loopback for local + same-host reverse proxy. Use `0.0.0.0` only when the API is on a private network behind a separate proxy, and firewall `:8787`. |
+| `PUBLIC_BASE_URL` | yes (for OAuth) | `http://127.0.0.1:8787` | Origin clients and Google redirects use. **No trailing slash.** Must match desktop `waypoint_api_base`. Local: `http://127.0.0.1:8787`. Production: `https://…` — see [DEPLOY.md](./DEPLOY.md). |
+| `WAYPOINT_CORS_ORIGINS` | no | _(empty)_ | Extra browser origins, comma-separated. `localhost`, `127.0.0.1`, and `tauri://localhost` are already allowed. |
+| `TRUST_PROXY` | no | unset (off) | Set `1` **only** behind a reverse proxy you control so rate limits use `X-Forwarded-For`. Never enable on a public bind without a trusted proxy. |
+| `NODE_ENV` | no | unset | Set `production` on real deploys: hardens email OTP (requires SMTP) and related defaults. |
+
+### Auth & tokens
+
+| Variable | Required | Default / example | Notes |
+|---|---|---|---|
+| `SESSION_SECRET` | **yes** for real login | _(generate)_ | HMAC secret for Waypoint JWTs. **≥32 characters.** `openssl rand -base64 32`. Missing/short → `503 session_secret_missing`. |
+| `GOOGLE_CLIENT_ID` | **yes** for Google login | _(from Cloud Console)_ | **Web application** OAuth client id. Never put this in the Mac app for API redirects. |
+| `GOOGLE_CLIENT_SECRET` | **yes** for Google login | _(from Cloud Console)_ | Web client secret. Server-only. |
+| `ACCESS_TOKEN_TTL_SECONDS` | no | `900` | Access JWT lifetime (15 minutes). |
+| `REFRESH_TOKEN_TTL_SECONDS` | no | `2592000` | Refresh token lifetime (30 days). |
+| `ADMIN_PASSWORD` | no | _(empty)_ | Password for local HTML `/admin`. Generate e.g. `openssl rand -base64 48 \| tr -dc A-Za-z0-9 \| head -c 32`. Cookie `wp_admin` is `HttpOnly; SameSite=Strict` and gets `Secure` when `PUBLIC_BASE_URL` is `https://`. |
+
+### Storage
+
+| Variable | Required | Default / example | Notes |
+|---|---|---|---|
+| `DATABASE_URL` | no | _(empty = file)_ | Empty → `data/store.json` (`GET /health` → `"storage":"file"`). Set to a Postgres / TigerData URL for durable multi-user storage (`"storage":"postgres"`). Schema applied from `src/db/schema.sql` on startup. Example shape: `postgresql://USER:PASSWORD@HOST:PORT/DB?sslmode=require`. |
+
+See [File vs Postgres storage](#file-vs-postgres-storage).
+
+### Email OTP (dev / API tests only)
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `SMTP_HOST` | no | _(empty)_ | Leave **all five** blank locally → codes append to `data/outbox.jsonl` (gitignored). |
+| `SMTP_PORT` | no | _(empty)_ | |
+| `SMTP_USER` | no | _(empty)_ | |
+| `SMTP_PASS` | no | _(empty)_ | |
+| `MAIL_FROM` | no | _(empty)_ | Set all five to send codes over SMTP. In `NODE_ENV=production`, email sign-in is refused unless SMTP is fully configured. |
+
+### Gemini (Google AI)
+
+| Variable | Required | Default / example | Notes |
+|---|---|---|---|
+| `GEMINI_API_KEY` | for Copilot / Live | _(empty)_ | Long-lived key; server-only. Unset → Copilot can fall back to Ollama if configured. |
+| `GEMINI_MODEL` | no | `gemini-3.5-flash-lite` | Copilot / companion **HTTP text** (`POST /v1/gemini/chat`, `/v1/companion/chat`). |
+| `GEMINI_OVERVIEW_MODEL` | no | `gemini-3.5-flash` | School digest / deep Drive overview REST. |
+| `GEMINI_LIVE_MODEL` | no | `gemini-3.8-live` | Talk / Live **voice** WebSocket only (`WS /v1/companion/live`). Not used for HTTP Copilot. |
+| `LIVE_ALLOW_QUERY_TOKEN` | no | `0` | `0` rejects `?access_token=` / `?token=` on Live (preferred). Desktop uses `Sec-WebSocket-Protocol: bearer.<jwt>`. |
+| `LITE_DEPTH_USE_LLM` | no | unset (off) | Set `1` to run Flash-Lite structuring on Drive deep-brief excerpts (uses more Gemini quota). |
+| `LOCAL_CHAT_PROVIDER` | no | `gemini` | `gemini` / `cloud` → Gemini first, silent Ollama fallback on quota/outage. `ollama` / `llama` / `local` → always Ollama; never Gemini for chat. |
 
 **Gemini surfaces (do not conflate):**
 
 | Surface | Env | API | Notes |
 |---|---|---|---|
-| Copilot / companion **text** | `GEMINI_MODEL` (default `gemini-3.5-flash-lite`) | REST `generateContent` via `POST /v1/gemini/chat` + `/v1/companion/chat` | Default `LOCAL_CHAT_PROVIDER=gemini` tries Gemini REST first; silent Ollama fallback (`OLLAMA_CHAT_MODEL`, default `qwen2.5:7b`) on quota/outage. A Gemini **429 on chat is REST quota**, not a Live WebSocket failure. |
+| Copilot / companion **text** | `GEMINI_MODEL` | REST `generateContent` via `POST /v1/gemini/chat` + `/v1/companion/chat` | A Gemini **429 on chat is REST quota**, not a Live WebSocket failure. |
 | School digest / deep Drive | `GEMINI_OVERVIEW_MODEL` | REST overview | Once/day digest + optional Lite depth (`LITE_DEPTH_USE_LLM=1`). |
-| Talk / Live **voice** | `GEMINI_LIVE_MODEL` + **`XAI_API_KEY`** | `WS /v1/companion/live` | Live WebSocket only. Heads-up TTS (`POST /v1/voice/tts`) can fall back to macOS `say`; **Live cannot**. The same `XAI_API_KEY` draws the final-review mission brag sheet (`POST /v1/concept-map` → Grok Imagine). |
+| Talk / Live **voice** | `GEMINI_LIVE_MODEL` + **`XAI_API_KEY`** | `WS /v1/companion/live` | Live needs Grok TTS; heads-up TTS can fall back to macOS `say`. |
 
-Set `LOCAL_CHAT_PROVIDER=ollama` (aliases: `llama`, `local`) to force local Llama and never call Gemini for chat. Set `PRESAGE_API_KEY` on this API for camera accountability vitals (`POST /v1/camera/observe`); the desktop uploads short clips here and never holds the Presage key on that path.
+### xAI / Grok
 
-```bash
-npm run dev
-# or: npm start
-```
+| Variable | Required | Default / example | Notes |
+|---|---|---|---|
+| `XAI_API_KEY` | for Live + brag sheets | _(empty)_ | Study heads-up TTS (`POST /v1/voice/tts`), Live speak, and mission brag sheet (`POST /v1/concept-map` → Grok Imagine). Server-only. Get a key from [console.x.ai](https://console.x.ai/). |
+| `XAI_TTS_VOICE` | no | `eve` | Built-in voice id (`eve`, `ara`, `rex`, `sal`, …). |
 
-The process listens on `BIND_HOST:PORT` (default `http://127.0.0.1:8787`). `GET /health` returns:
+### Presage (camera accountability)
 
-```json
-{ "ok": true, "service": "waypoint-api", "storage": "file" }
-```
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `PRESAGE_API_KEY` | no | _(empty)_ | Vitals for `POST /v1/camera/observe`. Server-only — desktop uploads clips here and never holds this key on that path. Unset → presence heuristics only (`vitals=null`). |
 
-`storage` is `postgres` when `DATABASE_URL` is set.
+### Ollama / coach proxy
 
-**Connection status panel** (desktop Settings → Connection) uses `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, Copilot chat provider, Presage, and storage. Auth is optional (JWT enriches account + Calendar/Drive). Probe results are cached ~300s (`cache_ttl_seconds` in the payload). Indicator meanings: **[docs/STATUS.md](./docs/STATUS.md)**.
+| Variable | Required | Default / example | Notes |
+|---|---|---|---|
+| `OLLAMA_BASE_URL` | no | `http://127.0.0.1:11434` | Ollama on the **API host**. Omit to use the default; set empty (`OLLAMA_BASE_URL=`) to disable the coach proxy (`503 ollama_not_configured`). |
+| `OLLAMA_MODEL` | no | `qwen2.5:0.5b` | Fast lock-in coach (`ollama pull qwen2.5:0.5b`). |
+| `OLLAMA_VISION_MODEL` | no | `moondream` | Rare local vision (`ollama pull moondream`). |
+| `OLLAMA_CHAT_MODEL` | no | `qwen2.5:7b` | Copilot local path / Gemini fallback (`ollama pull qwen2.5:7b`). |
+| `OLLAMA_CHAT_NUM_CTX` | no | `16384` | Context window for local Copilot. |
+| `OLLAMA_ALLOWED_MODELS` | no | _(empty)_ | Extra models `/v1/coach/api/generate` may run (comma-separated). The three configured models above are always allowed. |
+| `COACH_API_TOKEN` | no | _(empty)_ | Optional shared Bearer for `/v1/coach/*`. `openssl rand -hex 24`. Signed-in Waypoint JWTs also work. |
 
-**Restart limitations (single process):** in-flight Google sign-in polls, **calendar-connect** polls (`/v1/google/calendar/start` → `/poll`), and **camera presence ladder / stress cooldowns** live in process memory. A restart drops them; the app simply starts the connect flow again (camera may re-nag the first away/stress rung). Already-completed grants and tokens are stored durably. Run one API process (no horizontal scaling) unless these are moved to shared storage.
+## File vs Postgres storage
+
+| Mode | `DATABASE_URL` | Data location | `GET /health` | When to use |
+|---|---|---|---|---|
+| **File** | unset / empty | `data/store.json` (+ `data/outbox.jsonl` for local email codes) | `"storage":"file"` | Solo laptop / hackathon laptop. Single machine only. |
+| **Postgres** | TigerData or any Postgres URL | remote DB; tables from `src/db/schema.sql` on boot | `"storage":"postgres"` | Multi-device sync, shared team server, production. |
+
+TigerData sketch: create a service → copy the connection string once → paste into `DATABASE_URL` → restart → confirm `/health` shows `postgres`.
+
+### Connection status (`GET /v1/status`)
+
+Desktop **Settings → Connection** calls `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, Copilot chat provider, companion Live, xAI TTS, Presage, and storage. Auth is optional (JWT enriches account + Calendar/Drive). Probe results are cached ~300s (`cache_ttl_seconds` in the payload). Process liveness alone remains at `GET /health`. Full indicator meanings and critical vs optional rows: **[docs/STATUS.md](./docs/STATUS.md)**.
+
+### Camera observe / accountability
+
+Contract and nudge policy: **[docs/CAMERA-ACCOUNTABILITY.md](./docs/CAMERA-ACCOUNTABILITY.md)** (`POST /v1/camera/observe`). Desktop may use **local live face** (continuous Vision / yaw / brightness on the Mac) as the primary presence path; the API still serves sparse clip observes and optional **Presage** vitals when `PRESAGE_API_KEY` is set and the client uploads video without posting local `face_detected`. Presage key stays on this server only.
+
+### Live voice / TTS (`XAI_API_KEY`)
+
+Talk / Live (`WS /v1/companion/live`) needs **`XAI_API_KEY`** (Grok TTS) in addition to Gemini Live credentials — Live cannot fall back to macOS `say`. Heads-up TTS (`POST /v1/voice/tts`) may fall back to `say` when xAI is unset; check `companion_live` / `xai_tts` rows on `GET /v1/status`. The same key draws the mission brag sheet (`POST /v1/concept-map`).
+
+### Restart limitations (single process)
+
+In-flight Google sign-in polls, **calendar-connect** polls (`/v1/google/calendar/start` → `/poll`), and **camera presence ladder / stress cooldowns** live in process memory. A restart drops them; the app simply starts the connect flow again (camera may re-nag the first away/stress rung). Already-completed grants and tokens are stored durably (file or Postgres). Run one API process (no horizontal scaling) unless these are moved to shared storage. After any `.env` or code change, **restart** the process.
 
 **Admin console:** the `wp_admin` cookie is `HttpOnly; SameSite=Strict` and gets `Secure` automatically when `PUBLIC_BASE_URL` starts with `https://`.
 
-`npm test` covers Google sign-in and email codes. Email tests inject a mailer, so they do not send mail. After any `.env` or code change, **restart** the process.
+## Testing
 
-## Google Cloud client
+```bash
+npm test
+```
 
-Create a **Web application** OAuth client. The desktop client already baked into Waypoint is a different credential and will not work as this redirect target.
+Runs Node’s built-in test runner on `test/*.test.ts` (needs Node ≥ 22; uses `--experimental-strip-types`). No extra test runner install. Suites are self-contained: they spin up ephemeral servers / temp stores and inject fakes where needed (email mailer, Gemini/Presage/Ollama fetch stubs) — they do **not** send real mail or burn live API quota.
 
-1. Open [Google Cloud Console](https://console.cloud.google.com/) and select the Waypoint project.
+| Suite | Covers |
+|---|---|
+| `auth.test.ts` | Google start/poll/callback, refresh rotation, `/v1/me`, sign-out, CORS localhost |
+| `email-auth.test.ts` | Email OTP start/verify (injected mailer; no SMTP) |
+| `google-token.test.ts` | Google disconnect, `DELETE /v1/me/data`, pending-file permissions |
+| `status.test.ts` | `GET /v1/status` probes, quota/Ollama rows, auth enrichment, cache TTL |
+| `product.test.ts` | Memory/tasks/sessions/notes, companion + Gemini chat fallbacks, calendar, digest hooks |
+| `camera-observe.test.ts` / `camera-presence.test.ts` | Observe HTTP contract + presence/nudge ladders |
+| `presage.test.ts` | Vitals mapping, stress thresholds, safe upload URL |
+| `coach.test.ts` | `/v1/coach/*` auth + Ollama proxy |
+| `companion-live.test.ts` / `live-chat.test.ts` / `audio-protocol.test.ts` | Live setup, isolated Live chat, WP1 PCM framing |
+| `voice-tts.test.ts` / `grok-tts.test.ts` | `POST /v1/voice/tts` + Grok stream/queue protocol (`XAI_API_KEY`) |
+| `gemini-chat.test.ts` / `localChat.test.ts` | REST chat errors/quota; `LOCAL_CHAT_PROVIDER` parsing |
+| `concept-map.test.ts` | Brag-sheet prompt / validation |
+| `school-digest.test.ts` / `liteDepth.test.ts` / `drive-*.test.ts` | Digest caching, Drive extract/cache/search/brief |
+| `calendar-window.test.ts` | Agenda window / timezone edges |
+| `admin.test.ts` / `abuse-shields.test.ts` | Admin login; rate limits / client IP |
+
+## Google Cloud client (local OAuth)
+
+Create a **Web application** OAuth client. A Desktop-type client (or any client baked into the Mac app) is a different credential and will **not** work as this API’s redirect target.
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) and select (or create) the Waypoint project.
 2. **APIs & Services → OAuth consent screen**. App name `Waypoint`. Add the Google accounts that will sign in while the app is in testing.
-3. Scopes: the desktop **sign-in is one bundled consent**: `openid email profile` + `https://www.googleapis.com/auth/calendar.events` + `https://www.googleapis.com/auth/drive.readonly`. Add all of them on the consent screen and enable the Google Calendar and Drive APIs. The separate calendar connect flow (`/v1/google/calendar/start`) re-requests Calendar + Drive as a second consent (re-connect / incremental) with the same data scopes.
-4. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
-5. Application type: **Web application**. Name: `Waypoint API`.
-6. Authorized redirect URI:
+3. Enable **Google Calendar API** and **Google Drive API**.
+4. Scopes: desktop **sign-in is one bundled consent**: `openid email profile` + `https://www.googleapis.com/auth/calendar.events` + `https://www.googleapis.com/auth/drive.readonly`. Add them on the consent screen. The separate calendar connect flow (`/v1/google/calendar/start`) re-requests Calendar + Drive as a second consent (re-connect / incremental).
+5. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
+6. Application type: **Web application**. Name: `Waypoint API`.
+7. Authorized redirect URIs for **local** (`PUBLIC_BASE_URL=http://127.0.0.1:8787`):
 
 ```text
 http://127.0.0.1:8787/v1/auth/google/callback
 http://127.0.0.1:8787/v1/google/calendar/callback
 ```
 
-Those URIs are `{PUBLIC_BASE_URL}` plus `/v1/auth/google/callback` and `/v1/google/calendar/callback`. If you change `PUBLIC_BASE_URL`, add the new URIs on the same client and restart the server.
+Those URIs are `{PUBLIC_BASE_URL}` + `/v1/auth/google/callback` and `/v1/google/calendar/callback`. If you change `PUBLIC_BASE_URL` (or deploy HTTPS), add matching URIs on the same client and restart the server. Production redirect URIs: **[DEPLOY.md](./DEPLOY.md)**.
 
-7. Copy the client id and client secret into `.env`.
+8. Copy the client id and client secret into `.env` as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
 
-## Coach / Ollama proxy (desktop lock-in)
+Blank Google credentials → `503 google_not_configured` on `POST /v1/auth/google/start`.
 
-Ollama runs **on this API host**, not on end-user Macs. The desktop app sets `local_llm_base` to `{PUBLIC_BASE_URL}/v1/coach` and sends a user JWT (or optional `COACH_API_TOKEN`).
+## Coach / Ollama (desktop lock-in)
+
+Ollama runs **on this API host**, not on end-user Macs. The desktop sets `local_llm_base` to `{PUBLIC_BASE_URL}/v1/coach` and sends a user JWT (or optional `COACH_API_TOKEN`).
 
 ```bash
-# On the API machine
+# On the API machine (install from https://ollama.com/download if needed)
 ollama serve
-ollama pull qwen2.5:0.5b    # lock-in
-ollama pull moondream       # rare vision
-ollama pull qwen2.5:7b      # Copilot fallback when Gemini is limited
-# in .env:
-# OLLAMA_BASE_URL=http://127.0.0.1:11434
-# OLLAMA_CHAT_MODEL=qwen2.5:7b
-# COACH_API_TOKEN=<openssl rand -hex 24>   # optional
+ollama pull qwen2.5:0.5b    # lock-in coach (OLLAMA_MODEL)
+ollama pull moondream       # rare local vision (OLLAMA_VISION_MODEL)
+ollama pull qwen2.5:7b      # Copilot fallback / LOCAL_CHAT_PROVIDER=ollama (OLLAMA_CHAT_MODEL)
+
+# Confirm tags
+curl -s http://127.0.0.1:11434/api/tags | head
+```
+
+Typical `.env` for local coach:
+
+```env
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen2.5:0.5b
+OLLAMA_VISION_MODEL=moondream
+OLLAMA_CHAT_MODEL=qwen2.5:7b
+# COACH_API_TOKEN=   # optional; openssl rand -hex 24
 ```
 
 | Method | Path | Proxies to |
@@ -95,11 +241,36 @@ ollama pull qwen2.5:7b      # Copilot fallback when Gemini is limited
 | `POST` | `/v1/coach/api/generate` | `POST {OLLAMA_BASE_URL}/api/generate` |
 | `GET` | `/v1/coach/health` | tags probe + `{ ok, ollama }` |
 
-Auth: matching `COACH_API_TOKEN`, **or** a signed-in Waypoint access token. Generate bodies are capped at 4 MiB. CORS allows `tauri://localhost`, `http(s)://tauri.localhost`, and `http(s)://localhost` / `127.0.0.1`. Errors: `503 ollama_not_configured` if `OLLAMA_BASE_URL` is blank; `502 ollama_unreachable` if Ollama is down or times out.
+Auth: matching `COACH_API_TOKEN`, **or** a signed-in Waypoint access token. Generate bodies are capped at 4 MiB. CORS allows `tauri://localhost`, `http(s)://tauri.localhost`, and `http(s)://localhost` / `127.0.0.1`. Extra origins: `WAYPOINT_CORS_ORIGINS` (comma-separated). Errors: `503 ollama_not_configured` if `OLLAMA_BASE_URL` is blank; `502 ollama_unreachable` if Ollama is down or times out.
+
+## Production
+
+For HTTPS, nginx/Caddy, systemd, TigerData, production Google redirect URIs, and pointing Mac release builds at a public API, follow **[DEPLOY.md](./DEPLOY.md)** end-to-end. Do not ship apps with `PUBLIC_BASE_URL=http://127.0.0.1:8787`.
+
+## Pairing with the desktop app
+
+| This API (`.env`) | Desktop (`src-tauri/secrets.toml`) |
+|---|---|
+| `PUBLIC_BASE_URL` | `waypoint_api_base` — **must be identical** (scheme + host + port, no trailing slash mismatch) |
+| `{PUBLIC_BASE_URL}/v1/coach` | `local_llm_base` (coach / Ollama proxy) |
+
+Google OAuth redirect URIs on the Web client must use the same `PUBLIC_BASE_URL`. After changing either side, restart the API and rebuild/relaunch the Mac app so secrets and redirects stay aligned.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Google login never completes / `google_not_configured` | Missing `GOOGLE_CLIENT_*`, wrong redirect URI, or `PUBLIC_BASE_URL` ≠ desktop `waypoint_api_base` | Fill Web client secrets; add `{PUBLIC_BASE_URL}/v1/auth/google/callback` (and calendar callback); match desktop base; restart API |
+| Poll stuck / lost after restart mid-login | In-memory OAuth polls cleared on process restart | Start Google sign-in again (tokens already issued remain durable) |
+| Gemini chat / status shows Quota / 429 | Free-tier REST RPM/RPD exhausted (`GEMINI_API_KEY`) | Wait for quota reset; rely on Ollama fallback (`OLLAMA_CHAT_MODEL`) or set `LOCAL_CHAT_PROVIDER=ollama`; prefer Connection panel over hammering chat |
+| Coach / lock-in local judge fails; `502 ollama_unreachable` | Ollama not running on the API host, wrong `OLLAMA_BASE_URL`, or models not pulled | `ollama serve` + pull `qwen2.5:0.5b` / `moondream` / `qwen2.5:7b`; check `GET /v1/coach/health` |
+| Camera vitals empty / Presage Unavailable on status | `PRESAGE_API_KEY` unset or Presage transport failed | Set key for optional vitals; desktop local live face still covers presence — see [CAMERA-ACCOUNTABILITY.md](./docs/CAMERA-ACCOUNTABILITY.md) |
+| Talk / Live silent or `xai_tts` warn | Missing `XAI_API_KEY` | Set key; Live hard-requires Grok TTS (heads-ups may use macOS `say` without it) |
+| CORS errors from webview / wrong bind | Origin not allowed, or `BIND_HOST` not reachable from the Mac | Default CORS covers Tauri/localhost; add `WAYPOINT_CORS_ORIGINS` if needed. Local-only: `BIND_HOST=127.0.0.1`. LAN/deploy: bind `0.0.0.0` behind a reverse proxy and set `PUBLIC_BASE_URL` to the public HTTPS origin |
 
 ## Calling the API from Waypoint
 
-Base URL: `http://127.0.0.1:8787`, or whatever host you deploy this process on. Call it from Rust (`reqwest` is already in the app), the same way `connect_google` opens the system browser today. The webview may also call it: `http://localhost`, `http://127.0.0.1`, and `tauri://localhost` are allowed CORS origins.
+Base URL: whatever you set as `PUBLIC_BASE_URL` / desktop `waypoint_api_base` (default local `http://127.0.0.1:8787`). Call it from Rust (`reqwest` is already in the app), the same way `connect_google` opens the system browser today. The webview may also call it: `http://localhost`, `http://127.0.0.1`, and `tauri://localhost` are allowed CORS origins.
 
 Replace the placeholder `sign_in_waypoint` / `sign_out_waypoint` commands. Calendar connect below replaces the desktop Google client secret for events Waypoint creates. The field-by-field contract is `specs.md`.
 
@@ -223,7 +394,7 @@ During a lock-in, the desktop opens a **thin** WebSocket to this API only:
 
 `WS /v1/companion/live?access_token=ACCESS_TOKEN`
 
-Protocol mirrors [gemini_live_demo](https://github.com/legitminh/gemini_live_demo): `start` → mic `audio` / typed `text` / `barge` / `stop`. This server holds `GEMINI_API_KEY`, opens Gemini Live upstream, and streams transcripts + native audio back. Optional study context is sent on `start`. Typed fallback (no Live): `POST /v1/companion/chat`.
+Protocol mirrors [gemini_live_demo](https://github.com/legitminh/gemini_live_demo): `start` → mic `audio` / typed `text` / `barge` / `stop`. This server holds `GEMINI_API_KEY`, opens Gemini Live upstream (`GEMINI_LIVE_MODEL`), and streams transcripts + audio back via **Grok TTS (`XAI_API_KEY` required — no `say` fallback for Live)**. Optional study context is sent on `start`. Typed fallback (no Live): `POST /v1/companion/chat`.
 
 ## Rust sketch
 
@@ -361,7 +532,7 @@ The shipping Mac app calls a **narrow** authenticated surface. Other product rou
 | `/v1/coach/api/*`, `POST /v1/voice/tts`, `POST /v1/concept-map` | Calendar write/agenda, Drive folders |
 | Google connect summary, Drive search/inventory/deep-brief | Synonyms: `google/calendar/*` ≈ `google/connect/*` |
 | `GET/PUT /v1/study-memory`, school-digest | — |
-| `POST /v1/camera/observe` | — |
+| `POST /v1/camera/observe` (desktop may prefer local live face; API still serves observe + Presage) | — |
 
 **Lock-in cloud persistence:** the Mac syncs mission history via **`PUT /v1/study-memory` only**. `POST /v1/tasks` and `POST /v1/sessions` are **not** wired from lock-in start/stop (admin / future recap APIs). Camera observe still uses the desktop’s local `session_id`.
 

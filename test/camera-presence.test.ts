@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  LOOK_AWAY_TEXT,
+  LOOK_BACK_COOLDOWN_MS,
+  LOOK_BACK_KIND,
   mapStressedToNudge,
+  NUDGE_REEMIT_MS,
   observePresence,
+  PRESENCE_TIMINGS,
   shouldSuggestBreak,
   STRESS_COOLDOWN_MS,
   STRESSED_BREATH_KIND,
@@ -88,12 +93,13 @@ test("absence ladder then quiet; silent on break and paused", () => {
   });
   assert.equal(onPaused.nudge, null);
 
-  // Before 3 min: no second rung yet.
+  // Before 3 min: ack first rung so we do not re-emit; no second rung yet.
   const mid = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
+    lastNudgeAck: "left_desk",
     now: at(t0 + 70_000),
   });
   assert.equal(mid.nudge, null);
@@ -116,6 +122,7 @@ test("absence ladder then quiet; silent on break and paused", () => {
     sessionId: "s",
     phase: "active",
     faceDetected: false,
+    lastNudgeAck: SUGGEST_BREAK_KIND,
     now: at(t0 + 600_000),
   });
   assert.equal(pause.nudge?.kind, "left_desk_pause");
@@ -127,6 +134,7 @@ test("absence ladder then quiet; silent on break and paused", () => {
     sessionId: "s",
     phase: "active",
     faceDetected: false,
+    lastNudgeAck: "left_desk_pause",
     now: at(t0 + 700_000),
   });
   assert.equal(quiet.nudge, null);
@@ -159,12 +167,13 @@ test("30s observe cadence: first left_desk on confirming away (~30s), not an ext
   assert.equal(first.nudge?.kind, "left_desk");
   assert.match(first.nudge!.text, /stepped away/i);
 
-  // Next ticks before 3 min: no second rung.
+  // Next ticks before 3 min: ack delivery; no second rung.
   const mid = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
+    lastNudgeAck: "left_desk",
     now: at(t0 + 2 * cadence),
   });
   assert.equal(mid.nudge, null);
@@ -185,6 +194,7 @@ test("30s observe cadence: first left_desk on confirming away (~30s), not an ext
     sessionId: "s",
     phase: "active",
     faceDetected: false,
+    lastNudgeAck: SUGGEST_BREAK_KIND,
     now: at(t0 + 20 * cadence),
   });
   assert.equal(pauseAck.nudge?.kind, "left_desk_pause");
@@ -194,6 +204,7 @@ test("30s observe cadence: first left_desk on confirming away (~30s), not an ext
     sessionId: "s",
     phase: "active",
     faceDetected: false,
+    lastNudgeAck: "left_desk_pause",
     now: at(t0 + 21 * cadence),
   });
   assert.equal(quiet.nudge, null);
@@ -569,8 +580,371 @@ test("obstructed camera line fires after held delay with helpful non-shaming lin
     faceDetected: null,
     brightness: 10,
     brightnessMeasured: true,
-    now: at(t0 + 30_000),
+    now: at(t0 + 8_000),
   });
   assert.equal(held.nudge?.kind, "camera_obstructed");
   assert.match(held.nudge!.text, /camera|lighting/i);
+});
+
+test("PRESENCE_TIMINGS mirrors Dhanvi glance / look-away / first_callback", () => {
+  assert.equal(PRESENCE_TIMINGS.glanceIgnoreS, 8);
+  assert.equal(PRESENCE_TIMINGS.lookUpOrAwayS, 30);
+  assert.equal(PRESENCE_TIMINGS.lookAwayConfirmObserves, 1);
+  assert.equal(PRESENCE_TIMINGS.lookDownConfirmObserves, 2);
+  assert.equal(PRESENCE_TIMINGS.leftFrameFirstCallbackMs, 25_000);
+  assert.equal(PRESENCE_TIMINGS.leftFrameFirstCallbackDemoMs, 10_000);
+  assert.equal(PRESENCE_TIMINGS.cameraObstructedMs, 8_000);
+});
+
+test("looking_away confirms on first observe with look_back", () => {
+  const store = new CameraSessionStore();
+  const t0 = 7_500_000;
+  const away = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_away",
+    now: at(t0),
+  });
+  assert.equal(away.presence, "present");
+  assert.equal(away.nudge?.kind, LOOK_BACK_KIND);
+  assert.equal(away.nudge!.text, LOOK_AWAY_TEXT);
+  assert.equal(away.nudge!.text, "You're looking away. Turn back to the work.");
+  assert.notEqual(away.nudge?.kind, "left_desk");
+});
+
+test("looking_away never becomes left_desk even if faceDetected is false", () => {
+  const store = new CameraSessionStore();
+  const t0 = 7_600_000;
+  const a = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    attention: "looking_away",
+    now: at(t0),
+  });
+  assert.equal(a.presence, "present");
+  assert.equal(a.nudge?.kind, LOOK_BACK_KIND);
+});
+
+test("looking_down confirms then emits look_back; single glance does not", () => {
+  const store = new CameraSessionStore();
+  const t0 = 7_000_000;
+  const glance = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_down",
+    now: at(t0),
+  });
+  assert.equal(glance.presence, "present");
+  assert.equal(glance.nudge, null);
+  assert.notEqual(glance.nudge?.kind, "left_desk");
+
+  const confirmed = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_down",
+    now: at(t0 + 1_000),
+  });
+  assert.equal(confirmed.presence, "present");
+  assert.equal(confirmed.nudge?.kind, LOOK_BACK_KIND);
+  const wordCount = confirmed.nudge!.text
+    .trim()
+    .split(/\s+/)
+    .filter((w) => /\w/.test(w)).length;
+  assert.ok(wordCount <= 12, `look_back copy must stay ≤12 words (got ${wordCount})`);
+  assert.match(confirmed.nudge!.text, /eyes on the work/i);
+  // Soft hedge only — not a hard phone accusation (needs box detector; Audit E).
+  assert.match(confirmed.nudge!.text, /if you're on it/i);
+});
+
+test("looking_down never becomes left_desk even if faceDetected is false", () => {
+  const store = new CameraSessionStore();
+  const t0 = 7_200_000;
+  const a = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    attention: "looking_down",
+    now: at(t0),
+  });
+  assert.equal(a.presence, "present");
+  assert.notEqual(a.nudge?.kind, "left_desk");
+
+  const b = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    attention: "looking_down",
+    now: at(t0 + 1_000),
+  });
+  assert.equal(b.presence, "present");
+  assert.equal(b.nudge?.kind, LOOK_BACK_KIND);
+  assert.notEqual(b.nudge?.kind, "left_desk");
+});
+
+test("look_back respects sparse cooldown; brief looking_down resets confirm", () => {
+  const store = new CameraSessionStore();
+  const t0 = 7_400_000;
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_down",
+    now: at(t0),
+  });
+  const first = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_down",
+    now: at(t0 + 1_000),
+  });
+  assert.equal(first.nudge?.kind, LOOK_BACK_KIND);
+
+  const duringCooldown = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_down",
+    now: at(t0 + 30_000),
+  });
+  assert.equal(duringCooldown.presence, "present");
+  assert.equal(duringCooldown.nudge, null);
+
+  const afterCooldown = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_down",
+    now: at(t0 + LOOK_BACK_COOLDOWN_MS + 2_000),
+  });
+  assert.equal(afterCooldown.nudge?.kind, LOOK_BACK_KIND);
+
+  // Eyes up then a single looking_down glance — must re-confirm.
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "present",
+    now: at(t0 + LOOK_BACK_COOLDOWN_MS + 10_000),
+  });
+  const glance = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    attention: "looking_down",
+    now: at(t0 + LOOK_BACK_COOLDOWN_MS + 11_000),
+  });
+  assert.equal(glance.nudge, null);
+});
+
+test("look_back stays silent on break and paused", () => {
+  const store = new CameraSessionStore();
+  const t0 = 7_600_000;
+  for (const phase of ["break", "paused"] as const) {
+    observePresence(store, {
+      userId: "u",
+      sessionId: `s-${phase}`,
+      phase,
+      faceDetected: true,
+      attention: "looking_down",
+      now: at(t0),
+    });
+    const out = observePresence(store, {
+      userId: "u",
+      sessionId: `s-${phase}`,
+      phase,
+      faceDetected: true,
+      attention: "looking_down",
+      now: at(t0 + 1_000),
+    });
+    assert.equal(out.presence, "present", `presence present on phase=${phase}`);
+    assert.equal(out.nudge, null, `expected silence on phase=${phase}`);
+  }
+});
+
+test("speak-ack: drop then ack consumes left_desk; ladder can advance", () => {
+  const store = new CameraSessionStore();
+  const t0 = 8_000_000;
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0),
+  });
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 1_000),
+  });
+  const first = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 25_000),
+  });
+  assert.equal(first.nudge?.kind, "left_desk");
+
+  // Desktop dropped speak — no ack yet; within re-emit window → quiet.
+  const beforeReemit = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 25_000 + NUDGE_REEMIT_MS - 1),
+  });
+  assert.equal(beforeReemit.nudge, null);
+
+  // Ack arrives → rung consumed; still under 3 min → no next rung.
+  const acked = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    lastNudgeAck: "left_desk",
+    now: at(t0 + 25_000 + NUDGE_REEMIT_MS + 1_000),
+  });
+  assert.equal(acked.nudge, null);
+
+  const session = store.get("u", "s");
+  assert.ok(session?.ladderSpoken.has("first"));
+  assert.equal(session?.pendingLadderNudge, null);
+
+  // After ack, second rung can fire at ~3 min.
+  const second = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 180_000),
+  });
+  assert.equal(second.nudge?.kind, SUGGEST_BREAK_KIND);
+});
+
+test("speak-ack: re-emit unacked left_desk sparsely; wrong ack does not consume", () => {
+  const store = new CameraSessionStore();
+  const t0 = 8_200_000;
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0),
+  });
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 1_000),
+  });
+  const first = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 25_000),
+  });
+  assert.equal(first.nudge?.kind, "left_desk");
+
+  // Wrong kind must not clear pending.
+  const wrongAck = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    lastNudgeAck: "look_back",
+    now: at(t0 + 25_000 + 5_000),
+  });
+  assert.equal(wrongAck.nudge, null);
+  assert.ok(store.get("u", "s")?.pendingLadderNudge);
+
+  const reemit = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 25_000 + NUDGE_REEMIT_MS),
+  });
+  assert.equal(reemit.nudge?.kind, "left_desk");
+  assert.match(reemit.nudge!.text, /stepped away/i);
+
+  // Still unacked — must not advance to suggest_break even past 3 min.
+  const stuck = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 180_000),
+  });
+  assert.equal(stuck.nudge?.kind, "left_desk");
+  assert.ok(!store.get("u", "s")?.ladderSpoken.has("first"));
+});
+
+test("speak-ack: no infinite spam after ack", () => {
+  const store = new CameraSessionStore();
+  const t0 = 8_400_000;
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0),
+  });
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 1_000),
+  });
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 25_000),
+  });
+
+  // Ack on next observe.
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    lastNudgeAck: "left_desk",
+    now: at(t0 + 26_000),
+  });
+
+  // Many later observes before second rung — never re-spam left_desk.
+  for (let i = 1; i <= 5; i++) {
+    const tick = observePresence(store, {
+      userId: "u",
+      sessionId: "s",
+      phase: "active",
+      faceDetected: false,
+      lastNudgeAck: "left_desk", // idempotent leftover ack
+      now: at(t0 + 26_000 + i * NUDGE_REEMIT_MS),
+    });
+    assert.equal(tick.nudge, null, `unexpected nudge at tick ${i}`);
+  }
 });

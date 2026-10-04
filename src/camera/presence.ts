@@ -10,6 +10,8 @@ import {
   type PresenceState,
 } from "./sessionStore.ts";
 
+export type { PendingLadderNudge } from "./sessionStore.ts";
+
 export type CameraPhase = "active" | "paused" | "break";
 
 /** Desktop: when kind === "suggest_break" → emit-only `suggest_break_timer` (never auto-start). */
@@ -24,6 +26,17 @@ export type PresenceNudge = {
   text: string;
 };
 
+/**
+ * Local Vision posture from desktop (F1).
+ * looking_down = face present, head-down / phone lap.
+ * looking_away = face present, head yaw / off-center (not facing screen).
+ */
+export type AttentionSignal =
+  | "present"
+  | "absent"
+  | "looking_down"
+  | "looking_away";
+
 export type ObservePresenceInput = {
   userId: string;
   sessionId: string;
@@ -35,6 +48,13 @@ export type ObservePresenceInput = {
    * Obstructed only applies to a measured low reading, and never overrides a detected face.
    */
   brightnessMeasured?: boolean;
+  /** Optional posture from client; looking_down/away never count as left_desk. */
+  attention?: AttentionSignal | null;
+  /**
+   * Desktop ack of last successfully delivered camera nudge kind (F4).
+   * Consumes `pendingLadderNudge` when it matches; otherwise that rung re-emits sparsely.
+   */
+  lastNudgeAck?: string | null;
   stressed?: boolean | null;
   now?: Date;
 };
@@ -46,9 +66,33 @@ export type ObservePresenceResult = {
 };
 
 /** Need 2 away observes (or held candidate time) so a single glance does not confirm leave. */
-const AWAY_CONFIRM_OBSERVES = 2;
+export const AWAY_CONFIRM_OBSERVES = 2;
 /** Time-based confirm when observes are denser than the ~25–30s desktop cadence. */
-const AWAY_CONFIRM_MS = 5_000;
+export const AWAY_CONFIRM_MS = 5_000;
+/** looking_down: slightly cautious — 2 observes or short hold (phone-lap posture). */
+export const LOOK_DOWN_CONFIRM_OBSERVES = 2;
+export const LOOK_DOWN_CONFIRM_MS = 5_000;
+/**
+ * looking_away: client may already majority-vote yaw — fire on first observe
+ * (or ~3s hold if ticks are denser).
+ */
+export const LOOK_AWAY_CONFIRM_OBSERVES = 1;
+export const LOOK_AWAY_CONFIRM_MS = 3_000;
+/**
+ * Sparse look_back cooldown (~45s band). Shared with stress-family spirit:
+ * not every observe tick.
+ */
+export const LOOK_BACK_COOLDOWN_MS = 45_000;
+export const LOOK_BACK_KIND = "look_back" as const;
+/**
+ * Sparse re-emit of an unacked ladder nudge (~one desktop observe cycle).
+ * Prevents silent consume when overlay/TTS drops the first delivery.
+ */
+export const NUDGE_REEMIT_MS = 30_000;
+/** Dhanvi presence.first_callback_s — first left_desk rung after confirmed leave. */
+export const LEFT_FRAME_FIRST_CALLBACK_MS = 25_000;
+/** Dhanvi demo profile first_callback_s (not wired as a runtime switch). */
+export const LEFT_FRAME_FIRST_CALLBACK_DEMO_MS = 10_000;
 /**
  * Absence ladder after left_frame is confirmed (active only) — case-catalog D1 spirit.
  * Timings are wall-clock from when the away candidate began (not from confirm tick),
@@ -67,7 +111,7 @@ const AWAY_CONFIRM_MS = 5_000;
 const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: string }> = [
   {
     step: "first",
-    afterMs: 25_000,
+    afterMs: LEFT_FRAME_FIRST_CALLBACK_MS,
     kind: "left_desk",
     text: "You've stepped away. Come back to the work when you can.",
   },
@@ -86,7 +130,34 @@ const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: str
     text: "I'll stay quiet until you're back at the desk.",
   },
 ];
-const OBSTRUCTED_MS = 30_000;
+/**
+ * Cover / dark lens — speak sooner than a full away ladder for snappy UX
+ * (Waypoint ~8s; Dhanvi presence held ~30s before speaking).
+ */
+export const OBSTRUCTED_MS = 8_000;
+/**
+ * VIDEOINPUT-aligned timing reference for FE/BE sync.
+ * Continuous gaze is primarily desktop live-feed; BE merges `client_meta.attention`
+ * on sparse clip observes. Prefer FE-local presence for sub-~25s ticks — a
+ * meta-only observe path would still hit the ~1/25s rate limit.
+ *
+ * Dhanvi attention.yaml: glance_ignore_s=8, look_up_or_away_s=30 (FE hold before
+ * posting looking_away). BE confirms looking_away fast once posted.
+ */
+export const PRESENCE_TIMINGS = {
+  glanceIgnoreS: 8,
+  lookUpOrAwayS: 30,
+  lookAwayConfirmObserves: LOOK_AWAY_CONFIRM_OBSERVES,
+  lookAwayConfirmMs: LOOK_AWAY_CONFIRM_MS,
+  lookDownConfirmObserves: LOOK_DOWN_CONFIRM_OBSERVES,
+  lookDownConfirmMs: LOOK_DOWN_CONFIRM_MS,
+  leftFrameFirstCallbackMs: LEFT_FRAME_FIRST_CALLBACK_MS,
+  leftFrameFirstCallbackDemoMs: LEFT_FRAME_FIRST_CALLBACK_DEMO_MS,
+  cameraObstructedMs: OBSTRUCTED_MS,
+  lookBackCooldownMs: LOOK_BACK_COOLDOWN_MS,
+  awayConfirmObserves: AWAY_CONFIRM_OBSERVES,
+  awayConfirmMs: AWAY_CONFIRM_MS,
+} as const;
 /** Shared cooldown for stress-family nudges (`suggest_break` | `stressed`). */
 export const STRESS_COOLDOWN_MS = 180_000;
 const RETURN_CONFIRM_MS = 2_000;
@@ -100,6 +171,15 @@ const WELCOME_BACK_TEXT =
   "Welcome back — good to see you. Let's pick the work back up.";
 const CAMERA_OBSTRUCTED_TEXT =
   "I can't see you clearly. Check the camera or lighting.";
+/**
+ * Face still present (looking_down posture) — not left_desk, not Presage phone.
+ * Phone only as soft hedge; real phone accusation needs a box detector (Audit E).
+ */
+export const LOOK_BACK_TEXT =
+  "Eyes on the work — put the phone down if you're on it.";
+/** Dhanvi head_turned / looking_away line (speak once, then cooldown). */
+export const LOOK_AWAY_TEXT =
+  "You're looking away. Turn back to the work.";
 
 /** Pause and break phases: no spoken nudges. */
 export function isSilentCameraPhase(phase: CameraPhase): boolean {
@@ -143,9 +223,96 @@ function resetAbsence(session: CameraPresenceSession): void {
   session.ladderSpoken.clear();
   session.linesSpoken = 0;
   session.ladderQuiet = false;
+  session.pendingLadderNudge = null;
   session.leftConfirmed = false;
   session.welcomedBack = false;
   session.presentSince = null;
+}
+
+/** Consume pending ladder rung when desktop acks the same kind. */
+function applyLadderAck(
+  session: CameraPresenceSession,
+  lastNudgeAck: string | null | undefined,
+): void {
+  const pending = session.pendingLadderNudge;
+  if (!pending || typeof lastNudgeAck !== "string" || !lastNudgeAck) return;
+  if (lastNudgeAck !== pending.kind) return;
+  session.ladderSpoken.add(pending.step);
+  if (pending.step === "pause") session.ladderQuiet = true;
+  session.pendingLadderNudge = null;
+}
+
+/**
+ * Re-emit unacked ladder nudge after NUDGE_REEMIT_MS, or null while waiting.
+ * Blocks advancing to the next rung until ack.
+ */
+function ladderNudgeFromPending(
+  session: CameraPresenceSession,
+  silentPhase: boolean,
+  now: Date,
+): PresenceNudge | null {
+  const pending = session.pendingLadderNudge;
+  if (!pending || silentPhase) return null;
+  if (now.getTime() - pending.lastEmittedAt.getTime() < NUDGE_REEMIT_MS) {
+    return null;
+  }
+  pending.lastEmittedAt = now;
+  return { kind: pending.kind, text: pending.text };
+}
+
+function resetLookingDown(session: CameraPresenceSession): void {
+  session.lookingDownCandidateSince = null;
+  session.consecutiveLookingDown = 0;
+}
+
+function isGazeAway(attention: AttentionSignal | null | undefined): boolean {
+  return attention === "looking_down" || attention === "looking_away";
+}
+
+/**
+ * Sustained looking_down / looking_away → sparse look_back.
+ * Honest in-frame posture signal (Audit E): face still here — never left_desk,
+ * never invent Presage phone. looking_away confirms faster (yaw already majority
+ * on the client); looking_down keeps a short 2-observe confirm.
+ */
+function mapLookingDownToNudge(opts: {
+  attention: AttentionSignal | null | undefined;
+  silentPhase: boolean;
+  session: CameraPresenceSession;
+  now: Date;
+  cooldownMs?: number;
+}): PresenceNudge | null {
+  if (!isGazeAway(opts.attention)) {
+    resetLookingDown(opts.session);
+    return null;
+  }
+
+  opts.session.consecutiveLookingDown += 1;
+  if (opts.session.lookingDownCandidateSince == null) {
+    opts.session.lookingDownCandidateSince = opts.now;
+  }
+  const held =
+    opts.now.getTime() - opts.session.lookingDownCandidateSince.getTime();
+  const needObserves =
+    opts.attention === "looking_away"
+      ? LOOK_AWAY_CONFIRM_OBSERVES
+      : LOOK_DOWN_CONFIRM_OBSERVES;
+  const needHoldMs =
+    opts.attention === "looking_away"
+      ? LOOK_AWAY_CONFIRM_MS
+      : LOOK_DOWN_CONFIRM_MS;
+  const confirmed =
+    opts.session.consecutiveLookingDown >= needObserves || held >= needHoldMs;
+  if (!confirmed || opts.silentPhase) return null;
+
+  const cooldown = opts.cooldownMs ?? LOOK_BACK_COOLDOWN_MS;
+  const last = opts.session.lastLookBackNudgeAt?.getTime() ?? 0;
+  if (opts.now.getTime() - last < cooldown) return null;
+
+  opts.session.lastLookBackNudgeAt = opts.now;
+  const text =
+    opts.attention === "looking_away" ? LOOK_AWAY_TEXT : LOOK_BACK_TEXT;
+  return { kind: LOOK_BACK_KIND, text };
 }
 
 /**
@@ -194,6 +361,9 @@ export function observePresence(
   const session = store.getOrCreate(input.userId, input.sessionId, now);
   const silentPhase = isSilentCameraPhase(input.phase);
 
+  // Desktop speak-ack: consume pending ladder rung only after successful delivery.
+  applyLadderAck(session, input.lastNudgeAck);
+
   // Quiet phases: hold the stress cooldown clock so we do not fire a stress
   // line the moment the user leaves break/pause (a five-minute break already
   // outlasts STRESS_COOLDOWN_MS).
@@ -201,15 +371,23 @@ export function observePresence(
     session.lastStressNudgeAt = now;
   }
 
-  const raw = classify(
+  let raw = classify(
     input.faceDetected,
     input.brightness ?? null,
     input.brightnessMeasured,
   );
+  // Gaze-away means face is still in frame — never left_desk.
+  if (
+    isGazeAway(input.attention) &&
+    (raw === "left_frame" || raw === "uncertain")
+  ) {
+    raw = "present";
+  }
 
   let nudge: PresenceNudge | null = null;
 
   if (raw === "camera_obstructed") {
+    resetLookingDown(session);
     session.presence = "camera_obstructed";
     session.presentSince = null;
     if (session.obstructedSince == null) session.obstructedSince = now;
@@ -228,6 +406,7 @@ export function observePresence(
   if (raw === "present") session.obstructedSaid = false;
 
   if (raw === "uncertain") {
+    resetLookingDown(session);
     // Ignore brief uncertainty — do not chatter.
     if (session.presence !== "left_frame") {
       session.presence = "uncertain";
@@ -236,6 +415,7 @@ export function observePresence(
   }
 
   if (raw === "left_frame") {
+    resetLookingDown(session);
     session.consecutiveAway += 1;
     if (session.awayCandidateSince == null) session.awayCandidateSince = now;
     const heldCandidate = now.getTime() - session.awayCandidateSince.getTime();
@@ -258,19 +438,28 @@ export function observePresence(
     session.presence = "left_frame";
     const absentMs = now.getTime() - session.absentSince.getTime();
 
-    // Quiet on paused/break; after pause-ack stay silent for this absence.
+    // Quiet on paused/break; after pause rung is acked stay silent for this absence.
+    // Unacked rungs stay pending and re-emit sparsely — never permanently consume on emit.
     if (!silentPhase && !session.ladderQuiet) {
-      for (const rung of LADDER) {
-        if (session.ladderSpoken.has(rung.step) || absentMs < rung.afterMs) continue;
-        session.ladderSpoken.add(rung.step);
-        session.linesSpoken += 1;
-        nudge = { kind: rung.kind, text: rung.text };
-        if (rung.kind === SUGGEST_BREAK_KIND) {
-          session.lastStressNudgeAt = now;
-          session.lastStressNudgeKind = SUGGEST_BREAK_KIND;
+      if (session.pendingLadderNudge) {
+        nudge = ladderNudgeFromPending(session, silentPhase, now);
+      } else {
+        for (const rung of LADDER) {
+          if (session.ladderSpoken.has(rung.step) || absentMs < rung.afterMs) continue;
+          session.linesSpoken += 1;
+          nudge = { kind: rung.kind, text: rung.text };
+          session.pendingLadderNudge = {
+            step: rung.step,
+            kind: rung.kind,
+            text: rung.text,
+            lastEmittedAt: now,
+          };
+          if (rung.kind === SUGGEST_BREAK_KIND) {
+            session.lastStressNudgeAt = now;
+            session.lastStressNudgeKind = SUGGEST_BREAK_KIND;
+          }
+          break;
         }
-        if (rung.step === "pause") session.ladderQuiet = true;
-        break;
       }
     }
     return { presence: session.presence, nudge, watching_note: watchingNote(session.presence) };
@@ -301,6 +490,18 @@ export function observePresence(
   }
 
   session.presence = "present";
+
+  // Gaze-away (face still here) before stress — posture nudge is more specific.
+  if (!nudge) {
+    nudge = mapLookingDownToNudge({
+      attention: input.attention,
+      silentPhase,
+      session,
+      now,
+    });
+  } else if (!isGazeAway(input.attention)) {
+    resetLookingDown(session);
+  }
 
   if (!nudge) {
     const last = session.lastStressNudgeAt?.getTime() ?? 0;

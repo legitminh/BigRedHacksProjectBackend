@@ -4,6 +4,14 @@ export type PresenceState = "present" | "left_frame" | "uncertain" | "camera_obs
 
 export type LadderStep = "first" | "second" | "pause";
 
+/** Ladder nudge awaiting desktop `client_meta.last_nudge_ack` (F4 speak-ack). */
+export type PendingLadderNudge = {
+  step: LadderStep;
+  kind: string;
+  text: string;
+  lastEmittedAt: Date;
+};
+
 export interface CameraPresenceSession {
   presence: PresenceState;
   /** When consecutive away observations / held time began (pre-confirm). */
@@ -13,11 +21,16 @@ export interface CameraPresenceSession {
   absentSince: Date | null;
   /** When continuous presence resumed after absence. */
   presentSince: Date | null;
-  /** Ladder steps already spoken this absence. */
+  /** Ladder steps acked (delivered) this absence — not set until desktop ack. */
   ladderSpoken: Set<LadderStep>;
   linesSpoken: number;
-  /** After pause-ack, stay quiet on the ladder. */
+  /** After pause rung is acked, stay quiet on the ladder. */
   ladderQuiet: boolean;
+  /**
+   * Last ladder nudge emitted but not yet acked by desktop.
+   * Re-emitted sparsely until `last_nudge_ack` matches `kind`.
+   */
+  pendingLadderNudge: PendingLadderNudge | null;
   /** Welcome-back already spoken for this return. */
   welcomedBack: boolean;
   /** Confirmed leave this cycle (eligible for welcome-back). */
@@ -27,6 +40,11 @@ export interface CameraPresenceSession {
   lastStressNudgeAt: Date | null;
   /** Last stress-family nudge kind (`suggest_break` | `stressed`) for alternation. */
   lastStressNudgeKind: "suggest_break" | "stressed" | null;
+  /** When consecutive looking_down observations / held time began (pre-confirm). */
+  lookingDownCandidateSince: Date | null;
+  consecutiveLookingDown: number;
+  /** Last look_back nudge (sparse cooldown). */
+  lastLookBackNudgeAt: Date | null;
   lastSeenAt: Date;
 }
 
@@ -44,12 +62,16 @@ export function createEmptySession(now: Date): CameraPresenceSession {
     ladderSpoken: new Set(),
     linesSpoken: 0,
     ladderQuiet: false,
+    pendingLadderNudge: null,
     welcomedBack: false,
     leftConfirmed: false,
     obstructedSince: null,
     obstructedSaid: false,
     lastStressNudgeAt: null,
     lastStressNudgeKind: null,
+    lookingDownCandidateSince: null,
+    consecutiveLookingDown: 0,
+    lastLookBackNudgeAt: null,
     lastSeenAt: now,
   };
 }

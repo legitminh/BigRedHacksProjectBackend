@@ -13,3 +13,18 @@ export type PresageVitals = {
    */
   face_detected?: boolean | null;
 };
+
+/** Desktop local Vision (and brightness) posted with observe. */
+export type ClientObserveMeta = {
+  brightness?: number | null;
+  brightness_measured?: boolean;
+  /** Local Apple Vision majority face — PRIMARY for desk-away when boolean. */
+  face_detected?: boolean | null;
+  /** `"present"` | `"absent"` | `"looking_down"` | `"looking_away"` */
+  attention?: string | null;
+  /**
+   * Kind of the last camera nudge the desktop successfully delivered (push/speak).
+   * Server consumes a pending ladder rung only after this matches.
+   */
+  last_nudge_ack?: string | null;
+};

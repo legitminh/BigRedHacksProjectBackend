@@ -33,6 +33,7 @@ async function withApp(
       focus_ok: boolean;
       source: "presage";
       raw_summary: string;
+      face_detected?: boolean | null;
     }>;
   },
 ): Promise<void> {
@@ -635,6 +636,376 @@ test("POST /v1/camera/observe skips Presage upload during break", async () => {
           raw_summary: "ok",
         };
       },
+    },
+  );
+});
+
+test("POST /v1/camera/observe local face false + empty Presage confirms away", async () => {
+  await withApp(
+    async (base, token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      const payload = {
+        session_id: "lock-local-away",
+        phase: "active",
+        mime: "video/mp4",
+        data_base64: Buffer.from("clip-bytes").toString("base64"),
+        client_meta: {
+          brightness: 120,
+          brightness_measured: true,
+          face_detected: false,
+          attention: "absent",
+        },
+      };
+      const first = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(first.status, 200);
+      const firstBody = (await first.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      // Empty Presage must not block local-away (first tick still confirms).
+      assert.equal(firstBody.face_detected, false);
+      assert.equal(firstBody.presence, "uncertain");
+
+      const second = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 200);
+      const secondBody = (await second.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      assert.equal(secondBody.face_detected, false);
+      assert.equal(secondBody.presence, "left_frame");
+    },
+    {
+      cameraAnalyze: async () => ({
+        heart_rate: null,
+        breathing_rate: null,
+        stress_index: null,
+        stressed: false,
+        focus_ok: false,
+        source: "presage",
+        raw_summary: "HR=null RR=null",
+      }),
+    },
+  );
+});
+
+test("POST /v1/camera/observe Presage timeout still uses local face away", async () => {
+  await withApp(
+    async (base, token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      const payload = {
+        session_id: "lock-local-timeout-away",
+        phase: "active",
+        mime: "video/mp4",
+        data_base64: Buffer.from("clip-bytes").toString("base64"),
+        client_meta: {
+          face_detected: false,
+          attention: "absent",
+          brightness: 100,
+          brightness_measured: true,
+        },
+      };
+      const first = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(first.status, 200);
+      const firstBody = (await first.json()) as {
+        face_detected: boolean | null;
+        vitals: unknown;
+        presence: string;
+      };
+      assert.equal(firstBody.vitals, null);
+      assert.equal(firstBody.face_detected, false);
+      assert.equal(firstBody.presence, "uncertain");
+
+      const second = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 200);
+      const secondBody = (await second.json()) as { presence: string };
+      assert.equal(secondBody.presence, "left_frame");
+    },
+    {
+      cameraAnalyze: async () => {
+        throw new Error("Presage retrieve timeout");
+      },
+    },
+  );
+});
+
+test("POST /v1/camera/observe Presage explicit false wins when no local face", async () => {
+  await withApp(
+    async (base, token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      const payload = {
+        session_id: "lock-presage-explicit-no-local",
+        phase: "active",
+        mime: "video/mp4",
+        data_base64: Buffer.from("clip-bytes").toString("base64"),
+        client_meta: { brightness: 110, brightness_measured: true },
+      };
+      const first = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(first.status, 200);
+      const firstBody = (await first.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      assert.equal(firstBody.face_detected, false);
+      assert.equal(firstBody.presence, "uncertain");
+
+      const second = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 200);
+      const secondBody = (await second.json()) as { presence: string };
+      assert.equal(secondBody.presence, "left_frame");
+    },
+    {
+      cameraAnalyze: async () => ({
+        heart_rate: null,
+        breathing_rate: null,
+        stress_index: null,
+        stressed: false,
+        focus_ok: false,
+        source: "presage",
+        raw_summary: "no face",
+        face_detected: false,
+      }),
+    },
+  );
+});
+
+test("POST /v1/camera/observe local face true + Presage null stays present", async () => {
+  await withApp(
+    async (base, token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      const payload = {
+        session_id: "lock-local-present",
+        phase: "active",
+        mime: "video/mp4",
+        data_base64: Buffer.from("clip-bytes").toString("base64"),
+        client_meta: {
+          brightness: 140,
+          brightness_measured: true,
+          face_detected: true,
+          attention: "present",
+        },
+      };
+      const first = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(first.status, 200);
+      const firstBody = (await first.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      assert.equal(firstBody.face_detected, true);
+      assert.equal(firstBody.presence, "present");
+
+      const second = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 200);
+      const secondBody = (await second.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      assert.equal(secondBody.face_detected, true);
+      assert.equal(secondBody.presence, "present");
+    },
+    {
+      cameraAnalyze: async () => ({
+        heart_rate: null,
+        breathing_rate: null,
+        stress_index: null,
+        stressed: false,
+        focus_ok: false,
+        source: "presage",
+        raw_summary: "empty",
+      }),
+    },
+  );
+});
+
+test("POST /v1/camera/observe local face preferred over Presage scalars", async () => {
+  await withApp(
+    async (base, token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      const payload = {
+        session_id: "lock-local-primary",
+        phase: "active",
+        mime: "video/mp4",
+        data_base64: Buffer.from("clip-bytes").toString("base64"),
+        client_meta: {
+          face_detected: false,
+          attention: "absent",
+          brightness: 90,
+          brightness_measured: true,
+        },
+      };
+      const first = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(first.status, 200);
+      const firstBody = (await first.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+        vitals: { heart_rate: number | null } | null;
+      };
+      // Local face posted → Presage skipped (no 45s rPPG block); vitals stay null.
+      // Presence still uses local away (PRIMARY) even if analyze would have returned HR.
+      assert.equal(firstBody.vitals, null);
+      assert.equal(firstBody.face_detected, false);
+      assert.equal(firstBody.presence, "uncertain");
+
+      const second = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 200);
+      const secondBody = (await second.json()) as { presence: string };
+      assert.equal(secondBody.presence, "left_frame");
+    },
+    {
+      // Must not be called when client posts face_detected.
+      cameraAnalyze: async () => {
+        throw new Error("Presage should be skipped when local face is posted");
+      },
+    },
+  );
+});
+
+test("POST /v1/camera/observe passes looking_down attention through", async () => {
+  await withApp(
+    async (base, token) => {
+      const res = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          session_id: "lock-looking-down",
+          phase: "active",
+          mime: "video/mp4",
+          data_base64: Buffer.from("clip-bytes").toString("base64"),
+          client_meta: {
+            face_detected: true,
+            attention: "looking_down",
+            brightness: 130,
+            brightness_measured: true,
+          },
+        }),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      assert.equal(body.face_detected, true);
+      // Face present — looking_down must not become left_frame.
+      assert.equal(body.presence, "present");
+    },
+    {
+      cameraAnalyze: async () => ({
+        heart_rate: null,
+        breathing_rate: null,
+        stress_index: null,
+        stressed: false,
+        focus_ok: false,
+        source: "presage",
+        raw_summary: "empty",
+      }),
+    },
+  );
+});
+
+test("POST /v1/camera/observe looking_away emits look_back nudge", async () => {
+  await withApp(
+    async (base, token) => {
+      const res = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          session_id: "lock-looking-away",
+          phase: "active",
+          mime: "video/mp4",
+          data_base64: Buffer.from("clip-bytes").toString("base64"),
+          client_meta: {
+            face_detected: true,
+            attention: "looking_away",
+            brightness: 130,
+            brightness_measured: true,
+          },
+        }),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+        nudge: { kind: string; text: string } | null;
+      };
+      assert.equal(body.face_detected, true);
+      assert.equal(body.presence, "present");
+      assert.equal(body.nudge?.kind, "look_back");
+      assert.equal(
+        body.nudge!.text,
+        "You're looking away. Turn back to the work.",
+      );
+    },
+    {
+      cameraAnalyze: async () => ({
+        heart_rate: null,
+        breathing_rate: null,
+        stress_index: null,
+        stressed: false,
+        focus_ok: false,
+        source: "presage",
+        raw_summary: "empty",
+      }),
     },
   );
 });
