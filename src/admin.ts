@@ -20,6 +20,7 @@ const BROWSE_TABLES: { id: AdminBrowseTable; label: string }[] = [
   { id: "profiles", label: "Profiles" },
   { id: "tasks", label: "Tasks" },
   { id: "sessions", label: "Sessions" },
+  { id: "session_notes", label: "Session notes" },
   { id: "pace", label: "Pace samples" },
   { id: "proficiencies", label: "Proficiencies" },
   { id: "refresh_tokens", label: "Refresh tokens" },

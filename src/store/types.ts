@@ -34,6 +34,7 @@ import type {
   CalendarConnection,
   PaceSample,
   Proficiency,
+  SessionNote,
   SessionRecap,
   StoredProfile,
   TaskRecord,
@@ -95,6 +96,7 @@ export type AdminBrowseTable =
   | "users"
   | "tasks"
   | "sessions"
+  | "session_notes"
   | "pace"
   | "proficiencies"
   | "profiles"
@@ -141,6 +143,13 @@ export type Store = {
   saveTask(userId: string, task: TaskRecord): Promise<void>;
   insertSession(userId: string, session: SessionRecap): Promise<SessionRecap>;
   listSessions(userId: string): Promise<SessionRecap[]>;
+  /** Insert or replace the note for (userId, session_id). `created` is false on replace. */
+  upsertSessionNote(
+    userId: string,
+    note: SessionNote,
+  ): Promise<{ note: SessionNote; created: boolean }>;
+  listSessionNotes(userId: string, limit: number): Promise<SessionNote[]>;
+  getSessionNote(userId: string, id: string): Promise<SessionNote | null>;
   /** Permanently delete the user account and all synced data (admin row gone). */
   clearUserData(userId: string, now: Date): Promise<void>;
   close(): Promise<void>;

@@ -7,6 +7,7 @@ import { hashesMatch } from "../auth/tokens.ts";
 import type {
   PaceSample,
   Proficiency,
+  SessionNote,
   SessionRecap,
   StoredProfile,
   TaskRecord,
@@ -43,6 +44,7 @@ type FileData = {
   paceSamples: Owned<PaceSample>[];
   tasks: Owned<TaskRecord>[];
   sessions: Owned<SessionRecap>[];
+  sessionNotes: Owned<SessionNote>[];
 };
 
 function empty(): FileData {
@@ -55,6 +57,7 @@ function empty(): FileData {
     paceSamples: [],
     tasks: [],
     sessions: [],
+    sessionNotes: [],
   };
 }
 
@@ -93,6 +96,7 @@ export function openFileStore(path: string): Store {
         paceSamples: parsed.paceSamples ?? [],
         tasks: parsed.tasks ?? [],
         sessions: parsed.sessions ?? [],
+        sessionNotes: parsed.sessionNotes ?? [],
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
@@ -373,6 +377,14 @@ export function openFileStore(path: string): Store {
             return pack(data.tasks.map(({ userId, ...rest }) => ({ user_id: userId, ...rest })));
           case "sessions":
             return pack(data.sessions.map(({ userId, ...rest }) => ({ user_id: userId, ...rest })));
+          case "session_notes":
+            return pack(
+              data.sessionNotes.map(({ userId, markdown, user_id: _userId, ...rest }) => ({
+                user_id: userId,
+                ...rest,
+                markdown_chars: markdown.length,
+              })),
+            );
           case "pace":
             return pack(
               data.paceSamples.map(({ userId, ...rest }) => ({ user_id: userId, ...rest })),
@@ -570,6 +582,60 @@ export function openFileStore(path: string): Store {
           .sort((a, b) => Date.parse(b.ended_at) - Date.parse(a.ended_at));
       });
     },
+    async upsertSessionNote(userId, note) {
+      return lock(async () => {
+        const data = await read();
+        const index = data.sessionNotes.findIndex(
+          (item) => item.userId === userId && item.session_id === note.session_id,
+        );
+        if (index >= 0) {
+          const existing = data.sessionNotes[index]!;
+          const updated: Owned<SessionNote> = {
+            ...existing,
+            userId,
+            user_id: userId,
+            started_at: note.started_at,
+            ended_at: note.ended_at,
+            goals: note.goals,
+            kind: note.kind,
+            markdown: note.markdown,
+          };
+          data.sessionNotes[index] = updated;
+          await write(data);
+          const { userId: _userId, ...stored } = updated;
+          return { note: stored, created: false };
+        }
+        const created: Owned<SessionNote> = { ...note, userId, user_id: userId };
+        data.sessionNotes.push(created);
+        await write(data);
+        const { userId: _userId, ...stored } = created;
+        return { note: stored, created: true };
+      });
+    },
+    async listSessionNotes(userId, limit) {
+      return lock(async () => {
+        const data = await read();
+        const cap = Math.min(50, Math.max(0, limit));
+        return data.sessionNotes
+          .filter((note) => note.userId === userId)
+          .map(({ userId: _userId, ...note }) => note)
+          .sort(
+            (a, b) =>
+              Date.parse(b.ended_at) - Date.parse(a.ended_at) ||
+              Date.parse(b.created_at) - Date.parse(a.created_at),
+          )
+          .slice(0, cap);
+      });
+    },
+    async getSessionNote(userId, id) {
+      return lock(async () => {
+        const data = await read();
+        const note = data.sessionNotes.find((item) => item.userId === userId && item.id === id);
+        if (!note) return null;
+        const { userId: _userId, ...stored } = note;
+        return stored;
+      });
+    },
     async clearUserData(userId, _now) {
       await lock(async () => {
         const data = await read();
@@ -580,6 +646,7 @@ export function openFileStore(path: string): Store {
         data.paceSamples = data.paceSamples.filter((item) => item.userId !== userId);
         data.tasks = data.tasks.filter((item) => item.userId !== userId);
         data.sessions = data.sessions.filter((item) => item.userId !== userId);
+        data.sessionNotes = data.sessionNotes.filter((item) => item.userId !== userId);
         data.refreshTokens = data.refreshTokens.filter((item) => item.userId !== userId);
         if (email) {
           data.emailCodes = data.emailCodes.filter(

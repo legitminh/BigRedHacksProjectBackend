@@ -82,11 +82,11 @@ async function withApp(fn: (base: string, inbox: { code: string }[]) => Promise<
   return sent;
 }
 
-async function tokenFor(base: string, inbox: { code: string }[]): Promise<string> {
+async function tokenForEmail(base: string, inbox: { code: string }[], email: string): Promise<string> {
   const start = await fetch(`${base}/v1/auth/email/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: "student@cornell.edu" }),
+    body: JSON.stringify({ email }),
   });
   assert.equal(start.status, 200);
   const code = inbox.at(-1)?.code;
@@ -94,11 +94,27 @@ async function tokenFor(base: string, inbox: { code: string }[]): Promise<string
   const verify = await fetch(`${base}/v1/auth/email/verify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: "student@cornell.edu", code }),
+    body: JSON.stringify({ email, code }),
   });
   assert.equal(verify.status, 200);
   const body = (await verify.json()) as { access_token: string };
   return body.access_token;
+}
+
+async function tokenFor(base: string, inbox: { code: string }[]): Promise<string> {
+  return tokenForEmail(base, inbox, "student@cornell.edu");
+}
+
+function sessionNoteBody(overrides: Record<string, unknown> = {}) {
+  return {
+    session_id: "lock-1",
+    started_at: "2026-10-03T18:00:00Z",
+    ended_at: "2026-10-03T18:30:00Z",
+    goals: "Finish the queue",
+    kind: "study",
+    markdown: "Wrote the push method.",
+    ...overrides,
+  };
 }
 
 test("memory starts empty, updates in place, and caps lists", async () => {
@@ -472,6 +488,13 @@ test("DELETE /v1/me/data removes the user account entirely", async () => {
     });
     assert.equal(mem.status, 200);
 
+    const note = await fetch(`${base}/v1/session-notes`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(sessionNoteBody({ markdown: "Private lock-in note." })),
+    });
+    assert.equal(note.status, 201);
+
     const wiped = await fetch(`${base}/v1/me/data`, { method: "DELETE", headers: auth });
     assert.equal(wiped.status, 204);
 
@@ -501,6 +524,11 @@ test("DELETE /v1/me/data removes the user account entirely", async () => {
     assert.equal(emptyMem.status, 200);
     const body = (await emptyMem.json()) as { study_memory: unknown };
     assert.equal(body.study_memory, null);
+    const notes = await fetch(`${base}/v1/session-notes`, {
+      headers: { Authorization: `Bearer ${next.access_token}` },
+    });
+    assert.equal(notes.status, 200);
+    assert.deepEqual((await notes.json()) as { notes: unknown[] }, { notes: [] });
   });
 });
 
@@ -597,4 +625,248 @@ test("calendar consent classifies the agenda and refuses edits to other events",
     assert.equal(patch.status, 403);
     assert.equal(((await patch.json()) as { error: { code: string } }).error.code, "not_waypoint_event");
   }, calendar(events, inserted));
+});
+
+test("session notes upsert in place, list newest first, and stay private", async () => {
+  await withApp(async (base, inbox) => {
+    const token = await tokenFor(base, inbox);
+    const auth = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+    const me = (await (await fetch(`${base}/v1/me`, { headers: auth })).json()) as { id: string };
+
+    const created = await fetch(`${base}/v1/session-notes`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(sessionNoteBody({ client: "desktop", markdown: "First draft." })),
+    });
+    assert.equal(created.status, 201);
+    const first = (await created.json()) as {
+      id: string;
+      user_id: string;
+      session_id: string;
+      kind: string;
+      markdown: string;
+      goals: string;
+      created_at: string;
+      started_at: string;
+      ended_at: string;
+    };
+    assert.equal(first.user_id, me.id);
+    assert.equal(first.session_id, "lock-1");
+    assert.equal(first.kind, "study");
+    assert.equal(first.markdown, "First draft.");
+    assert.equal(first.goals, "Finish the queue");
+    assert.equal("client" in first, false);
+
+    const replaced = await fetch(`${base}/v1/session-notes`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(
+        sessionNoteBody({
+          kind: "devlog",
+          goals: "",
+          markdown: "Replaced draft.",
+          ended_at: "2026-10-03T19:00:00Z",
+        }),
+      ),
+    });
+    assert.equal(replaced.status, 200);
+    const second = (await replaced.json()) as typeof first;
+    assert.equal(second.id, first.id);
+    assert.equal(second.created_at, first.created_at);
+    assert.equal(second.markdown, "Replaced draft.");
+    assert.equal(second.kind, "devlog");
+    assert.equal(second.goals, "");
+    assert.equal(second.ended_at, "2026-10-03T19:00:00.000Z");
+
+    const older = await fetch(`${base}/v1/session-notes`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(
+        sessionNoteBody({
+          session_id: "lock-0",
+          started_at: "2026-10-03T16:00:00Z",
+          ended_at: "2026-10-03T17:00:00Z",
+          markdown: "Earlier note.",
+        }),
+      ),
+    });
+    assert.equal(older.status, 201);
+
+    const list = await fetch(`${base}/v1/session-notes`, { headers: auth });
+    assert.equal(list.status, 200);
+    const body = (await list.json()) as { notes: { id: string; session_id: string; markdown: string }[] };
+    assert.deepEqual(
+      body.notes.map((note) => note.session_id),
+      ["lock-1", "lock-0"],
+    );
+    assert.equal(body.notes[0]?.markdown, "Replaced draft.");
+
+    const one = await fetch(`${base}/v1/session-notes/${first.id}`, { headers: auth });
+    assert.equal(one.status, 200);
+    assert.equal(((await one.json()) as { id: string }).id, first.id);
+
+    const otherToken = await tokenForEmail(base, inbox, "other@cornell.edu");
+    const otherAuth = { Authorization: `Bearer ${otherToken}` };
+    const otherList = await fetch(`${base}/v1/session-notes`, { headers: otherAuth });
+    assert.deepEqual(await otherList.json(), { notes: [] });
+    const hidden = await fetch(`${base}/v1/session-notes/${first.id}`, { headers: otherAuth });
+    assert.equal(hidden.status, 404);
+    const missing = await fetch(`${base}/v1/session-notes/not-a-uuid`, { headers: auth });
+    assert.equal(missing.status, 404);
+  });
+});
+
+test("session notes reject bad kind, empty markdown, overlong text, and images", async () => {
+  await withApp(async (base, inbox) => {
+    const token = await tokenFor(base, inbox);
+    const auth = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+    async function post(body: unknown) {
+      const response = await fetch(`${base}/v1/session-notes`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify(body),
+      });
+      const payload = (await response.json()) as { error: { code: string } };
+      return { status: response.status, code: payload.error.code };
+    }
+
+    assert.deepEqual(await post(sessionNoteBody({ kind: "journal" })), {
+      status: 400,
+      code: "invalid_session_note",
+    });
+    assert.deepEqual(await post(sessionNoteBody({ markdown: "   " })), {
+      status: 400,
+      code: "invalid_session_note",
+    });
+    assert.deepEqual(await post(sessionNoteBody({ session_id: "  " })), {
+      status: 400,
+      code: "invalid_session_note",
+    });
+    assert.deepEqual(await post(sessionNoteBody({ ended_at: "not-a-time" })), {
+      status: 400,
+      code: "invalid_session_note",
+    });
+    assert.deepEqual(
+      await post(sessionNoteBody({ started_at: "2026-10-03T19:00:00Z", ended_at: "2026-10-03T18:00:00Z" })),
+      { status: 400, code: "invalid_session_note" },
+    );
+    assert.deepEqual(await post(sessionNoteBody({ markdown: "a".repeat(32_001) })), {
+      status: 400,
+      code: "note_too_long",
+    });
+    assert.deepEqual(await post(sessionNoteBody({ goals: "g".repeat(2_001) })), {
+      status: 400,
+      code: "goals_too_long",
+    });
+    assert.deepEqual(await post(sessionNoteBody({ screenshot: "desk.png" })), {
+      status: 400,
+      code: "image_not_allowed",
+    });
+    assert.deepEqual(
+      await post(sessionNoteBody({ markdown: "see data:image/png;base64,iVBORw0KGgoAAA" })),
+      { status: 400, code: "image_not_allowed" },
+    );
+
+    const list = await fetch(`${base}/v1/session-notes`, { headers: auth });
+    assert.deepEqual(await list.json(), { notes: [] });
+  });
+});
+
+test("memory card recent_notes excerpts do not replace study memory", async () => {
+  await withApp(async (base, inbox) => {
+    const token = await tokenFor(base, inbox);
+    const auth = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+    const saved = await fetch(`${base}/v1/study-memory`, {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({ narrative: "Still here", stats: { total_sessions: 2 } }),
+    });
+    assert.equal(saved.status, 200);
+
+    const prose = `Line one\n\nLine two ${"x".repeat(300)}`;
+    for (let i = 0; i < 6; i += 1) {
+      const response = await fetch(`${base}/v1/session-notes`, {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify(
+          sessionNoteBody({
+            session_id: `card-${i}`,
+            started_at: "2026-10-03T11:00:00Z",
+            ended_at: new Date(Date.parse("2026-10-03T12:00:00Z") + i * 60_000).toISOString(),
+            goals: i === 5 ? "Newest goal" : "older",
+            markdown: i === 5 ? prose : `note ${i}`,
+          }),
+        ),
+      });
+      assert.equal(response.status, 201);
+    }
+
+    const memory = (await (await fetch(`${base}/v1/memory`, { headers: auth })).json()) as {
+      study_memory: { narrative: string } | null;
+      recent_notes: { session_id: string; goals: string; excerpt: string; kind: string }[];
+    };
+    assert.equal(memory.study_memory?.narrative, "Still here");
+    assert.equal(memory.recent_notes.length, 5);
+    assert.equal(memory.recent_notes[0]?.session_id, "card-5");
+    assert.equal(memory.recent_notes[0]?.goals, "Newest goal");
+    assert.equal(memory.recent_notes[0]?.kind, "study");
+    assert.equal(memory.recent_notes[0]?.excerpt.includes("\n"), false);
+    assert.ok(memory.recent_notes[0]?.excerpt.startsWith("Line one Line two "));
+    assert.equal(memory.recent_notes[0]?.excerpt.length, 240);
+    assert.equal(memory.recent_notes.some((note) => note.session_id === "card-0"), false);
+  });
+});
+
+test("clearUserData deletes session notes for that user only", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "waypoint-notes-"));
+  const store = openFileStore(join(dir, "store.json"));
+  const now = new Date("2026-10-03T18:00:00.000Z");
+  const owner = await store.findOrCreateUserByEmail("student@cornell.edu", now);
+  const other = await store.findOrCreateUserByEmail("other@cornell.edu", now);
+  const note = {
+    started_at: "2026-10-03T18:00:00.000Z",
+    ended_at: "2026-10-03T19:00:00.000Z",
+    goals: "",
+    kind: "study" as const,
+    markdown: "secret note",
+    created_at: now.toISOString(),
+  };
+  for (let i = 0; i < 51; i += 1) {
+    await store.upsertSessionNote(owner.id, {
+      ...note,
+      id: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+      user_id: owner.id,
+      session_id: `n-${i}`,
+      ended_at: new Date(Date.parse("2026-10-03T12:00:00.000Z") + i * 60_000).toISOString(),
+    });
+  }
+  await store.upsertSessionNote(other.id, {
+    ...note,
+    id: "00000000-0000-4000-8000-000000000099",
+    user_id: other.id,
+    session_id: "n-50",
+    markdown: "other note",
+  });
+  const listed = await store.listSessionNotes(owner.id, 50);
+  assert.equal(listed.length, 50);
+  assert.equal(listed[0]?.session_id, "n-50");
+  assert.equal(listed.some((item) => item.session_id === "n-0"), false);
+  const replaced = await store.upsertSessionNote(owner.id, {
+    ...note,
+    id: "00000000-0000-4000-8000-000000000077",
+    user_id: owner.id,
+    session_id: "n-50",
+    markdown: "replaced",
+    created_at: "2026-10-04T00:00:00.000Z",
+  });
+  assert.equal(replaced.created, false);
+  assert.equal(replaced.note.id, listed[0]?.id);
+  assert.equal(replaced.note.created_at, note.created_at);
+  assert.equal(replaced.note.markdown, "replaced");
+  await store.clearUserData(owner.id, now);
+  assert.deepEqual(await store.listSessionNotes(owner.id, 50), []);
+  const kept = await store.listSessionNotes(other.id, 50);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0]?.markdown, "other note");
+  await store.close();
 });

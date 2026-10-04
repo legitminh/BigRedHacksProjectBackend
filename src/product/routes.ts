@@ -42,9 +42,11 @@ import {
   parsePaceInput,
   parseProficiencyList,
   parseSession,
+  parseSessionNote,
   parseStudyMemory,
   parseTaskCreate,
   parseTaskPatch,
+  sessionNoteExcerpt,
   stepProficiency,
   type Level,
 } from "./model.ts";
@@ -137,6 +139,8 @@ function isProductPath(path: string): boolean {
     path === "/v1/tasks/active" ||
     path.startsWith("/v1/tasks/") ||
     path === "/v1/sessions" ||
+    path === "/v1/session-notes" ||
+    path.startsWith("/v1/session-notes/") ||
     path === "/v1/camera/observe"
   );
 }
@@ -509,15 +513,56 @@ export async function handleProduct(
     return true;
   }
 
+  if (method === "POST" && path === "/v1/session-notes") {
+    const user = await requireUser(deps, req, now);
+    const parsed = parseSessionNote(await readJson(req, SESSION_NOTE_BODY_MAX));
+    const { note, created } = await deps.store.upsertSessionNote(user.id, {
+      id: randomUUID(),
+      user_id: user.id,
+      created_at: now.toISOString(),
+      ...parsed,
+    });
+    sendJson(res, created ? 201 : 200, note);
+    return true;
+  }
+  if (method === "GET" && path === "/v1/session-notes") {
+    const user = await requireUser(deps, req, now);
+    sendJson(res, 200, { notes: await deps.store.listSessionNotes(user.id, 50) });
+    return true;
+  }
+  const notePath = /^\/v1\/session-notes\/([^/]+)$/.exec(path);
+  if (notePath && method === "GET") {
+    const user = await requireUser(deps, req, now);
+    const id = decodeURIComponent(notePath[1]!);
+    if (!SESSION_NOTE_ID.test(id)) {
+      throw new HttpError(404, "not_found", "Session note not found.");
+    }
+    const note = await deps.store.getSessionNote(user.id, id);
+    if (!note) throw new HttpError(404, "not_found", "Session note not found.");
+    sendJson(res, 200, note);
+    return true;
+  }
+
   throw new HttpError(405, "method_not_allowed", "Method not allowed.");
 }
+
+const SESSION_NOTE_BODY_MAX = 128 * 1024;
+const SESSION_NOTE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function memoryCard(store: Store, userId: string) {
   const profile = await store.getProfile(userId);
   const proficiencies = await store.listProficiencies(userId);
   const samples = await store.listPaceSamples(userId, null);
+  const recent_notes = (await store.listSessionNotes(userId, 5)).map((note) => ({
+    id: note.id,
+    session_id: note.session_id,
+    ended_at: note.ended_at,
+    kind: note.kind,
+    goals: note.goals,
+    excerpt: sessionNoteExcerpt(note.markdown),
+  }));
   if (!profile) {
-    return { ...emptyMemory(), proficiencies, pace: paceCards(samples) };
+    return { ...emptyMemory(), proficiencies, pace: paceCards(samples), recent_notes };
   }
   return {
     interests: profile.interests,
@@ -528,6 +573,7 @@ async function memoryCard(store: Store, userId: string) {
     interaction: profile.interaction,
     updated_at: profile.updated_at,
     study_memory: profile.study_memory ?? null,
+    recent_notes,
   };
 }
 

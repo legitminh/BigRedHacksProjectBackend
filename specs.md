@@ -203,6 +203,35 @@ Sets `ended_at`, stores `outcome`, and appends a pace sample. `actual_minutes` i
 
 `attention` is `steady`, `recovered`, or `dropped`. This is a log, not an input to the profile card, except that task completion already wrote the pace sample.
 
+## Session notes
+
+`POST /v1/session-notes` stores the Markdown note the desktop writes when a lock-in ends. The API does not call Gemini and does not accept screenshots or images. One row per user and client `session_id`.
+
+```json
+{
+  "session_id": "lock-in-1",
+  "started_at": "2026-10-03T18:30:00Z",
+  "ended_at": "2026-10-03T19:00:00Z",
+  "goals": "Finish the priority queue",
+  "kind": "study",
+  "markdown": "## Lock-in\n\nFinished push."
+}
+```
+
+`kind` is `study` or `devlog`. `goals` may be empty and is capped at 2,000 characters (`400` `goals_too_long`). `markdown` is required and capped at 32,000 characters (`400` `note_too_long`). `session_id` is a non-empty string up to 512 characters. `started_at` and `ended_at` are ISO-8601 timestamps, and `ended_at` must not be before `started_at`. Fields named like `image` or `screenshot`, and base64 image payloads, are rejected with `400` `image_not_allowed`. Other unknown fields are ignored.
+
+The first POST returns `201` with the stored row (`id`, `user_id`, `session_id`, `started_at`, `ended_at`, `goals`, `kind`, `markdown`, `created_at`). A second POST with the same `session_id` for this user replaces `markdown`, `kind`, `goals`, `started_at`, and `ended_at`, keeps the same `id` and `created_at`, and returns `200`.
+
+`GET /v1/session-notes` returns `{ "notes": [...] }` for the signed-in user, newest `ended_at` first, at most 50, including full markdown.
+
+`GET /v1/session-notes/:id` returns one note, or `404` when it is missing or belongs to someone else.
+
+`GET /v1/memory` includes `recent_notes`: up to five `{ id, session_id, ended_at, kind, goals, excerpt }`. `excerpt` is the first 240 characters of markdown with whitespace runs collapsed to single spaces. `study_memory` is unchanged.
+
+### Table
+
+`session_notes`: `id`, `user_id`, `session_id`, `started_at`, `ended_at`, `goals`, `kind`, `markdown`, `created_at`. Unique on `(user_id, session_id)`. Indexed on `(user_id, ended_at DESC)`.
+
 ## What stays on the client
 
 - Gemini tool loop and the advise vs pair reply policy
