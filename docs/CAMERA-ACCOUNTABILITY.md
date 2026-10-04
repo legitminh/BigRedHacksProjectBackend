@@ -35,7 +35,7 @@ Response 200:
     "focus_ok": true,
     "source": "presage"
   },
-  "nudge": { "kind": "left_desk", "text": "Camera lost you — phone down or back to the desk." },
+  "nudge": { "kind": "left_desk", "text": "You've stepped away. Come back to the work when you can." },
   "watching_note": "Camera accountability · present"
 }
 ```
@@ -44,11 +44,11 @@ Nudge `kind` values (internal tags — **never** speak the kind string; use `tex
 
 | kind | Meaning | Spoken intent |
 |------|---------|---------------|
-| `left_desk` | Presage face-lost / no usable face (absence ladder, **active** only) | Phone down or back to desk |
-| `left_desk_pause` | Still no face ~2 min — end away-nags for this leave (**not** mission pause) | Pause check-ins until back |
-| `welcome_back` | Confirmed return after leave (**active** only) | Welcome back |
+| `left_desk` | Presage no usable face (D1 absence ladder, **active** only) — **not** a phone accusation | Stepped away — come back |
+| `suggest_break` | Stress **or** ~3 min still away (D1 mid-ladder) → voluntary break invite | Optional break card |
+| `left_desk_pause` | Still no face ~10 min — end away-nags (**not** mission pause) | Stay quiet until back |
+| `welcome_back` | Confirmed return after leave ≥20s (**active** only) | Welcome back |
 | `camera_obstructed` | Lens/lighting unclear held ~30s (**active** only) | Fix camera/lighting |
-| `suggest_break` | Stress → voluntary five-minute break invite (primary) | Optional break card |
 | `stressed` | Stress breath fallback after a recent `suggest_break` | Slow breath |
 
 - `nudge` is `null` when silent (cooldown, `paused`/`break`, already spoken ladder step, etc.).
@@ -64,9 +64,10 @@ Nudge `kind` values (internal tags — **never** speak the kind string; use `tex
 ## Spirit (nudge policy)
 
 - Under ~12 words for lock-in nudges; max ~25 for check-ins.
-- Absence ladder (active phase only): first callback → second → pause acknowledgment; then stay quiet.
+- Absence ladder (active phase only; case-catalog D1 spirit): silent under ~25s → `left_desk` callback → ~3 min `suggest_break` invite → ~10 min `left_desk_pause` quiet.
   - Confirm leave after sustained away (2 observes / brief hold) so glances do not chatter.
-  - Ladder clock starts at the first away candidate; with ~25–30s observe cadence a real away (~20–60s+) gets the first `left_desk` on the confirming observe.
+  - Ladder clock starts at the first away candidate; with ~25–30s observe cadence a real away gets the first `left_desk` on the confirming observe.
+  - Do **not** accuse phone on face-lost (phone is C1 with a detector we do not run); head-down without a box is not a phone nudge.
 - Welcome-back once after confirmed return; no praise after a nudge in the same beat.
 - Stress family (`suggest_break` ↔ `stressed`):
   - Shared **180s** cooldown (`STRESS_COOLDOWN_MS`).

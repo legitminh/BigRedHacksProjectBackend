@@ -45,52 +45,54 @@ const AWAY_CONFIRM_OBSERVES = 2;
 /** Time-based confirm when observes are denser than the ~25–30s desktop cadence. */
 const AWAY_CONFIRM_MS = 5_000;
 /**
- * Absence ladder after left_frame is confirmed (active only).
+ * Absence ladder after left_frame is confirmed (active only) — case-catalog D1 spirit.
  * Timings are wall-clock from when the away candidate began (not from confirm tick),
- * so with ~25–30s observe cadence a real away (~20–60s+) gets a first nudge on the
- * confirming observe — not an extra full period later.
+ * so with ~25–30s observe cadence a real away gets the first callback on the confirming
+ * observe (~25–30s), not an extra full period later.
  *
  * Kind is an internal tag — spoken `text` is what the student hears. Never surface
  * the kind string in UI/TTS.
  *
- * VIDEOINPUT / Presage only (no local LLM on webcam):
- * - `left_desk`: Presage lost a usable face signal (walk-away or phone-down / face_lost).
- * - `left_desk_pause`: still no face ~2 min — stop nagging (does NOT pause the mission).
- * - `welcome_back`: face confirmed back after a leave.
- * - `camera_obstructed`: lens/lighting too dark to judge presence.
- * - `suggest_break` / `stressed`: Presage stress scalars (present only); break is suggestion-only.
+ * Presage / VIDEOINPUT only (no local LLM, no phone-box detector):
+ * - `left_desk`: no usable face (D1). Do **not** accuse phone (that is C1 with a box).
+ * - Mid-ladder `suggest_break`: ~3 min away → optional break invite (D1), not stress.
+ * - `left_desk_pause`: ~10 min → stop nagging (soft stand-in for pause_session).
+ * - `welcome_back` / `camera_obstructed` / stress family: unchanged roles.
  */
 const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: string }> = [
   {
     step: "first",
-    afterMs: 20_000,
+    afterMs: 25_000,
     kind: "left_desk",
-    // Presage has no phone box detector — face_lost covers walk-away and phone pickup.
-    text: "Camera lost you — phone down or back to the desk.",
+    text: "You've stepped away. Come back to the work when you can.",
   },
   {
     step: "second",
-    afterMs: 60_000,
-    kind: "left_desk",
-    text: "Still away from the camera — return when you're ready.",
+    afterMs: 180_000,
+    // Desktop maps suggest_break → Accept/Not now break card (never auto-starts).
+    kind: SUGGEST_BREAK_KIND,
+    text: "Still away — optional five-minute break so you know when to return?",
   },
   {
     step: "pause",
-    afterMs: 120_000,
+    afterMs: 600_000,
     kind: "left_desk_pause",
-    // Not mission pause — just end the away-nudge ladder for this absence.
-    text: "Still away — I'll pause check-ins until you're back.",
+    // Soft quiet (catalog D1 ~10 min pause_session); does not force mission pause.
+    text: "I'll stay quiet until you're back at the desk.",
   },
 ];
 const OBSTRUCTED_MS = 30_000;
 /** Shared cooldown for stress-family nudges (`suggest_break` | `stressed`). */
 export const STRESS_COOLDOWN_MS = 180_000;
 const RETURN_CONFIRM_MS = 2_000;
+/** Catalog D2: only welcome after a real leave (≥20 s), not a blink. */
+const WELCOME_BACK_MIN_ABSENT_MS = 20_000;
 
-// Keep under ~12 words; never include digits (HR/RR/%). Spell out "five".
+// Keep under ~12 words for lock-in; never include digits (HR/RR/%). Spell out "five".
 const SUGGEST_BREAK_TEXT = "Feeling tense — optional five-minute break?";
 const STRESSED_BREATH_TEXT = "You seem tense — one slow breath, then back.";
-const WELCOME_BACK_TEXT = "Welcome back. Stay with the work.";
+const WELCOME_BACK_TEXT =
+  "Welcome back — good to see you. Let's pick the work back up.";
 const CAMERA_OBSTRUCTED_TEXT =
   "I can't see you clearly. Check the camera or lighting.";
 
@@ -249,6 +251,10 @@ export function observePresence(
         session.ladderSpoken.add(rung.step);
         session.linesSpoken += 1;
         nudge = { kind: rung.kind, text: rung.text };
+        if (rung.kind === SUGGEST_BREAK_KIND) {
+          session.lastStressNudgeAt = now;
+          session.lastStressNudgeKind = SUGGEST_BREAK_KIND;
+        }
         if (rung.step === "pause") session.ladderQuiet = true;
         break;
       }
@@ -264,7 +270,12 @@ export function observePresence(
     if (session.presentSince == null) session.presentSince = now;
     const backMs = now.getTime() - session.presentSince.getTime();
     if (backMs >= RETURN_CONFIRM_MS) {
-      if (!silentPhase && !session.welcomedBack) {
+      const absentMs = now.getTime() - session.absentSince.getTime();
+      if (
+        !silentPhase &&
+        !session.welcomedBack &&
+        absentMs >= WELCOME_BACK_MIN_ABSENT_MS
+      ) {
         session.welcomedBack = true;
         nudge = { kind: "welcome_back", text: WELCOME_BACK_TEXT };
       }
