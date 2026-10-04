@@ -50,7 +50,23 @@ test("GET /admin shows login when configured", async () => {
     assert.equal(res.status, 200);
     const html = await res.text();
     assert.match(html, /Admin password/);
+    assert.match(html, /brand-mark/);
+    assert.match(html, /\/admin\/favicon\.png/);
     assert.doesNotMatch(html, /Recent users/);
+  });
+});
+
+test("admin favicon is public", async () => {
+  await withApp(async (base) => {
+    const png = await fetch(`${base}/admin/favicon.png`);
+    assert.equal(png.status, 200);
+    assert.match(png.headers.get("content-type") ?? "", /image\/png/);
+    const bytes = Buffer.from(await png.arrayBuffer());
+    assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+
+    const ico = await fetch(`${base}/admin/favicon.ico`);
+    assert.equal(ico.status, 200);
+    assert.match(ico.headers.get("content-type") ?? "", /image\/x-icon|image\/vnd\.microsoft\.icon/);
   });
 });
 
