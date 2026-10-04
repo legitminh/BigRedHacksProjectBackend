@@ -30,6 +30,11 @@ export type ObservePresenceInput = {
   phase: CameraPhase;
   faceDetected: boolean | null;
   brightness?: number | null;
+  /**
+   * When false/omitted, brightness 0 (common placeholder) is ignored.
+   * Obstructed only applies to a measured low reading, and never overrides a detected face.
+   */
+  brightnessMeasured?: boolean;
   stressed?: boolean | null;
   now?: Date;
 };
@@ -45,28 +50,39 @@ const AWAY_CONFIRM_OBSERVES = 2;
 /** Time-based confirm when observes are denser than the ~25–30s desktop cadence. */
 const AWAY_CONFIRM_MS = 5_000;
 /**
- * Absence ladder after left_frame is confirmed (active only).
+ * Absence ladder after left_frame is confirmed (active only) — case-catalog D1 spirit.
  * Timings are wall-clock from when the away candidate began (not from confirm tick),
- * so with ~25–30s observe cadence a real away (~20–60s+) gets a first nudge on the
- * confirming observe — not an extra full period later.
+ * so with ~25–30s observe cadence a real away gets the first callback on the confirming
+ * observe (~25–30s), not an extra full period later.
+ *
+ * Kind is an internal tag — spoken `text` is what the student hears. Never surface
+ * the kind string in UI/TTS.
+ *
+ * Presage / VIDEOINPUT only (no local LLM, no phone-box detector):
+ * - `left_desk`: no usable face (D1). Do **not** accuse phone (that is C1 with a box).
+ * - Mid-ladder `suggest_break`: ~3 min away → optional break invite (D1), not stress.
+ * - `left_desk_pause`: ~10 min → stop nagging (soft stand-in for pause_session).
+ * - `welcome_back` / `camera_obstructed` / stress family: unchanged roles.
  */
 const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: string }> = [
   {
     step: "first",
-    afterMs: 20_000,
+    afterMs: 25_000,
     kind: "left_desk",
-    text: "You've stepped away. Come back to the work.",
+    text: "You've stepped away. Come back to the work when you can.",
   },
   {
     step: "second",
-    afterMs: 60_000,
-    kind: "left_desk",
-    text: "Still away — pick the task back up when you can.",
+    afterMs: 180_000,
+    // Desktop maps suggest_break → Accept/Not now break card (never auto-starts).
+    kind: SUGGEST_BREAK_KIND,
+    text: "Still away — optional five-minute break so you know when to return?",
   },
   {
     step: "pause",
-    afterMs: 120_000,
+    afterMs: 600_000,
     kind: "left_desk_pause",
+    // Soft quiet (catalog D1 ~10 min pause_session); does not force mission pause.
     text: "I'll stay quiet until you're back at the desk.",
   },
 ];
@@ -74,10 +90,16 @@ const OBSTRUCTED_MS = 30_000;
 /** Shared cooldown for stress-family nudges (`suggest_break` | `stressed`). */
 export const STRESS_COOLDOWN_MS = 180_000;
 const RETURN_CONFIRM_MS = 2_000;
+/** Catalog D2: only welcome after a real leave (≥20 s), not a blink. */
+const WELCOME_BACK_MIN_ABSENT_MS = 20_000;
 
-// Keep under ~12 words; never include digits (HR/RR/%). Spell out "five".
+// Keep under ~12 words for lock-in; never include digits (HR/RR/%). Spell out "five".
 const SUGGEST_BREAK_TEXT = "Feeling tense — optional five-minute break?";
 const STRESSED_BREATH_TEXT = "You seem tense — one slow breath, then back.";
+const WELCOME_BACK_TEXT =
+  "Welcome back — good to see you. Let's pick the work back up.";
+const CAMERA_OBSTRUCTED_TEXT =
+  "I can't see you clearly. Check the camera or lighting.";
 
 /** Pause and break phases: no spoken nudges. */
 export function isSilentCameraPhase(phase: CameraPhase): boolean {
@@ -87,11 +109,16 @@ export function isSilentCameraPhase(phase: CameraPhase): boolean {
 function classify(
   faceDetected: boolean | null,
   brightness: number | null | undefined,
+  brightnessMeasured?: boolean,
 ): PresenceState {
-  if (typeof brightness === "number" && brightness < 25) {
+  // Face wins over lighting: a detected face must not become an obstructed nag.
+  if (faceDetected === true) return "present";
+  const measured =
+    brightnessMeasured === true ||
+    (typeof brightness === "number" && Number.isFinite(brightness) && brightness > 0);
+  if (measured && typeof brightness === "number" && brightness < 25) {
     return "camera_obstructed";
   }
-  if (faceDetected === true) return "present";
   if (faceDetected === false) return "left_frame";
   return "uncertain";
 }
@@ -174,7 +201,11 @@ export function observePresence(
     session.lastStressNudgeAt = now;
   }
 
-  const raw = classify(input.faceDetected, input.brightness ?? null);
+  const raw = classify(
+    input.faceDetected,
+    input.brightness ?? null,
+    input.brightnessMeasured,
+  );
 
   let nudge: PresenceNudge | null = null;
 
@@ -187,7 +218,7 @@ export function observePresence(
       session.obstructedSaid = true;
       nudge = {
         kind: "camera_obstructed",
-        text: "I can't see you clearly. Check the camera or lighting.",
+        text: CAMERA_OBSTRUCTED_TEXT,
       };
     }
     return { presence: session.presence, nudge, watching_note: watchingNote(session.presence) };
@@ -234,6 +265,10 @@ export function observePresence(
         session.ladderSpoken.add(rung.step);
         session.linesSpoken += 1;
         nudge = { kind: rung.kind, text: rung.text };
+        if (rung.kind === SUGGEST_BREAK_KIND) {
+          session.lastStressNudgeAt = now;
+          session.lastStressNudgeKind = SUGGEST_BREAK_KIND;
+        }
         if (rung.step === "pause") session.ladderQuiet = true;
         break;
       }
@@ -249,9 +284,14 @@ export function observePresence(
     if (session.presentSince == null) session.presentSince = now;
     const backMs = now.getTime() - session.presentSince.getTime();
     if (backMs >= RETURN_CONFIRM_MS) {
-      if (!silentPhase && !session.welcomedBack) {
+      const absentMs = now.getTime() - session.absentSince.getTime();
+      if (
+        !silentPhase &&
+        !session.welcomedBack &&
+        absentMs >= WELCOME_BACK_MIN_ABSENT_MS
+      ) {
         session.welcomedBack = true;
-        nudge = { kind: "welcome_back", text: "Welcome back. Stay with the work." };
+        nudge = { kind: "welcome_back", text: WELCOME_BACK_TEXT };
       }
       resetAbsence(session);
     }

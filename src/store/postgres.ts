@@ -97,6 +97,7 @@ function mapSchoolDigestRow(row: {
   sources_json: SchoolDigestSource[] | string;
   created_at: Date;
   updated_at: Date;
+  manual_refresh_at?: Date | null;
 }): SchoolDigest {
   const digestDate =
     row.digest_date instanceof Date
@@ -115,6 +116,9 @@ function mapSchoolDigestRow(row: {
     sources: Array.isArray(sources) ? sources : [],
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
+    manualRefreshAt: row.manual_refresh_at
+      ? new Date(row.manual_refresh_at).toISOString()
+      : null,
   };
 }
 
@@ -1206,8 +1210,10 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         sources_json: SchoolDigestSource[];
         created_at: Date;
         updated_at: Date;
+        manual_refresh_at: Date | null;
       }>(
-        `SELECT user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at
+        `SELECT user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at,
+                manual_refresh_at
          FROM school_digests WHERE user_id = $1 AND digest_date = $2::date`,
         [userId, digestDate],
       );
@@ -1219,14 +1225,16 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
       const clipped = clipSchoolDigestText(digest.digestText);
       await pool.query(
         `INSERT INTO school_digests
-           (user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at)
-         VALUES ($1, $2::date, $3, $4, $5, $6::jsonb, $7::timestamptz, $8::timestamptz)
+           (user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at,
+            manual_refresh_at)
+         VALUES ($1, $2::date, $3, $4, $5, $6::jsonb, $7::timestamptz, $8::timestamptz, $9::timestamptz)
          ON CONFLICT (user_id, digest_date) DO UPDATE SET
            timezone = EXCLUDED.timezone,
            model = EXCLUDED.model,
            digest_text = EXCLUDED.digest_text,
            sources_json = EXCLUDED.sources_json,
-           updated_at = EXCLUDED.updated_at`,
+           updated_at = EXCLUDED.updated_at,
+           manual_refresh_at = EXCLUDED.manual_refresh_at`,
         [
           digest.userId,
           digest.digestDate,
@@ -1236,8 +1244,17 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           JSON.stringify(digest.sources),
           digest.createdAt,
           digest.updatedAt,
+          digest.manualRefreshAt ?? null,
         ],
       );
+    },
+    async getLatestSchoolDigestManualRefreshAt(userId) {
+      const result = await pool.query<{ latest: Date | null }>(
+        `SELECT MAX(manual_refresh_at) AS latest FROM school_digests WHERE user_id = $1`,
+        [userId],
+      );
+      const latest = result.rows[0]?.latest;
+      return latest ? new Date(latest).toISOString() : null;
     },
     async clearUserData(userId, _now) {
       const client = await pool.connect();

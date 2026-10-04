@@ -72,6 +72,8 @@ export type SchoolDigest = {
   sources: SchoolDigestSource[];
   createdAt: string;
   updatedAt: string;
+  /** ISO timestamp of the last user-triggered force rebuild, when any. */
+  manualRefreshAt?: string | null;
 };
 
 export type AdminOverview = {
@@ -192,6 +194,8 @@ export type Store = {
   clearDriveFileCache(userId: string): Promise<void>;
   getSchoolDigest(userId: string, digestDate: string): Promise<SchoolDigest | null>;
   upsertSchoolDigest(digest: SchoolDigest): Promise<void>;
+  /** Latest user-triggered digest refresh across all digest dates, if any. */
+  getLatestSchoolDigestManualRefreshAt(userId: string): Promise<string | null>;
   /** Permanently delete the user account and all synced data (admin row gone). */
   clearUserData(userId: string, now: Date): Promise<void>;
   close(): Promise<void>;

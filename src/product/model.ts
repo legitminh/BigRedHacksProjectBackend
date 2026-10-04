@@ -133,6 +133,10 @@ export function emptyMemory(): MemoryCard {
   };
 }
 
+/**
+ * Parse study-memory PUT body. `updated_at` from the client is ignored —
+ * the server clock is authoritative (GET echoes the stamped value).
+ */
 export function parseStudyMemory(body: unknown, now: Date): StudyMemoryBlob {
   if (!isRecord(body)) throw new HttpError(400, "invalid_study_memory", "Expected a JSON object.");
   const narrative = typeof body.narrative === "string" ? body.narrative.trim() : "";

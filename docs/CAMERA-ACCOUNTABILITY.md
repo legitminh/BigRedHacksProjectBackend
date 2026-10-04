@@ -1,6 +1,8 @@
 # Camera accountability (server-side)
 
-Inspired by [VIDEOINPUT](https://github.com/dhanvi2612/VIDEOINPUT): camera → Presage scalars + presence state on the **API**; desktop only captures short clips and uploads them. Sparse nudges; never recite HR/RR numbers; no nagging during pause/break; short calm lines that point back to the work.
+Inspired by [VIDEOINPUT](https://github.com/dhanvi2612/VIDEOINPUT): camera → **Presage** scalars + presence state on the **API**; desktop only captures short clips and uploads them. Sparse nudges; never recite HR/RR numbers; no nagging during pause/break; short calm lines that point back to the work.
+
+**Do not** run a local LLM / VLM on webcam frames for `left_desk` / phone / stress. Presage owns face-lost and vitals (VIDEOINPUT: phone pickup is inferred as face leaving the steady stream — there is no separate phone detector). Local OCR/VLM stay on **screen** signals only.
 
 ## Contract
 
@@ -14,7 +16,7 @@ Request JSON:
   "phase": "active" | "paused" | "break",
   "mime": "video/mp4" | "video/webm" | "image/jpeg",
   "data_base64": "<base64 payload, max ~8MB decoded>",
-  "client_meta": { "brightness": 0 }
+  "client_meta": { "brightness": 128, "brightness_measured": true }
 }
 ```
 
@@ -33,37 +35,41 @@ Response 200:
     "focus_ok": true,
     "source": "presage"
   },
-  "nudge": { "kind": "left_desk", "text": "You've stepped away. Come back to the work." },
+  "nudge": { "kind": "left_desk", "text": "You've stepped away. Come back to the work when you can." },
   "watching_note": "Camera accountability · present"
 }
 ```
 
-Nudge `kind` values (sparse; at most one per observe):
+Nudge `kind` values (internal tags — **never** speak the kind string; use `text`):
 
-| kind | When |
-|------|------|
-| `left_desk` / `left_desk_pause` | Absence ladder (**active** only) |
-| `welcome_back` | Confirmed return after leave (**active** only) |
-| `camera_obstructed` | Lens/lighting unclear held ~30s (**active** only) |
-| `suggest_break` | Stress → voluntary five-minute break invite (primary) |
-| `stressed` | Stress breath fallback after a recent `suggest_break` |
+| kind | Meaning | Spoken intent |
+|------|---------|---------------|
+| `left_desk` | Presage no usable face (D1 absence ladder, **active** only) — **not** a phone accusation | Stepped away — come back |
+| `suggest_break` | Stress **or** ~3 min still away (D1 mid-ladder) → voluntary break invite | Optional break card |
+| `left_desk_pause` | Still no face ~10 min — end away-nags (**not** mission pause) | Stay quiet until back |
+| `welcome_back` | Confirmed return after leave ≥20s (**active** only) | Welcome back |
+| `camera_obstructed` | Lens/lighting unclear held ~30s (**active** only) | Fix camera/lighting |
+| `stressed` | Stress breath fallback after a recent `suggest_break` | Slow breath |
 
 - `nudge` is `null` when silent (cooldown, `paused`/`break`, already spoken ladder step, etc.).
-- Rate limit: ~1 observe / 25s per user (429 if faster).
-- Do not persist video bytes. Process then discard.
-- If `PRESAGE_API_KEY` unset or Presage fails: still run presence heuristics; **`vitals` is `null`** (no invented stress). Desktop may apply local VIDEOINPUT fallback separately.
-- `vitals.stressed` from Presage when `stress_index > 150` **or** HRV/RMSSD `< 20`.
+- Rate limit: ~1 observe / 25s per user (429 if faster). Concurrent observes for the same session are serialized server-side.
+- Do not persist video bytes on the API host. Process then discard locally. **When `PRESAGE_API_KEY` is set and phase is `active`, short video clips are uploaded to Presage Physiology (third-party biometric processing).** Retention at Presage is outside Waypoint control — unset the key to disable uploads; pause/break phases never upload. Prefer shortest clips; rotate the key after vendor incidents.
+- If `PRESAGE_API_KEY` unset, Presage transport/auth fails, phase is `paused`/`break`, or mime is `image/jpeg`: still run presence heuristics with **`face_detected: null`** (uncertain — do **not** mark away); **`vitals` is `null`** (no invented stress). JPEG observes cannot detect leave/stress — desktop should send `video/mp4` or `video/webm` for accountability.
+- Empty Presage success (no usable scalars, no explicit face flag) stays **uncertain** — not away. Real leave requires an explicit vendor face/quality signal (`face_detected: false` / equivalent).
+- `vitals.stressed` from Presage when `stress_index > 150` **or** HRV/RMSSD `< 20` (zero/sentinel HRV ignored).
+- Camera ladder / stress cooldown state is **in-process only** (single API instance; restart may re-nag).
 
 ### Env
 
-`PRESAGE_API_KEY` — server only (never in the Mac app for this path).
+`PRESAGE_API_KEY` — server only (never in the Mac app for this path). Unset disables third-party video upload.
 
 ## Spirit (nudge policy)
 
 - Under ~12 words for lock-in nudges; max ~25 for check-ins.
-- Absence ladder (active phase only): first callback → second → pause acknowledgment; then stay quiet.
+- Absence ladder (active phase only; case-catalog D1 spirit): silent under ~25s → `left_desk` callback → ~3 min `suggest_break` invite → ~10 min `left_desk_pause` quiet.
   - Confirm leave after sustained away (2 observes / brief hold) so glances do not chatter.
-  - Ladder clock starts at the first away candidate; with ~25–30s observe cadence a real away (~20–60s+) gets the first `left_desk` on the confirming observe.
+  - Ladder clock starts at the first away candidate; with ~25–30s observe cadence a real away gets the first `left_desk` on the confirming observe.
+  - Do **not** accuse phone on face-lost (phone is C1 with a detector we do not run); head-down without a box is not a phone nudge.
 - Welcome-back once after confirmed return; no praise after a nudge in the same beat.
 - Stress family (`suggest_break` ↔ `stressed`):
   - Shared **180s** cooldown (`STRESS_COOLDOWN_MS`).

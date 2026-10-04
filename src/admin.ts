@@ -1,8 +1,17 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { googleConfigured, smtpConfigured, type Config } from "./config.ts";
 import { HttpError, escapeHtml, sendEmpty, sendHtml, sendJson } from "./http.ts";
+import {
+  clientIp,
+  rateLimited,
+  type RateLimiter,
+  type RateRule,
+} from "./security/rateLimit.ts";
 import type {
   AdminBrowseResult,
   AdminBrowseTable,
@@ -14,6 +23,9 @@ import type {
 const COOKIE = "wp_admin";
 const MAX_BODY = 8 * 1024;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ASSETS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "assets");
+const SHIP_ICON_PNG = readFileSync(join(ASSETS_DIR, "ship-icon.png"));
+const FAVICON_ICO = readFileSync(join(ASSETS_DIR, "favicon.ico"));
 
 const BROWSE_TABLES: { id: AdminBrowseTable; label: string; group: "product" | "google" | "auth" }[] =
   [
@@ -47,6 +59,10 @@ const PILL_KEYS = new Set([
 export type AdminDeps = {
   config: Config;
   store: Store;
+  /** Optional abuse shield for POST /admin/login (per-IP). */
+  limiter?: RateLimiter;
+  adminLoginRule?: RateRule;
+  now?: () => Date;
 };
 
 function cookieSecret(config: Config): string {
@@ -147,6 +163,13 @@ function requireAdmin(req: IncomingMessage, config: Config): void {
   }
 }
 
+function brandHeading(title: string): string {
+  return `<div class="brand">
+      <img class="brand-mark" src="/admin/favicon.png" width="36" height="36" alt="" aria-hidden="true" />
+      <h1><span class="brand-star" aria-hidden="true">✦</span> ${escapeHtml(title)}</h1>
+    </div>`;
+}
+
 function shell(title: string, body: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -154,6 +177,9 @@ function shell(title: string, body: string): string {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)}</title>
+  <link rel="icon" type="image/png" href="/admin/favicon.png" />
+  <link rel="shortcut icon" href="/admin/favicon.ico" />
+  <link rel="apple-touch-icon" href="/admin/favicon.png" />
   <style>
     :root {
       --bg: #12141a;
@@ -179,6 +205,23 @@ function shell(title: string, body: string): string {
     }
     main { max-width: 1180px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
     h1 { font-size: 1.55rem; margin: 0 0 0.35rem; letter-spacing: -0.02em; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      margin: 0 0 0.35rem;
+    }
+    .brand h1 { margin: 0; display: flex; align-items: center; gap: 0.4rem; }
+    .brand-mark {
+      width: 2.15rem;
+      height: 2.15rem;
+      border-radius: 50%;
+      display: block;
+      flex-shrink: 0;
+      object-fit: cover;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+    }
+    .brand-star { color: var(--accent); font-size: 0.95rem; }
     h2 { margin: 0 0 0.85rem; font-size: 1.05rem; }
     h3 { margin: 0 0 0.65rem; font-size: 0.88rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
     .sub { color: var(--muted); margin: 0 0 1.5rem; }
@@ -320,7 +363,7 @@ function loginPage(error?: string): string {
   return shell(
     "Waypoint Admin",
     `
-    <h1>Waypoint admin</h1>
+    ${brandHeading("Waypoint admin")}
     <p class="sub">Local operator console.</p>
     <div class="panel">
       <form method="POST" action="/admin/login" autocomplete="current-password">
@@ -370,11 +413,24 @@ function headerBar(title: string, sub: string): string {
   return `
     <div class="row" style="justify-content: space-between; margin-bottom: 0.35rem">
       <div>
-        <h1>${escapeHtml(title)}</h1>
+        ${brandHeading(title)}
         <p class="sub" style="margin:0">${sub}</p>
       </div>
       <form method="POST" action="/admin/logout"><button class="ghost" type="submit">Sign out</button></form>
     </div>`;
+}
+
+function sendAdminAsset(
+  res: ServerResponse,
+  body: Buffer,
+  contentType: string,
+): void {
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": body.length,
+    "Cache-Control": "public, max-age=86400",
+  });
+  res.end(body);
 }
 
 function shortId(value: string): string {
@@ -707,6 +763,15 @@ export async function handleAdmin(
 ): Promise<boolean> {
   if (!path.startsWith("/admin")) return false;
 
+  if (method === "GET" && path === "/admin/favicon.png") {
+    sendAdminAsset(res, SHIP_ICON_PNG, "image/png");
+    return true;
+  }
+  if (method === "GET" && path === "/admin/favicon.ico") {
+    sendAdminAsset(res, FAVICON_ICO, "image/x-icon");
+    return true;
+  }
+
   if (!deps.config.adminPassword) {
     if (method === "GET" && path === "/admin") {
       sendHtml(
@@ -714,7 +779,7 @@ export async function handleAdmin(
         503,
         shell(
           "Admin unavailable",
-          `<h1>Admin unavailable</h1><p class="sub">This console is not enabled on this server.</p>`,
+          `${brandHeading("Admin unavailable")}<p class="sub">This console is not enabled on this server.</p>`,
         ),
       );
       return true;
@@ -733,8 +798,18 @@ export async function handleAdmin(
   }
 
   if (method === "POST" && path === "/admin/login") {
+    if (deps.limiter && deps.adminLoginRule) {
+      const ip = clientIp(req, deps.config.trustProxy);
+      const nowMs = (deps.now ?? (() => new Date()))().getTime();
+      const result = deps.limiter.hit("admin-login", ip, deps.adminLoginRule, nowMs);
+      if (!result.ok) {
+        console.warn("[admin] login rate-limited for", ip);
+        throw rateLimited(result.retryAfterSeconds, "admin_login_rate_limited");
+      }
+    }
     const password = await readPassword(req);
     if (!passwordsMatch(password, deps.config.adminPassword)) {
+      console.warn("[admin] failed login attempt");
       sendHtml(res, 401, loginPage("Incorrect password."));
       return true;
     }

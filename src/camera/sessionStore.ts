@@ -59,6 +59,8 @@ export const DEFAULT_SESSION_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
 export class CameraSessionStore {
   private readonly sessions = new Map<string, CameraPresenceSession>();
+  /** Per (userId, sessionId) serialize overlapping observe analyzes. */
+  private readonly observeGates = new Map<string, Promise<void>>();
 
   getOrCreate(userId: string, sessionId: string, now: Date = new Date()): CameraPresenceSession {
     const key = sessionKey(userId, sessionId);
@@ -74,6 +76,31 @@ export class CameraSessionStore {
 
   get(userId: string, sessionId: string): CameraPresenceSession | undefined {
     return this.sessions.get(sessionKey(userId, sessionId));
+  }
+
+  /**
+   * Run `fn` exclusively for this user+session. Concurrent observes wait their turn
+   * so presence ladder mutations cannot interleave mid-analyze.
+   */
+  async withObserveLock<T>(userId: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const key = sessionKey(userId, sessionId);
+    const previous = this.observeGates.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = previous.then(
+      () => gate,
+      () => gate,
+    );
+    this.observeGates.set(key, chained);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.observeGates.get(key) === chained) this.observeGates.delete(key);
+    }
   }
 
   size(): number {
@@ -95,5 +122,6 @@ export class CameraSessionStore {
 
   clear(): void {
     this.sessions.clear();
+    this.observeGates.clear();
   }
 }

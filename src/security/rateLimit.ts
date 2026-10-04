@@ -35,6 +35,12 @@ export const DEFAULT_RATE_RULES = {
   ttsUser: { limit: 30, windowMs: MIN },
   /** Gemini/companion chat per IP. */
   chatIp: { limit: 60, windowMs: MIN },
+  /** Authenticated Gemini/companion chat per user (Gemini + Drive context). */
+  chatUser: { limit: 30, windowMs: MIN },
+  /** Admin console password guesses per IP. */
+  adminLoginIp: { limit: 5, windowMs: 15 * MIN },
+  /** Google / calendar connect poll token checks per IP. */
+  authPollIp: { limit: 120, windowMs: MIN },
   /** Camera accountability observe uploads per user (~1 / 25s). */
   cameraObserveUser: { limit: 3, windowMs: 75_000 },
 } as const satisfies Record<string, RateRule>;

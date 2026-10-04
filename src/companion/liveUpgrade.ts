@@ -51,17 +51,22 @@ function envFlag(value: string | undefined, fallback: boolean): boolean {
  * Env:
  * - LIVE_MAX_SESSIONS_PER_USER (default 2)
  * - LIVE_MAX_SESSIONS_GLOBAL (default 50)
- * - LIVE_ALLOW_QUERY_TOKEN (default on for client compatibility; set 0 to disable the
- *   deprecated query-string token)
+ * - LIVE_ALLOW_QUERY_TOKEN — deprecated `?access_token=` / `?token=`.
+ *   Default off when NODE_ENV=production or PUBLIC_BASE_URL is https (tokens leak into
+ *   proxy/CDN logs). Dev HTTP stays on for older clients unless explicitly set to 0.
  */
 export function loadLiveLimits(
   env: NodeJS.ProcessEnv = process.env,
   overrides: Partial<LiveLimits> = {},
 ): LiveLimits {
+  const production = (env.NODE_ENV ?? "").trim().toLowerCase() === "production";
+  const publicHttps = (env.PUBLIC_BASE_URL ?? "").trim().toLowerCase().startsWith("https://");
+  const defaultAllowQuery = !(production || publicHttps);
   return {
     maxPerUser: overrides.maxPerUser ?? positiveInt(env.LIVE_MAX_SESSIONS_PER_USER, 2),
     maxGlobal: overrides.maxGlobal ?? positiveInt(env.LIVE_MAX_SESSIONS_GLOBAL, 50),
-    allowQueryToken: overrides.allowQueryToken ?? envFlag(env.LIVE_ALLOW_QUERY_TOKEN, true),
+    allowQueryToken:
+      overrides.allowQueryToken ?? envFlag(env.LIVE_ALLOW_QUERY_TOKEN, defaultAllowQuery),
   };
 }
 
@@ -219,6 +224,10 @@ export function attachCompanionLiveUpgrade(
           rejectUpgrade(socket, 503, "gemini_not_configured");
           return;
         }
+        if (!deps.config.xaiApiKey) {
+          rejectUpgrade(socket, 503, "xai_not_configured");
+          return;
+        }
 
         const slot = slots.acquire(user.id);
         if (!slot.ok) {
@@ -262,8 +271,19 @@ export function attachCompanionLiveUpgrade(
   });
 }
 
+const UPGRADE_MESSAGES: Record<string, string> = {
+  unauthorized: "Sign in required for Live companion.",
+  session_secret_missing: "Sign-in is temporarily unavailable.",
+  gemini_not_configured: "Cloud voice is unavailable (Gemini Live not configured).",
+  xai_not_configured: "Cloud voice is unavailable (Grok / XAI_API_KEY not configured).",
+  too_many_live_sessions: "Too many Live sessions for this account. Close another tab and try again.",
+  live_capacity: "Live companion is at capacity. Try again shortly.",
+  upgrade_failed: "Could not start Live companion.",
+};
+
 function rejectUpgrade(socket: Duplex, status: number, code: string): void {
-  const body = JSON.stringify({ error: { code, message: code } });
+  const message = UPGRADE_MESSAGES[code] ?? "Live companion request failed.";
+  const body = JSON.stringify({ error: { code, message } });
   const reason =
     status === 401
       ? "Unauthorized"

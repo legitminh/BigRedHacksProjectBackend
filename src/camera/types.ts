@@ -7,4 +7,9 @@ export type PresageVitals = {
   focus_ok: boolean;
   source: "presage";
   raw_summary: string;
+  /**
+   * Explicit vendor face/quality signal when present.
+   * `null`/omitted means "unknown" — empty scalars must not invent away.
+   */
+  face_detected?: boolean | null;
 };

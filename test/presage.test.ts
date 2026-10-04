@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  assertSafePresageUploadUrl,
   HRV_STRESSED_MAX,
+  queueVideoHrRr,
   STRESS_INDEX_STRESSED_MIN,
   vitalsFromResult,
 } from "../src/camera/presage.ts";
@@ -68,4 +70,61 @@ test("vitalsFromResult reads last array sample for pulse/breath", () => {
   assert.equal(v.breathing_rate, 13);
   assert.equal(v.stress_index, 90);
   assert.equal(v.stressed, false);
+});
+
+test("vitalsFromResult ignores error/current collisions for breathing rate", () => {
+  assert.equal(vitalsFromResult({ error: 500 }).breathing_rate, null);
+  assert.equal(vitalsFromResult({ error_code: 12 }).breathing_rate, null);
+  assert.equal(vitalsFromResult({ current: 99 }).breathing_rate, null);
+  assert.equal(vitalsFromResult({ br: [12, 14] }).breathing_rate, 14);
+  assert.equal(vitalsFromResult({ respiratory_rr: 16 }).breathing_rate, 16);
+});
+
+test("vitalsFromResult ignores zero HRV sentinel for stress", () => {
+  const v = vitalsFromResult({ hr: 72, hrv: 0 });
+  assert.equal(v.stressed, false);
+});
+
+test("vitalsFromResult reads explicit face_detected flags", () => {
+  assert.equal(vitalsFromResult({ face_detected: false }).face_detected, false);
+  assert.equal(vitalsFromResult({ face_present: true, hr: 70 }).face_detected, true);
+  assert.equal(vitalsFromResult({}).face_detected, null);
+});
+
+test("assertSafePresageUploadUrl rejects SSRF-shaped targets", () => {
+  assert.throws(() => assertSafePresageUploadUrl("http://127.0.0.1/evil"), /https/);
+  assert.throws(() => assertSafePresageUploadUrl("https://127.0.0.1/evil"), /not allowed/);
+  assert.throws(
+    () => assertSafePresageUploadUrl("https://169.254.169.254/latest/meta-data/"),
+    /not allowed/,
+  );
+  assert.throws(() => assertSafePresageUploadUrl("https://evil.example.com/put"), /allowlisted/);
+  const ok = assertSafePresageUploadUrl(
+    "https://presage-uploads.s3.amazonaws.com/part?X-Amz-Signature=abc",
+  );
+  assert.equal(ok.hostname, "presage-uploads.s3.amazonaws.com");
+});
+
+test("queueVideoHrRr refuses incomplete multipart before complete", async () => {
+  const calls: string[] = [];
+  const fetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    calls.push(`${init?.method ?? "GET"} ${url}`);
+    if (url.endsWith("/v2/upload-url")) {
+      return new Response(
+        JSON.stringify({
+          id: "vid-1",
+          upload_id: "up-1",
+          urls: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response("unexpected", { status: 500 });
+  };
+  await assert.rejects(
+    () => queueVideoHrRr("key", Buffer.alloc(1024), "video/mp4", { fetchImpl }),
+    /no part urls/,
+  );
+  assert.ok(!calls.some((c) => c.includes("/v2/complete")));
 });

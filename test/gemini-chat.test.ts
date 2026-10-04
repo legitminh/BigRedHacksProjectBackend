@@ -50,7 +50,10 @@ test("geminiChat: non-quota failures stay gemini_failed; empty is gemini_empty",
   try {
     await assert.rejects(
       () => geminiChat({ ...base, fetchImpl: json(404, { error: { message: "model not found", status: "NOT_FOUND" } }) }),
-      (e: unknown) => e instanceof HttpError && e.code === "gemini_failed",
+      (e: unknown) =>
+        e instanceof HttpError &&
+        e.code === "gemini_failed" &&
+        !/model not found/i.test(e.message),
     );
     await assert.rejects(
       () => geminiChat({ ...base, fetchImpl: json(200, { candidates: [] }) }),

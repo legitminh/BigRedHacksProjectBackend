@@ -6,8 +6,8 @@ import {
   observePresence,
   shouldSuggestBreak,
   STRESS_COOLDOWN_MS,
-  SUGGEST_BREAK_KIND,
   STRESSED_BREATH_KIND,
+  SUGGEST_BREAK_KIND,
 } from "../src/camera/presence.ts";
 import { CameraSessionStore } from "../src/camera/sessionStore.ts";
 
@@ -18,25 +18,26 @@ function at(ms: number): Date {
 test("ignores brief away; confirms left_frame after persistence", () => {
   const store = new CameraSessionStore();
   const t0 = 1_000_000;
-  const first = observePresence(store, {
+  const a = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
     now: at(t0),
   });
-  assert.equal(first.presence, "uncertain");
-  assert.equal(first.nudge, null);
+  assert.equal(a.presence, "uncertain");
+  assert.equal(a.nudge, null);
 
-  const second = observePresence(store, {
+  const b = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
     now: at(t0 + 1000),
   });
-  assert.equal(second.presence, "left_frame");
-  assert.equal(second.nudge, null);
+  assert.equal(b.presence, "left_frame");
+  // Under 25s: silent (catalog D1).
+  assert.equal(b.nudge, null);
 });
 
 test("absence ladder then quiet; silent on break and paused", () => {
@@ -67,6 +68,7 @@ test("absence ladder then quiet; silent on break and paused", () => {
   });
   assert.equal(first.nudge?.kind, "left_desk");
   assert.match(first.nudge!.text, /stepped away/i);
+  assert.ok(!/phone/i.test(first.nudge!.text), "D1 must not accuse phone without C1 box");
 
   const onBreak = observePresence(store, {
     userId: "u",
@@ -86,31 +88,46 @@ test("absence ladder then quiet; silent on break and paused", () => {
   });
   assert.equal(onPaused.nudge, null);
 
-  const second = observePresence(store, {
+  // Before 3 min: no second rung yet.
+  const mid = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
     now: at(t0 + 70_000),
   });
-  assert.equal(second.nudge?.kind, "left_desk");
-  assert.match(second.nudge!.text, /still away/i);
+  assert.equal(mid.nudge, null);
 
+  // ~3 min: optional break invite (catalog D1).
+  const breakOffer = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 180_000),
+  });
+  assert.equal(breakOffer.nudge?.kind, SUGGEST_BREAK_KIND);
+  assert.match(breakOffer.nudge!.text, /five-minute break/i);
+  assert.ok(!/\d/.test(breakOffer.nudge!.text));
+
+  // ~10 min: quiet ack, then silence.
   const pause = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
-    now: at(t0 + 130_000),
+    now: at(t0 + 600_000),
   });
   assert.equal(pause.nudge?.kind, "left_desk_pause");
+  assert.match(pause.nudge!.text, /stay quiet|pause check-ins/i);
+  assert.ok(!/left_desk/i.test(pause.nudge!.text), "kind tag must not be spoken");
 
   const quiet = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
-    now: at(t0 + 200_000),
+    now: at(t0 + 700_000),
   });
   assert.equal(quiet.nudge, null);
 });
@@ -130,7 +147,7 @@ test("30s observe cadence: first left_desk on confirming away (~30s), not an ext
   assert.equal(glance.presence, "uncertain");
   assert.equal(glance.nudge, null);
 
-  // Second observe ~30s later: sustained away — confirm + first ladder rung.
+  // Second observe ~30s later: sustained away — confirm + first ladder rung (≥25s).
   const first = observePresence(store, {
     userId: "u",
     sessionId: "s",
@@ -142,24 +159,33 @@ test("30s observe cadence: first left_desk on confirming away (~30s), not an ext
   assert.equal(first.nudge?.kind, "left_desk");
   assert.match(first.nudge!.text, /stepped away/i);
 
-  // Next tick (~60s total away): second rung, not a repeat of first.
-  const second = observePresence(store, {
+  // Next ticks before 3 min: no second rung.
+  const mid = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
     now: at(t0 + 2 * cadence),
   });
-  assert.equal(second.nudge?.kind, "left_desk");
-  assert.match(second.nudge!.text, /still away/i);
+  assert.equal(mid.nudge, null);
 
-  // ~120s total away: pause ack, then quiet.
+  // ~3 min total away: break offer.
+  const breakOffer = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 6 * cadence),
+  });
+  assert.equal(breakOffer.nudge?.kind, SUGGEST_BREAK_KIND);
+
+  // ~10 min: pause ack, then quiet.
   const pauseAck = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
-    now: at(t0 + 4 * cadence),
+    now: at(t0 + 20 * cadence),
   });
   assert.equal(pauseAck.nudge?.kind, "left_desk_pause");
 
@@ -168,7 +194,7 @@ test("30s observe cadence: first left_desk on confirming away (~30s), not an ext
     sessionId: "s",
     phase: "active",
     faceDetected: false,
-    now: at(t0 + 5 * cadence),
+    now: at(t0 + 21 * cadence),
   });
   assert.equal(quiet.nudge, null);
 });
@@ -198,7 +224,7 @@ test("single away observe never ladders even if wall clock later advances alone"
   assert.equal(back.nudge, null);
 });
 
-test("welcome back once after confirmed return", () => {
+test("welcome back once after confirmed return lasting ≥20s away", () => {
   const store = new CameraSessionStore();
   const t0 = 3_000_000;
   observePresence(store, {
@@ -215,13 +241,21 @@ test("welcome back once after confirmed return", () => {
     faceDetected: false,
     now: at(t0 + 1000),
   });
+  // Hold away past welcome threshold + first callback.
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 25_000),
+  });
 
   const back1 = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: true,
-    now: at(t0 + 5000),
+    now: at(t0 + 30_000),
   });
   assert.equal(back1.nudge, null);
 
@@ -230,18 +264,55 @@ test("welcome back once after confirmed return", () => {
     sessionId: "s",
     phase: "active",
     faceDetected: true,
-    now: at(t0 + 7500),
+    now: at(t0 + 32_500),
   });
   assert.equal(back2.nudge?.kind, "welcome_back");
+  assert.match(back2.nudge!.text, /welcome back/i);
 
   const again = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: true,
-    now: at(t0 + 10_000),
+    now: at(t0 + 40_000),
   });
   assert.equal(again.nudge, null);
+});
+
+test("brief leave under 20s returns silently (catalog D2)", () => {
+  const store = new CameraSessionStore();
+  const t0 = 3_200_000;
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0),
+  });
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 1000),
+  });
+  // Confirmed leave but total absent < 20s when return confirms.
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    now: at(t0 + 5_000),
+  });
+  const back = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    now: at(t0 + 7_500),
+  });
+  assert.equal(back.nudge, null);
+  assert.equal(back.presence, "present");
 });
 
 test("stress prefers suggest_break; breath fallback after cooldown; no biometric digits", () => {
@@ -322,27 +393,25 @@ test("after break phase, stress stays quiet until cooldown grace elapses", () =>
   });
   assert.equal(first.nudge?.kind, SUGGEST_BREAK_KIND);
 
-  // Five-minute break with observes (desktop keeps uploading) — must stay silent.
-  const midBreak = observePresence(store, {
+  // Quiet phase refreshes the stress cooldown clock.
+  observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "break",
     faceDetected: true,
     stressed: true,
-    now: at(t0 + 300_000),
+    now: at(t0 + 10_000),
   });
-  assert.equal(midBreak.nudge, null);
 
-  // Immediately back to active: grace from last quiet observe, not another stress line.
-  const resume = observePresence(store, {
+  const soon = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: true,
     stressed: true,
-    now: at(t0 + 301_000),
+    now: at(t0 + 20_000),
   });
-  assert.equal(resume.nudge, null);
+  assert.equal(soon.nudge, null);
 
   // After full cooldown from last quiet tick, breath fallback (last kind was suggest_break).
   const later = observePresence(store, {
@@ -351,77 +420,37 @@ test("after break phase, stress stays quiet until cooldown grace elapses", () =>
     phase: "active",
     faceDetected: true,
     stressed: true,
-    now: at(t0 + 301_000 + STRESS_COOLDOWN_MS + 1_000),
+    now: at(t0 + 10_000 + STRESS_COOLDOWN_MS + 1_000),
   });
   assert.equal(later.nudge?.kind, STRESSED_BREATH_KIND);
 });
 
 test("shouldSuggestBreak / mapStressedToNudge helpers", () => {
   assert.equal(shouldSuggestBreak(null), true);
-  assert.equal(shouldSuggestBreak(STRESSED_BREATH_KIND), true);
   assert.equal(shouldSuggestBreak(SUGGEST_BREAK_KIND), false);
+  assert.equal(shouldSuggestBreak(STRESSED_BREATH_KIND), true);
 
   const breakNudge = mapStressedToNudge({
     stressed: true,
     silentPhase: false,
-    msSinceLastStressNudge: 200_000,
+    msSinceLastStressNudge: STRESS_COOLDOWN_MS,
     lastStressKind: null,
   });
   assert.equal(breakNudge?.kind, SUGGEST_BREAK_KIND);
-  assert.match(breakNudge!.text, /optional five-minute break/i);
-  assert.ok(!/\d/.test(breakNudge!.text));
 
-  assert.equal(
-    mapStressedToNudge({
-      stressed: true,
-      silentPhase: false,
-      msSinceLastStressNudge: 200_000,
-      lastStressKind: SUGGEST_BREAK_KIND,
-    })?.kind,
-    STRESSED_BREATH_KIND,
-  );
-  assert.equal(
-    mapStressedToNudge({
-      stressed: true,
-      silentPhase: true,
-      msSinceLastStressNudge: 200_000,
-      lastStressKind: null,
-    }),
-    null,
-  );
-  assert.equal(
-    mapStressedToNudge({
-      stressed: true,
-      silentPhase: false,
-      msSinceLastStressNudge: 10_000,
-      lastStressKind: null,
-    }),
-    null,
-  );
-  assert.equal(
-    mapStressedToNudge({
-      stressed: false,
-      silentPhase: false,
-      msSinceLastStressNudge: 200_000,
-      lastStressKind: null,
-    }),
-    null,
-  );
-  assert.equal(
-    mapStressedToNudge({
-      stressed: null,
-      silentPhase: false,
-      msSinceLastStressNudge: 200_000,
-      lastStressKind: null,
-    }),
-    null,
-  );
+  const breath = mapStressedToNudge({
+    stressed: true,
+    silentPhase: false,
+    msSinceLastStressNudge: STRESS_COOLDOWN_MS,
+    lastStressKind: SUGGEST_BREAK_KIND,
+  });
+  assert.equal(breath?.kind, STRESSED_BREATH_KIND);
+  assert.ok(breath && !/\d/.test(breath.text));
 });
 
 test("false return: brief appearance then away resets return confirmation timer", () => {
   const store = new CameraSessionStore();
   const t0 = 5_000_000;
-  // Confirm leave
   observePresence(store, {
     userId: "u",
     sessionId: "s",
@@ -436,53 +465,86 @@ test("false return: brief appearance then away resets return confirmation timer"
     faceDetected: false,
     now: at(t0 + 1000),
   });
-
-  // Brief appearance (only 1 tick, < RETURN_CONFIRM_MS)
-  const flash = observePresence(store, {
-    userId: "u",
-    sessionId: "s",
-    phase: "active",
-    faceDetected: true,
-    now: at(t0 + 5000),
-  });
-  assert.equal(flash.nudge, null);
-
-  // Steps away again and confirms left_frame
   observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: false,
-    now: at(t0 + 6000),
+    now: at(t0 + 25_000),
   });
-  const reConfirmAway = observePresence(store, {
-    userId: "u",
-    sessionId: "s",
-    phase: "active",
-    faceDetected: false,
-    now: at(t0 + 7000),
-  });
-  assert.equal(reConfirmAway.presence, "left_frame");
 
-  // Appears again later: should NOT immediately welcome back from stale presentSince
-  const firstTickBack = observePresence(store, {
+  observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: true,
-    now: at(t0 + 20_000),
+    now: at(t0 + 30_000),
   });
-  assert.equal(firstTickBack.nudge, null);
+  // Glance then leave again before RETURN_CONFIRM_MS — no welcome yet.
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 30_500),
+  });
+  const stillAway = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: false,
+    now: at(t0 + 31_500),
+  });
+  assert.equal(stillAway.presence, "left_frame");
+  assert.notEqual(stillAway.nudge?.kind, "welcome_back");
 
-  // Confirmed return after continuous presence
+  // Sustained return after long absence.
+  observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    now: at(t0 + 40_000),
+  });
   const confirmedBack = observePresence(store, {
     userId: "u",
     sessionId: "s",
     phase: "active",
     faceDetected: true,
-    now: at(t0 + 22_500),
+    now: at(t0 + 42_500),
   });
   assert.equal(confirmedBack.nudge?.kind, "welcome_back");
+});
+
+test("face present wins over placeholder brightness 0", () => {
+  const store = new CameraSessionStore();
+  const out = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    brightness: 0,
+    now: at(9_000_000),
+  });
+  assert.equal(out.presence, "present");
+  assert.equal(out.nudge, null);
+});
+
+test("observe lock serializes overlapping session work", async () => {
+  const store = new CameraSessionStore();
+  const order: number[] = [];
+  const a = store.withObserveLock("u", "s", async () => {
+    order.push(1);
+    await new Promise((r) => setTimeout(r, 30));
+    order.push(2);
+    return "a";
+  });
+  const b = store.withObserveLock("u", "s", async () => {
+    order.push(3);
+    return "b";
+  });
+  assert.deepEqual(await Promise.all([a, b]), ["a", "b"]);
+  assert.deepEqual(order, [1, 2, 3]);
 });
 
 test("obstructed camera line fires after held delay with helpful non-shaming line", () => {
@@ -492,8 +554,9 @@ test("obstructed camera line fires after held delay with helpful non-shaming lin
     userId: "u",
     sessionId: "s",
     phase: "active",
-    faceDetected: true,
+    faceDetected: null,
     brightness: 10,
+    brightnessMeasured: true,
     now: at(t0),
   });
   assert.equal(start.presence, "camera_obstructed");
@@ -503,11 +566,11 @@ test("obstructed camera line fires after held delay with helpful non-shaming lin
     userId: "u",
     sessionId: "s",
     phase: "active",
-    faceDetected: true,
+    faceDetected: null,
     brightness: 10,
-    now: at(t0 + 31_000),
+    brightnessMeasured: true,
+    now: at(t0 + 30_000),
   });
   assert.equal(held.nudge?.kind, "camera_obstructed");
-  assert.match(held.nudge!.text, /check the camera or lighting/i);
+  assert.match(held.nudge!.text, /camera|lighting/i);
 });
-

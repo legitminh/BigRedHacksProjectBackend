@@ -135,6 +135,9 @@ export function allowedOllamaModels(config: Config): Set<string> {
 /** Upper bounds so a caller cannot pin the GPU with huge contexts / endless generations. */
 const MAX_NUM_PREDICT = 4096;
 
+const MAX_GENERATE_IMAGES = 2;
+const MAX_IMAGE_B64_CHARS = 2 * 1024 * 1024;
+
 function normalizeGenerateBody(config: Config, body: unknown): Record<string, unknown> {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "invalid_body", "Generate body must be a JSON object.");
@@ -148,8 +151,37 @@ function normalizeGenerateBody(config: Config, body: unknown): Record<string, un
     // Do not echo the allowlist back — just say it is not served here.
     throw new HttpError(403, "model_not_allowed", "That model is not available on this server.");
   }
-  // Proxy always returns a single JSON object; streaming NDJSON is not supported.
-  const out: Record<string, unknown> = { ...input, stream: false };
+  // Explicit allowlist — do not forward arbitrary client keys (e.g. huge images arrays).
+  const out: Record<string, unknown> = {
+    model: model.trim(),
+    stream: false,
+  };
+  if (typeof input.prompt === "string") out.prompt = input.prompt;
+  if (typeof input.system === "string") out.system = input.system;
+  if (typeof input.template === "string") out.template = input.template;
+  if (typeof input.raw === "boolean") out.raw = input.raw;
+  if (typeof input.keep_alive === "string" || typeof input.keep_alive === "number") {
+    out.keep_alive = input.keep_alive;
+  }
+  if (input.images !== undefined) {
+    if (!Array.isArray(input.images)) {
+      throw new HttpError(400, "invalid_body", "images must be an array of base64 strings.");
+    }
+    if (input.images.length > MAX_GENERATE_IMAGES) {
+      throw new HttpError(400, "invalid_body", `At most ${MAX_GENERATE_IMAGES} images are allowed.`);
+    }
+    const images: string[] = [];
+    for (const img of input.images) {
+      if (typeof img !== "string" || !img.trim()) {
+        throw new HttpError(400, "invalid_body", "Each image must be a non-empty base64 string.");
+      }
+      if (img.length > MAX_IMAGE_B64_CHARS) {
+        throw new HttpError(400, "invalid_body", "Image payload is too large.");
+      }
+      images.push(img);
+    }
+    if (images.length > 0) out.images = images;
+  }
   if (input.options !== undefined) {
     if (input.options === null || typeof input.options !== "object" || Array.isArray(input.options)) {
       throw new HttpError(400, "invalid_body", "options must be an object.");

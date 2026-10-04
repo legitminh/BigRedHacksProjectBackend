@@ -6,6 +6,9 @@ export type ChatTurn = {
   content: string;
 };
 
+/** Cap hung Gemini HTTPS calls so handlers do not pin until the reverse-proxy read timeout. */
+export const GEMINI_CHAT_TIMEOUT_MS = 90_000;
+
 export async function geminiChat(input: {
   apiKey: string;
   model: string;
@@ -35,8 +38,13 @@ export async function geminiChat(input: {
         contents,
         generationConfig: { temperature: 0.4 },
       }),
+      signal: AbortSignal.timeout(GEMINI_CHAT_TIMEOUT_MS),
     });
-  } catch {
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "";
+    if (name === "TimeoutError" || name === "AbortError") {
+      throw new HttpError(502, "gemini_unreachable", "Cloud coach timed out.");
+    }
     throw new HttpError(502, "gemini_unreachable", "Could not reach Gemini.");
   }
 
@@ -59,7 +67,11 @@ export async function geminiChat(input: {
         "Cloud coach hit today’s free limit. Try again tomorrow, or keep using local lock-in coaching.",
       );
     }
-    throw new HttpError(502, "gemini_failed", msg);
+    throw new HttpError(
+      502,
+      "gemini_failed",
+      "Cloud coach failed. Try again, or keep using local lock-in coaching.",
+    );
   }
 
   const text = payload?.candidates?.[0]?.content?.parts

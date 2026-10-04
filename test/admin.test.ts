@@ -25,13 +25,14 @@ function appConfig(extra: Record<string, string> = {}): Config {
 
 async function withApp(
   fn: (base: string, store: Store) => Promise<void>,
-  options: { config?: Config } = {},
+  options: { config?: Config; rateRules?: Parameters<typeof createApp>[0]["rateRules"] } = {},
 ): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "waypoint-admin-"));
   const store = openFileStore(join(dir, "store.json"));
   const server: Server = createApp({
     config: options.config ?? appConfig(),
     store,
+    rateRules: options.rateRules,
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
   const address = server.address() as AddressInfo;
@@ -50,7 +51,23 @@ test("GET /admin shows login when configured", async () => {
     assert.equal(res.status, 200);
     const html = await res.text();
     assert.match(html, /Admin password/);
+    assert.match(html, /brand-mark/);
+    assert.match(html, /\/admin\/favicon\.png/);
     assert.doesNotMatch(html, /Recent users/);
+  });
+});
+
+test("admin favicon is public", async () => {
+  await withApp(async (base) => {
+    const png = await fetch(`${base}/admin/favicon.png`);
+    assert.equal(png.status, 200);
+    assert.match(png.headers.get("content-type") ?? "", /image\/png/);
+    const bytes = Buffer.from(await png.arrayBuffer());
+    assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+
+    const ico = await fetch(`${base}/admin/favicon.ico`);
+    assert.equal(ico.status, 200);
+    assert.match(ico.headers.get("content-type") ?? "", /image\/x-icon|image\/vnd\.microsoft\.icon/);
   });
 });
 
@@ -65,6 +82,32 @@ test("wrong password is rejected", async () => {
     assert.equal(res.status, 401);
     assert.match(await res.text(), /Incorrect password/);
   });
+});
+
+test("admin login is rate-limited per IP", async () => {
+  await withApp(
+    async (base) => {
+      for (let i = 0; i < 2; i += 1) {
+        const res = await fetch(`${base}/admin/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "password=nope",
+          redirect: "manual",
+        });
+        assert.equal(res.status, 401);
+      }
+      const blocked = await fetch(`${base}/admin/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `password=${encodeURIComponent(ADMIN_PASSWORD)}`,
+        redirect: "manual",
+      });
+      assert.equal(blocked.status, 429);
+      const body = (await blocked.json()) as { error: { code: string } };
+      assert.equal(body.error.code, "admin_login_rate_limited");
+    },
+    { rateRules: { adminLoginIp: { limit: 2, windowMs: 60_000 } } },
+  );
 });
 
 test("correct password sets cookie and opens dashboard", async () => {
