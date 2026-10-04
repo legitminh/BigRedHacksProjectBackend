@@ -1,6 +1,8 @@
 # Camera accountability (server-side)
 
-Inspired by [VIDEOINPUT](https://github.com/dhanvi2612/VIDEOINPUT): camera → Presage scalars + presence state on the **API**; desktop only captures short clips and uploads them. Sparse nudges; never recite HR/RR numbers; no nagging during pause/break; short calm lines that point back to the work.
+Inspired by [VIDEOINPUT](https://github.com/dhanvi2612/VIDEOINPUT): camera → **Presage** scalars + presence state on the **API**; desktop only captures short clips and uploads them. Sparse nudges; never recite HR/RR numbers; no nagging during pause/break; short calm lines that point back to the work.
+
+**Do not** run a local LLM / VLM on webcam frames for `left_desk` / phone / stress. Presage owns face-lost and vitals (VIDEOINPUT: phone pickup is inferred as face leaving the steady stream — there is no separate phone detector). Local OCR/VLM stay on **screen** signals only.
 
 ## Contract
 
@@ -33,7 +35,7 @@ Response 200:
     "focus_ok": true,
     "source": "presage"
   },
-  "nudge": { "kind": "left_desk", "text": "Looks like you stepped away. Come back when you can." },
+  "nudge": { "kind": "left_desk", "text": "Camera lost you — phone down or back to the desk." },
   "watching_note": "Camera accountability · present"
 }
 ```
@@ -42,8 +44,8 @@ Nudge `kind` values (internal tags — **never** speak the kind string; use `tex
 
 | kind | Meaning | Spoken intent |
 |------|---------|---------------|
-| `left_desk` | Confirmed out of frame (absence ladder, **active** only) | Stepped away — come back |
-| `left_desk_pause` | Still away ~2 min — end away-nags for this leave (**not** mission pause) | Pause check-ins until back |
+| `left_desk` | Presage face-lost / no usable face (absence ladder, **active** only) | Phone down or back to desk |
+| `left_desk_pause` | Still no face ~2 min — end away-nags for this leave (**not** mission pause) | Pause check-ins until back |
 | `welcome_back` | Confirmed return after leave (**active** only) | Welcome back |
 | `camera_obstructed` | Lens/lighting unclear held ~30s (**active** only) | Fix camera/lighting |
 | `suggest_break` | Stress → voluntary five-minute break invite (primary) | Optional break card |

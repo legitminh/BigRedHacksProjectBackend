@@ -66,7 +66,7 @@ test("absence ladder then quiet; silent on break and paused", () => {
     now: at(t0 + 25_000),
   });
   assert.equal(first.nudge?.kind, "left_desk");
-  assert.match(first.nudge!.text, /stepped away/i);
+  assert.match(first.nudge!.text, /camera lost you|phone down|stepped away/i);
 
   const onBreak = observePresence(store, {
     userId: "u",
@@ -142,7 +142,7 @@ test("30s observe cadence: first left_desk on confirming away (~30s), not an ext
   });
   assert.equal(first.presence, "left_frame");
   assert.equal(first.nudge?.kind, "left_desk");
-  assert.match(first.nudge!.text, /stepped away/i);
+  assert.match(first.nudge!.text, /camera lost you|phone down|stepped away/i);
 
   // Next tick (~60s total away): second rung, not a repeat of first.
   const second = observePresence(store, {

@@ -131,10 +131,9 @@ export async function handleCameraObserve(
         "[camera/observe] Presage failed:",
         err instanceof Error ? err.message : err,
       );
-      // Treat analyze failures like "no usable face signal" so the away /
-      // obstructed ladder can still confirm (phone-over-lens, walk-away).
-      // A single failure stays silent (AWAY_CONFIRM_OBSERVES=2); network blips
-      // alone do not speak. vitals stay null — never invent stress.
+      // VIDEOINPUT: leave/phone-down is Presage face-lost, not a local LLM.
+      // Sustained analyze failures (covered lens / walk-away) count as no face;
+      // a single failure stays silent (AWAY_CONFIRM_OBSERVES=2). vitals stay null.
       faceDetected = false;
     }
   } else if (!isVideo) {

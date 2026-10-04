@@ -53,24 +53,26 @@ const AWAY_CONFIRM_MS = 5_000;
  * Kind is an internal tag — spoken `text` is what the student hears. Never surface
  * the kind string in UI/TTS.
  *
- * - `left_desk`: camera confirmed you’re out of frame (not a browser/app).
- * - `left_desk_pause`: still away after ~2 min — stop nagging (does NOT pause the mission).
+ * VIDEOINPUT / Presage only (no local LLM on webcam):
+ * - `left_desk`: Presage lost a usable face signal (walk-away or phone-down / face_lost).
+ * - `left_desk_pause`: still no face ~2 min — stop nagging (does NOT pause the mission).
  * - `welcome_back`: face confirmed back after a leave.
  * - `camera_obstructed`: lens/lighting too dark to judge presence.
- * - `suggest_break` / `stressed`: stress family (present only); break is suggestion-only.
+ * - `suggest_break` / `stressed`: Presage stress scalars (present only); break is suggestion-only.
  */
 const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: string }> = [
   {
     step: "first",
     afterMs: 20_000,
     kind: "left_desk",
-    text: "Looks like you stepped away. Come back when you can.",
+    // Presage has no phone box detector — face_lost covers walk-away and phone pickup.
+    text: "Camera lost you — phone down or back to the desk.",
   },
   {
     step: "second",
     afterMs: 60_000,
     kind: "left_desk",
-    text: "Still away — return to the desk when you're ready.",
+    text: "Still away from the camera — return when you're ready.",
   },
   {
     step: "pause",
