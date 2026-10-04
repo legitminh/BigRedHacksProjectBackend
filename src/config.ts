@@ -32,6 +32,11 @@ export type Config = {
   /** Built-in xAI voice id (eve, ara, …). Defaults to eve. */
   xaiTtsVoice: string;
   /**
+   * Presage Technologies API key for camera accountability vitals (`POST /v1/camera/observe`).
+   * Stays on this server only — never bake into Waypoint.app.
+   */
+  presageApiKey: string | null;
+  /**
    * Which engine serves Copilot chat when local inference is preferred.
    * - `ollama`: always use Ollama (`OLLAMA_CHAT_MODEL`); never call Gemini for chat.
    * - `gemini`: Gemini first; silent Ollama fallback on quota/outage (cloud companion path).
@@ -184,6 +189,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     geminiLiveModel: nonempty(env.GEMINI_LIVE_MODEL) ?? "gemini-3.8-live",
     xaiApiKey: nonempty(env.XAI_API_KEY),
     xaiTtsVoice: nonempty(env.XAI_TTS_VOICE) ?? "eve",
+    presageApiKey: nonempty(env.PRESAGE_API_KEY),
     // Default gemini keeps cloud companion; set LOCAL_CHAT_PROVIDER=ollama to force Llama.
     localChatProvider: parseLocalChatProvider(env.LOCAL_CHAT_PROVIDER),
     // Default local Ollama when unset. Set OLLAMA_BASE_URL= (empty) to disable the proxy.

@@ -171,7 +171,8 @@ test("GET /v1/status reports config-only for anonymous callers (no live probes)"
       assert.equal(byId(body, "google_oauth").state, "ok");
       assert.equal(byId(body, "account").state, "warn");
       assert.equal(byId(body, "google").state, "warn");
-      assert.ok(!body.services.some((s) => s.id === "presage"));
+      assert.equal(byId(body, "presage").state, "warn");
+      assert.equal(byId(body, "presage").status, "Degraded");
       assert.equal(geminiHits, 0);
       assert.equal(ollamaHits, 0);
     },

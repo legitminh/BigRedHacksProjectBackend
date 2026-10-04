@@ -237,6 +237,28 @@ function apiIndicator(store: Store): ServiceIndicator {
   };
 }
 
+/** Config-only — no outbound Presage probe (key presence only). */
+function presageIndicator(config: Config): ServiceIndicator {
+  if (config.presageApiKey) {
+    return {
+      id: "presage",
+      label: "Presage",
+      state: "ok",
+      status: "Configured",
+      detail: "Camera accountability vitals ready",
+      optional: true,
+    };
+  }
+  return {
+    id: "presage",
+    label: "Presage",
+    state: "warn",
+    status: "Degraded",
+    detail: "PRESAGE_API_KEY unset — presence heuristics only; vitals unavailable",
+    optional: true,
+  };
+}
+
 function googleOauthIndicator(config: Config): ServiceIndicator {
   const ready = googleConfigured(config);
   return {
@@ -398,9 +420,11 @@ export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse>
     accountIndicator(deps.user),
     googleOauthIndicator(deps.config),
     apiIndicator(deps.store),
+    presageIndicator(deps.config),
   ];
 
   // Gemini-only failures do not flip ok when Copilot can fall back (chat_provider).
+  // `presage` is optional — missing key is warn/Degraded and does not flip ok.
   const critical = new Set(["api", "google_oauth", "ollama", "chat_provider"]);
   const hardDown = services.some((s) => critical.has(s.id) && s.state === "err");
   return {

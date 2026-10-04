@@ -21,6 +21,7 @@ import {
   rateLimited,
   type RateRules,
 } from "./security/rateLimit.ts";
+import { CameraSessionStore } from "./camera/sessionStore.ts";
 import { handleProduct, type ProductDeps } from "./product/routes.ts";
 import { handleVoiceHealth, handleVoiceTts } from "./voice/tts.ts";
 import { aggregateStatus } from "./status/aggregate.ts";
@@ -56,6 +57,10 @@ export type AppDeps = {
   rateRules?: Partial<RateRules>;
   /** Per-mailbox OTP brute-force guard; defaults to 5 failures → 15 min lockout. */
   emailCodeGuard?: EmailCodeGuard;
+  /** Shared camera presence store (defaults to one per app process). */
+  cameraSessions?: CameraSessionStore;
+  /** Override Presage analyze for tests. */
+  cameraAnalyze?: ProductDeps["cameraAnalyze"];
 };
 
 type Shields = {
@@ -69,7 +74,12 @@ type HandleDeps = Required<
     AppDeps,
     "config" | "store" | "pending" | "google" | "mailer" | "calendar" | "drive" | "calendarConnects" | "now" | "fetch"
   >
-> & { shields: Shields; liveChat?: ProductDeps["liveChat"] };
+> & {
+  shields: Shields;
+  liveChat?: ProductDeps["liveChat"];
+  cameraSessions: CameraSessionStore;
+  cameraAnalyze?: ProductDeps["cameraAnalyze"];
+};
 
 function shieldIp(deps: HandleDeps, req: IncomingMessage): string {
   return clientIp(req, deps.config.trustProxy);
@@ -153,6 +163,7 @@ export function createApp(deps: AppDeps): Server {
   const calendar = deps.calendar ?? createCalendarClient(fetchImpl);
   const drive = deps.drive ?? createDriveClient(fetchImpl);
   const calendarConnects = deps.calendarConnects ?? new CalendarConnects();
+  const cameraSessions = deps.cameraSessions ?? new CameraSessionStore();
   const shields: Shields = {
     limiter: deps.limiter ?? new RateLimiter(),
     rules: { ...DEFAULT_RATE_RULES, ...deps.rateRules },
@@ -167,6 +178,7 @@ export function createApp(deps: AppDeps): Server {
     }
     void handle(req, res, {
       ...deps,
+      cameraSessions,
       pending,
       google,
       mailer,
@@ -300,6 +312,11 @@ async function handle(
   if (method === "POST" && (path === "/v1/gemini/chat" || path === "/v1/companion/chat")) {
     limit(deps, "chat", shieldIp(deps, req), "chatIp");
   }
+  if (method === "POST" && path === "/v1/camera/observe") {
+    // Meter by user id when JWT is present; fall back to IP before auth fails inside product.
+    const user = await optionalUser(deps, req, deps.now());
+    limit(deps, "camera-observe", user?.id ?? shieldIp(deps, req), "cameraObserveUser");
+  }
   if (
     await handleProduct(method, path, url, req, res, {
       config: deps.config,
@@ -311,6 +328,8 @@ async function handle(
       now: deps.now,
       fetch: deps.fetch,
       liveChat: deps.liveChat,
+      cameraSessions: deps.cameraSessions,
+      cameraAnalyze: deps.cameraAnalyze,
     })
   ) {
     return;

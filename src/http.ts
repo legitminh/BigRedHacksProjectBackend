@@ -86,6 +86,8 @@ export function originAllowed(origin: string, extra: string[]): boolean {
 export const JSON_BODY_MAX = 16 * 1024;
 /** Chat/companion bodies carry history + calendar/Drive context. */
 export const CHAT_BODY_MAX = 256 * 1024;
+/** Camera observe bodies carry base64 clips (see CAMERA_BODY_MAX in camera/routes). */
+export const CAMERA_JSON_BODY_MAX = 12 * 1024 * 1024;
 
 export async function readJson(req: IncomingMessage, maxBytes = JSON_BODY_MAX): Promise<unknown> {
   const chunks: Buffer[] = [];

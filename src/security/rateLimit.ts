@@ -37,6 +37,8 @@ export const DEFAULT_RATE_RULES = {
   ttsUser: { limit: 30, windowMs: MIN },
   /** Gemini/companion chat per IP. */
   chatIp: { limit: 60, windowMs: MIN },
+  /** Camera accountability observe uploads per user (~1 / 25s). */
+  cameraObserveUser: { limit: 3, windowMs: 75_000 },
 } as const satisfies Record<string, RateRule>;
 
 export type RateRules = { [K in keyof typeof DEFAULT_RATE_RULES]: RateRule };

@@ -44,6 +44,8 @@ import {
   type Level,
 } from "./model.ts";
 import type { PublicUser, Store } from "../store/types.ts";
+import { handleCameraObserve, type CameraAnalyzeFn } from "../camera/routes.ts";
+import type { CameraSessionStore } from "../camera/sessionStore.ts";
 
 /** Calendar write + Drive read for Copilot (second consent after Waypoint Google sign-in). */
 const GOOGLE_DATA_SCOPES =
@@ -60,6 +62,10 @@ export type ProductDeps = {
   fetch: FetchLike;
   /** Override Live text chat (tests). Default: short-lived Gemini Live TEXT session. */
   liveChat?: (input: LiveChatInput) => Promise<string>;
+  /** In-memory presence state for camera accountability. */
+  cameraSessions?: CameraSessionStore;
+  /** Override Presage analyze (tests). */
+  cameraAnalyze?: CameraAnalyzeFn;
 };
 
 function nowSeconds(now: Date): number {
@@ -121,7 +127,8 @@ function isProductPath(path: string): boolean {
     path === "/v1/tasks" ||
     path === "/v1/tasks/active" ||
     path.startsWith("/v1/tasks/") ||
-    path === "/v1/sessions"
+    path === "/v1/sessions" ||
+    path === "/v1/camera/observe"
   );
 }
 
@@ -135,6 +142,22 @@ export async function handleProduct(
 ): Promise<boolean> {
   if (!isProductPath(path)) return false;
   const now = deps.now();
+
+  if (method === "POST" && path === "/v1/camera/observe") {
+    const user = await requireUser(deps, req, now);
+    // Must be the shared process store from createApp — a per-request store
+    // would reset presence ladder / welcome-back state every call.
+    if (!deps.cameraSessions) {
+      throw new HttpError(503, "camera_unavailable", "Camera accountability is unavailable.");
+    }
+    await handleCameraObserve(req, res, user, {
+      config: deps.config,
+      now: deps.now,
+      store: deps.cameraSessions,
+      analyzeClip: deps.cameraAnalyze,
+    });
+    return true;
+  }
 
   if (method === "GET" && path === "/v1/memory") {
     const user = await requireUser(deps, req, now);
