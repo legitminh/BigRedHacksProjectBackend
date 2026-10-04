@@ -104,6 +104,8 @@ test("absence ladder then quiet; silent on break and paused", () => {
     now: at(t0 + 130_000),
   });
   assert.equal(pause.nudge?.kind, "left_desk_pause");
+  assert.match(pause.nudge!.text, /pause check-ins|stay quiet/i);
+  assert.ok(!/left_desk/i.test(pause.nudge!.text), "kind tag must not be spoken");
 
   const quiet = observePresence(store, {
     userId: "u",

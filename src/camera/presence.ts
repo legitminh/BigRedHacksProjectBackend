@@ -49,25 +49,35 @@ const AWAY_CONFIRM_MS = 5_000;
  * Timings are wall-clock from when the away candidate began (not from confirm tick),
  * so with ~25–30s observe cadence a real away (~20–60s+) gets a first nudge on the
  * confirming observe — not an extra full period later.
+ *
+ * Kind is an internal tag — spoken `text` is what the student hears. Never surface
+ * the kind string in UI/TTS.
+ *
+ * - `left_desk`: camera confirmed you’re out of frame (not a browser/app).
+ * - `left_desk_pause`: still away after ~2 min — stop nagging (does NOT pause the mission).
+ * - `welcome_back`: face confirmed back after a leave.
+ * - `camera_obstructed`: lens/lighting too dark to judge presence.
+ * - `suggest_break` / `stressed`: stress family (present only); break is suggestion-only.
  */
 const LADDER: Array<{ step: LadderStep; afterMs: number; kind: string; text: string }> = [
   {
     step: "first",
     afterMs: 20_000,
     kind: "left_desk",
-    text: "You've stepped away. Come back to the work.",
+    text: "Looks like you stepped away. Come back when you can.",
   },
   {
     step: "second",
     afterMs: 60_000,
     kind: "left_desk",
-    text: "Still away — pick the task back up when you can.",
+    text: "Still away — return to the desk when you're ready.",
   },
   {
     step: "pause",
     afterMs: 120_000,
     kind: "left_desk_pause",
-    text: "I'll stay quiet until you're back at the desk.",
+    // Not mission pause — just end the away-nudge ladder for this absence.
+    text: "Still away — I'll pause check-ins until you're back.",
   },
 ];
 const OBSTRUCTED_MS = 30_000;
@@ -78,6 +88,9 @@ const RETURN_CONFIRM_MS = 2_000;
 // Keep under ~12 words; never include digits (HR/RR/%). Spell out "five".
 const SUGGEST_BREAK_TEXT = "Feeling tense — optional five-minute break?";
 const STRESSED_BREATH_TEXT = "You seem tense — one slow breath, then back.";
+const WELCOME_BACK_TEXT = "Welcome back. Stay with the work.";
+const CAMERA_OBSTRUCTED_TEXT =
+  "I can't see you clearly. Check the camera or lighting.";
 
 /** Pause and break phases: no spoken nudges. */
 export function isSilentCameraPhase(phase: CameraPhase): boolean {
@@ -187,7 +200,7 @@ export function observePresence(
       session.obstructedSaid = true;
       nudge = {
         kind: "camera_obstructed",
-        text: "I can't see you clearly. Check the camera or lighting.",
+        text: CAMERA_OBSTRUCTED_TEXT,
       };
     }
     return { presence: session.presence, nudge, watching_note: watchingNote(session.presence) };
@@ -251,7 +264,7 @@ export function observePresence(
     if (backMs >= RETURN_CONFIRM_MS) {
       if (!silentPhase && !session.welcomedBack) {
         session.welcomedBack = true;
-        nudge = { kind: "welcome_back", text: "Welcome back. Stay with the work." };
+        nudge = { kind: "welcome_back", text: WELCOME_BACK_TEXT };
       }
       resetAbsence(session);
     }

@@ -33,20 +33,21 @@ Response 200:
     "focus_ok": true,
     "source": "presage"
   },
-  "nudge": { "kind": "left_desk", "text": "You've stepped away. Come back to the work." },
+  "nudge": { "kind": "left_desk", "text": "Looks like you stepped away. Come back when you can." },
   "watching_note": "Camera accountability · present"
 }
 ```
 
-Nudge `kind` values (sparse; at most one per observe):
+Nudge `kind` values (internal tags — **never** speak the kind string; use `text`):
 
-| kind | When |
-|------|------|
-| `left_desk` / `left_desk_pause` | Absence ladder (**active** only) |
-| `welcome_back` | Confirmed return after leave (**active** only) |
-| `camera_obstructed` | Lens/lighting unclear held ~30s (**active** only) |
-| `suggest_break` | Stress → voluntary five-minute break invite (primary) |
-| `stressed` | Stress breath fallback after a recent `suggest_break` |
+| kind | Meaning | Spoken intent |
+|------|---------|---------------|
+| `left_desk` | Confirmed out of frame (absence ladder, **active** only) | Stepped away — come back |
+| `left_desk_pause` | Still away ~2 min — end away-nags for this leave (**not** mission pause) | Pause check-ins until back |
+| `welcome_back` | Confirmed return after leave (**active** only) | Welcome back |
+| `camera_obstructed` | Lens/lighting unclear held ~30s (**active** only) | Fix camera/lighting |
+| `suggest_break` | Stress → voluntary five-minute break invite (primary) | Optional break card |
+| `stressed` | Stress breath fallback after a recent `suggest_break` | Slow breath |
 
 - `nudge` is `null` when silent (cooldown, `paused`/`break`, already spoken ladder step, etc.).
 - Rate limit: ~1 observe / 25s per user (429 if faster).
