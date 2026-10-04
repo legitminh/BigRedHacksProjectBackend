@@ -17,7 +17,8 @@ import {
 import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
 import { buildCompanionChatSystem, buildCopilotChatSystem } from "../companion/geminiLive.ts";
 import { createDriveClient, summarizeDriveFiles, type DriveClient } from "../drive/client.ts";
-import { geminiLiveChat, type LiveChatInput } from "../gemini/liveChat.ts";
+import { geminiChat, type ChatTurn } from "../gemini/chat.ts";
+import type { LiveChatInput } from "../gemini/liveChat.ts";
 import {
   isLocalChatForced,
   ollamaChat,
@@ -60,7 +61,11 @@ export type ProductDeps = {
   calendarConnects: CalendarConnects;
   now: () => Date;
   fetch: FetchLike;
-  /** Override Live text chat (tests). Default: short-lived Gemini Live TEXT session. */
+  /**
+   * Override cloud text chat (tests).
+   * Production uses REST generateContent with GEMINI_MODEL (Flash-Lite free tier).
+   * Live (GEMINI_LIVE_MODEL) stays for voice companion only.
+   */
   liveChat?: (input: LiveChatInput) => Promise<string>;
   /** In-memory presence state for camera accountability. */
   cameraSessions?: CameraSessionStore;
@@ -586,19 +591,28 @@ async function chatWithLocalFallback(
   }
 
   try {
-    // Per-request Live TEXT WebSocket — isolated system/history; no shared session state.
-    const chat = deps.liveChat ?? geminiLiveChat;
-    return await chat({
+    // REST Flash-Lite (free tier). Live AUDIO is voice-only — not HTTP Copilot.
+    if (deps.liveChat) {
+      return await deps.liveChat({
+        apiKey: deps.config.geminiApiKey,
+        model: deps.config.geminiModel,
+        system: input.system,
+        history: input.history,
+        message: input.message,
+      });
+    }
+    return await geminiChat({
       apiKey: deps.config.geminiApiKey,
-      model: deps.config.geminiLiveModel,
+      model: deps.config.geminiModel,
       system: input.system,
-      history: input.history,
+      history: input.history as ChatTurn[],
       message: input.message,
+      fetchImpl: deps.fetch,
     });
   } catch (error) {
     if (!localReady || !shouldFallbackToLocal(error)) throw error;
     console.warn(
-      "Gemini Live chat unavailable; falling back to local Ollama model",
+      "Gemini chat unavailable; falling back to local Ollama model",
       deps.config.ollamaChatModel,
       error instanceof HttpError ? error.code : error,
     );

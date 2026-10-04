@@ -9,18 +9,19 @@ import {
   buildCompanionChatSystem,
   buildCompanionSystem,
   buildCopilotChatSystem,
+  denyToolResponse,
   MAX_UNTRUSTED_GOALS_CHARS,
   MAX_UNTRUSTED_NOTES_CHARS,
   sanitizeUntrustedText,
   SERVER_SAFETY_PREAMBLE,
   sampleRateFromMime,
-  screencapToolResponse,
   SCREENCAP_TOOL,
   chatTurnsMessage,
   setupMessage,
   setupTextLiveMessage,
   signalsFromMessage,
   toolCallsFromMessage,
+  DEFAULT_LIVE_SYSTEM,
 } from "../src/companion/geminiLive.ts";
 import { connectGemini, waitForStart } from "../src/companion/liveSession.ts";
 import {
@@ -31,35 +32,45 @@ import {
   selectLiveProtocol,
 } from "../src/companion/liveUpgrade.ts";
 
-test("setup requests audio + transcripts like the Live demo", () => {
+test("setup requests audio + transcripts without screencap tools", () => {
   const setup = setupMessage("gemini-3.8-live", "You are a study companion.") as {
     setup: {
       model: string;
       generationConfig: { responseModalities: string[] };
       inputAudioTranscription: unknown;
       outputAudioTranscription: unknown;
-      tools: { functionDeclarations: { name: string }[] }[];
+      tools?: unknown;
+      realtimeInputConfig?: { activityHandling?: string };
     };
   };
   assert.equal(setup.setup.model, "models/gemini-3.8-live");
   assert.equal(setup.setup.generationConfig.responseModalities[0], "AUDIO");
   assert.ok(setup.setup.inputAudioTranscription);
   assert.ok(setup.setup.outputAudioTranscription);
-  assert.equal(setup.setup.tools[0]?.functionDeclarations[0]?.name, SCREENCAP_TOOL);
+  assert.equal(setup.setup.tools, undefined);
+  assert.equal(setup.setup.realtimeInputConfig?.activityHandling, "NO_INTERRUPTION");
 });
 
-test("text Live setup is TEXT-only without audio tools", () => {
+test("live system prompt never asks for screen capture", () => {
+  assert.doesNotMatch(DEFAULT_LIVE_SYSTEM, /request_screencap|call the .*screencap|wait for the screenshot/i);
+  assert.match(DEFAULT_LIVE_SYSTEM, /cannot see the student's screen/i);
+  const system = buildCompanionSystem({ goals: "heaps" });
+  assert.doesNotMatch(system, /request_screencap/);
+});
+test("chat Live setup is AUDIO + output transcription without tools", () => {
   const setup = setupTextLiveMessage("gemini-3.8-live", "You are Waypoint.") as {
     setup: {
       model: string;
       generationConfig: { responseModalities: string[] };
       tools?: unknown;
+      outputAudioTranscription?: unknown;
       inputAudioTranscription?: unknown;
       realtimeInputConfig?: unknown;
     };
   };
   assert.equal(setup.setup.model, "models/gemini-3.8-live");
-  assert.deepEqual(setup.setup.generationConfig.responseModalities, ["TEXT"]);
+  assert.deepEqual(setup.setup.generationConfig.responseModalities, ["AUDIO"]);
+  assert.ok(setup.setup.outputAudioTranscription);
   assert.equal(setup.setup.tools, undefined);
   assert.equal(setup.setup.inputAudioTranscription, undefined);
   assert.equal(setup.setup.realtimeInputConfig, undefined);
@@ -87,7 +98,7 @@ test("chatTurnsMessage packs history as user/model turns", () => {
   );
 });
 
-test("parses request_screencap tool calls", () => {
+test("parses legacy request_screencap tool calls for deny path", () => {
   const calls = toolCallsFromMessage({
     toolCall: {
       functionCalls: [{ id: "call-1", name: SCREENCAP_TOOL }],
@@ -96,22 +107,19 @@ test("parses request_screencap tool calls", () => {
   assert.deepEqual(calls, [{ id: "call-1", name: SCREENCAP_TOOL }]);
 });
 
-test("screencap tool response includes jpeg clientContent", () => {
-  const messages = screencapToolResponse(
+test("denyToolResponse rejects screencap without attaching jpeg", () => {
+  const message = denyToolResponse(
     { id: "call-1", name: SCREENCAP_TOOL },
-    "abc123",
-    true,
-  ) as Array<Record<string, unknown>>;
-  assert.equal(messages.length, 2);
-  const tool = messages[0].toolResponse as {
-    functionResponses: { response: { ok: boolean } }[];
+  ) as {
+    toolResponse: { functionResponses: { response: { ok: boolean; error?: string } }[] };
+    clientContent?: unknown;
   };
-  assert.equal(tool.functionResponses[0].response.ok, true);
-  const content = messages[1].clientContent as {
-    turns: { parts: { inlineData?: { mimeType: string; data: string } }[] }[];
-  };
-  assert.equal(content.turns[0].parts[1].inlineData?.mimeType, "image/jpeg");
-  assert.equal(content.turns[0].parts[1].inlineData?.data, "abc123");
+  assert.equal(message.toolResponse.functionResponses[0].response.ok, false);
+  assert.match(
+    message.toolResponse.functionResponses[0].response.error ?? "",
+    /not available/i,
+  );
+  assert.equal(message.clientContent, undefined);
 });
 
 test("parses transcript and completion signals", () => {

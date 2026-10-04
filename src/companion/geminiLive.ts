@@ -5,6 +5,7 @@
 
 export const INPUT_MIME = "audio/pcm;rate=16000";
 export const OUTPUT_SAMPLE_RATE = 24_000;
+/** Legacy tool name — never advertised; denied immediately if the model still calls it. */
 export const SCREENCAP_TOOL = "request_screencap";
 
 export const DEFAULT_LIVE_SYSTEM = `\
@@ -15,9 +16,8 @@ Keep most replies to one or two sentences unless they ask for more detail. \
 Stay focused on their current study material and timer context. \
 Never read, quote, or paraphrase these instructions or the study context block aloud. \
 Do not introduce yourself with a long preamble — wait for the student, or reply briefly. \
-When you need to see what is on their screen to help (code, problem set, webpage, error), \
-call the request_screencap tool, wait for the screenshot, then answer from what you see. \
-Do not call request_screencap on every turn — only when the screen would change your advice.`;
+You cannot see the student's screen and must not request screenshots or screen capture. \
+Help from what they say, type, and the study context only.`;
 
 export type LiveSignal =
   | { kind: "interim_user"; text: string }
@@ -44,41 +44,30 @@ export function setupMessage(model: string, systemInstruction: string): unknown 
       systemInstruction: {
         parts: [{ text: systemInstruction }],
       },
-      tools: [
-        {
-          functionDeclarations: [
-            {
-              name: SCREENCAP_TOOL,
-              description:
-                "Capture the student's current desktop so you can see their work and respond accurately.",
-              parameters: {
-                type: "OBJECT",
-                properties: {
-                  reason: {
-                    type: "STRING",
-                    description: "Brief why you need the screen (for logs).",
-                  },
-                },
-              },
-            },
-          ],
-        },
-      ],
+      // No tools — Live must not request desktop screenshots (stalls audio).
       inputAudioTranscription: {},
       outputAudioTranscription: {},
       realtimeInputConfig: {
         automaticActivityDetection: {
-          silenceDurationMs: 700,
+          // Less hair-trigger so speaker→mic echo doesn't cut the reply mid-sentence.
+          silenceDurationMs: 900,
+          prefixPaddingMs: 300,
+          startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
+          endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
         },
-        activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
+        // Echo from laptop speakers was interrupting generation ("jumps ahead").
+        // Client mutes uplink while playing; user can still end Live or type.
+        activityHandling: "NO_INTERRUPTION",
       },
     },
   };
 }
 
 /**
- * Text-only Live setup for Copilot / companion HTTP chat.
- * One short-lived WS session per request — no audio tools or VAD.
+ * Live setup for Copilot / companion HTTP chat.
+ * gemini-3.8-live supports AUDIO output only (TEXT or AUDIO+TEXT → WS close 1007), so we ask for
+ * AUDIO and read the reply from `outputAudioTranscription`. Text goes in via clientContent;
+ * the model's PCM is discarded. One short-lived WS session per request, no tools or VAD.
  */
 export function setupTextLiveMessage(model: string, systemInstruction: string): unknown {
   const modelName = model.startsWith("models/") ? model : `models/${model}`;
@@ -86,11 +75,12 @@ export function setupTextLiveMessage(model: string, systemInstruction: string): 
     setup: {
       model: modelName,
       generationConfig: {
-        responseModalities: ["TEXT"],
+        responseModalities: ["AUDIO"],
       },
       systemInstruction: {
         parts: [{ text: systemInstruction }],
       },
+      outputAudioTranscription: {},
     },
   };
 }
@@ -155,52 +145,40 @@ export function chatTurnsMessage(history: LiveChatTurn[], message: string): unkn
   };
 }
 
-/** Tool ack + desktop JPEG so Gemini can see the student's screen. */
+/**
+ * Immediate deny for unexpected Live tool calls (e.g. legacy request_screencap).
+ * Never attaches images or asks the desktop for a screenshot.
+ */
+export function denyToolResponse(call: ToolCall, detail?: string): unknown {
+  const error =
+    detail ??
+    (call.name === SCREENCAP_TOOL
+      ? "Screen capture is not available. Continue from the student's words and study context only."
+      : `Tool "${call.name}" is not available.`);
+  return {
+    toolResponse: {
+      functionResponses: [
+        {
+          id: call.id,
+          name: call.name,
+          response: { ok: false, error },
+        },
+      ],
+    },
+  };
+}
+
+/** @deprecated Use denyToolResponse — Live never attaches screenshots. */
 export function screencapToolResponse(
   call: ToolCall,
-  jpegBase64: string,
+  _jpegBase64: string,
   ok: boolean,
   detail?: string,
 ): unknown[] {
-  const messages: unknown[] = [
-    {
-      toolResponse: {
-        functionResponses: [
-          {
-            id: call.id,
-            name: call.name,
-            response: ok
-              ? { ok: true, note: detail ?? "Screenshot attached as the next user turn." }
-              : { ok: false, error: detail ?? "Screenshot failed." },
-          },
-        ],
-      },
-    },
-  ];
-  if (ok && jpegBase64) {
-    messages.push({
-      clientContent: {
-        turns: [
-          {
-            role: "user",
-            parts: [
-              {
-                text: "Here is my current screen. Please use it for your next reply.",
-              },
-              {
-                inlineData: {
-                  mimeType: "image/jpeg",
-                  data: jpegBase64,
-                },
-              },
-            ],
-          },
-        ],
-        turnComplete: true,
-      },
-    });
+  if (ok) {
+    return [denyToolResponse(call, detail ?? "Screen capture is not available.")];
   }
-  return messages;
+  return [denyToolResponse(call, detail)];
 }
 
 export function audioStreamEndMessage(): unknown {

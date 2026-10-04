@@ -47,7 +47,12 @@ export async function geminiChat(input: {
 
   if (!response.ok) {
     const msg = payload?.error?.message ?? `HTTP ${response.status}`;
-    if (response.status === 429 || /resource.exhausted|quota/i.test(msg)) {
+    console.warn("Gemini REST chat failure:", response.status, String(msg).slice(0, 300));
+    if (
+      response.status === 429 ||
+      payload?.error?.status === "RESOURCE_EXHAUSTED" ||
+      /resource.exhausted|\bquota\b/i.test(msg)
+    ) {
       throw new HttpError(
         429,
         "gemini_quota",

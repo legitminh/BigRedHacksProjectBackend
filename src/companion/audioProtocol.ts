@@ -11,7 +11,8 @@
  *   pcm…     = s16le mono samples
  *
  * JSON control messages stay as text frames. Audio uses binary to avoid
- * base64 overhead and let the proxy coalesce cleanly.
+ * base64 overhead. Downlink is paced at ~realtime so the desktop gets a
+ * steady stream instead of bursty Gemini fragments.
  */
 
 export const AUDIO_PROTOCOL = "wp1";
@@ -23,10 +24,15 @@ const MAGIC1 = 0x50; // P
 const VERSION = 1;
 const HEADER_BYTES = 16;
 
-/** Target ~160ms at 24 kHz s16le before flushing a downlink frame. */
-export const DOWNLINK_TARGET_BYTES = 7680;
-/** Flush partial batch if idle this long (ms). */
-export const DOWNLINK_MAX_HOLD_MS = 60;
+/** One paced tick (~20ms). */
+export const DOWNLINK_TICK_MS = 20;
+/** Fallback slice size when sample rate is unknown (~20ms @ 24 kHz s16le). */
+export const DOWNLINK_SLICE_BYTES_24K = 960;
+
+/** @deprecated Kept for tests that assert coalesce behavior; paced streamer is used in prod. */
+export const DOWNLINK_TARGET_BYTES = DOWNLINK_SLICE_BYTES_24K * 4;
+/** @deprecated */
+export const DOWNLINK_MAX_HOLD_MS = DOWNLINK_TICK_MS;
 
 export type DecodedPcmFrame = {
   kind: number;
@@ -69,21 +75,28 @@ export function tryDecodePcmFrame(data: Buffer): DecodedPcmFrame | null {
   };
 }
 
-/** Coalesce tiny Gemini PCM fragments into steadier downlink frames. */
-export class DownlinkAudioBatcher {
-  private chunks: Buffer[] = [];
-  private bytes = 0;
+function sliceBytesForRate(sampleRate: number): number {
+  const rate = sampleRate > 0 ? sampleRate : 24_000;
+  // 20ms of mono s16le
+  return Math.max(2, Math.floor((rate * DOWNLINK_TICK_MS) / 1000) * 2);
+}
+
+/**
+ * Buffer Gemini PCM as it arrives, emit wp1 frames to the desktop at ~1× realtime.
+ * Stops the bursty “dump then silence” pattern that makes Live audio choppy.
+ */
+export class PacedDownlinkStreamer {
+  private buffer = Buffer.alloc(0);
   private sampleRate = 24_000;
   private epoch = 1;
   private seq = 0;
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private readonly flush: (frame: Buffer) => void;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private readonly send: (frame: Buffer) => void;
 
-  constructor(flush: (frame: Buffer) => void) {
-    this.flush = flush;
+  constructor(send: (frame: Buffer) => void) {
+    this.send = send;
   }
 
-  /** Drop pending audio and advance epoch — used on barge/interrupt (never flush stale PCM). */
   setEpoch(epoch: number) {
     this.reset();
     this.epoch = epoch;
@@ -99,40 +112,68 @@ export class DownlinkAudioBatcher {
     }
     if (pcm.length === 0 || pcm.length % 2 !== 0) return;
     if (sampleRate > 0) this.sampleRate = sampleRate;
-    this.chunks.push(pcm);
-    this.bytes += pcm.length;
-    if (this.bytes >= DOWNLINK_TARGET_BYTES) {
-      this.forceFlush();
-      return;
-    }
-    if (!this.timer) {
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        this.forceFlush();
-      }, DOWNLINK_MAX_HOLD_MS);
-    }
+    this.buffer = this.buffer.length === 0 ? pcm : Buffer.concat([this.buffer, pcm]);
+    this.ensureTimer();
   }
 
+  /** Drain remaining audio as paced slices (or one last partial). */
   forceFlush() {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
+    const slice = sliceBytesForRate(this.sampleRate);
+    while (this.buffer.length >= slice) {
+      this.emitSlice(slice);
     }
-    if (this.bytes === 0) return;
-    const pcm = Buffer.concat(this.chunks, this.bytes);
-    this.chunks = [];
-    this.bytes = 0;
-    const seq = this.seq;
-    this.seq = (this.seq + 1) >>> 0;
-    this.flush(encodePcmFrame(AUDIO_KIND_DOWNLINK, this.epoch, this.sampleRate, seq, pcm));
+    if (this.buffer.length >= 2) {
+      const pcm = this.buffer;
+      this.buffer = Buffer.alloc(0);
+      this.emitRaw(pcm);
+    } else {
+      this.buffer = Buffer.alloc(0);
+    }
+    this.stopTimer();
   }
 
   reset() {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
+    this.stopTimer();
+    this.buffer = Buffer.alloc(0);
+  }
+
+  private ensureTimer() {
+    if (this.timer) return;
+    this.timer = setInterval(() => this.tick(), DOWNLINK_TICK_MS);
+    // Don't let the timer keep the process alive alone.
+    if (typeof this.timer === "object" && this.timer && "unref" in this.timer) {
+      (this.timer as NodeJS.Timeout).unref?.();
     }
-    this.chunks = [];
-    this.bytes = 0;
+  }
+
+  private stopTimer() {
+    if (!this.timer) return;
+    clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  private tick() {
+    const slice = sliceBytesForRate(this.sampleRate);
+    if (this.buffer.length < slice) {
+      // Wait for more Gemini audio; keep timer while a reply may still be streaming.
+      return;
+    }
+    // Exactly one realtime slice per tick — smooth WS cadence.
+    this.emitSlice(slice);
+  }
+
+  private emitSlice(slice: number) {
+    const pcm = this.buffer.subarray(0, slice);
+    this.buffer = this.buffer.subarray(slice);
+    this.emitRaw(pcm);
+  }
+
+  private emitRaw(pcm: Buffer) {
+    const seq = this.seq;
+    this.seq = (this.seq + 1) >>> 0;
+    this.send(encodePcmFrame(AUDIO_KIND_DOWNLINK, this.epoch, this.sampleRate, seq, pcm));
   }
 }
+
+/** @deprecated Alias — Live sessions use paced streaming. */
+export class DownlinkAudioBatcher extends PacedDownlinkStreamer {}

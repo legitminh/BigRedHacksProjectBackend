@@ -184,8 +184,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     smtpPass: nonempty(env.SMTP_PASS),
     mailFrom: nonempty(env.MAIL_FROM),
     geminiApiKey: nonempty(env.GEMINI_API_KEY),
-    geminiModel: nonempty(env.GEMINI_MODEL) ?? "gemini-flash-latest",
-    // Match gemini_live_demo default; override via GEMINI_LIVE_MODEL when Google renames models.
+    // Copilot / companion HTTP chat (REST). Flash-Lite = highest free-tier RPD; avoid full Flash (~20 RPD).
+    geminiModel: nonempty(env.GEMINI_MODEL) ?? "gemini-3.5-flash-lite",
+    // Voice companion Live only (`/v1/companion/live`). Not used for HTTP Copilot text.
     geminiLiveModel: nonempty(env.GEMINI_LIVE_MODEL) ?? "gemini-3.8-live",
     xaiApiKey: nonempty(env.XAI_API_KEY),
     xaiTtsVoice: nonempty(env.XAI_TTS_VOICE) ?? "eve",

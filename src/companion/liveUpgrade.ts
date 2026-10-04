@@ -165,6 +165,8 @@ export function attachCompanionLiveUpgrade(
   const slots = new LiveSlots(limits);
   const wss = new WebSocketServer({
     noServer: true,
+    // Avoid deflate spikes on paced PCM binary frames (choppy Live audio).
+    perMessageDeflate: false,
     handleProtocols: (protocols) => selectLiveProtocol(protocols),
   });
 

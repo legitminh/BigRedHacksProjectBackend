@@ -396,11 +396,11 @@ test("LOCAL_CHAT_PROVIDER=ollama never calls Gemini even when GEMINI_API_KEY is 
   }
 });
 
-test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini Live when healthy (cloud companion)", async () => {
+test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini REST Flash-Lite when healthy (cloud companion)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
   const sent: { code: string }[] = [];
   const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
-  let liveCalls = 0;
+  let cloudCalls = 0;
   const hitOllama: string[] = [];
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
@@ -420,6 +420,7 @@ test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini Live when healthy (cloud c
       SESSION_SECRET: SECRET,
       PUBLIC_BASE_URL: "http://127.0.0.1:8787",
       GEMINI_API_KEY: "test-gemini-key",
+      GEMINI_MODEL: "gemini-3.5-flash-lite",
       LOCAL_CHAT_PROVIDER: "gemini",
       OLLAMA_BASE_URL: "http://127.0.0.1:11434",
       OLLAMA_CHAT_MODEL: "qwen2.5:7b",
@@ -430,8 +431,8 @@ test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini Live when healthy (cloud c
     calendar: calendar([]),
     fetch: fetchImpl,
     liveChat: async (input) => {
-      liveCalls += 1;
-      assert.match(input.model, /live/i);
+      cloudCalls += 1;
+      assert.match(input.model, /flash-lite/i);
       return "Cloud companion reply.";
     },
     now: () => new Date("2026-10-03T18:00:00.000Z"),
@@ -449,8 +450,8 @@ test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini Live when healthy (cloud c
     assert.equal(res.status, 200);
     const body = (await res.json()) as { content: string };
     assert.equal(body.content, "Cloud companion reply.");
-    assert.equal(liveCalls, 1);
-    assert.equal(hitOllama.length, 0, "healthy Gemini Live must not fall through to Ollama");
+    assert.equal(cloudCalls, 1);
+    assert.equal(hitOllama.length, 0, "healthy Gemini REST must not fall through to Ollama");
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }

@@ -43,24 +43,43 @@ function closeQuietly(socket: WebSocket | null | undefined): void {
   }
 }
 
-function mapLiveError(err: unknown): HttpError {
+/** Real Google quota exhaustion only — never bare "429" digits or our own rate_limited. */
+const QUOTA_RE = /resource[_ .-]?exhausted|\bquota\b|exceeded your (current )?quota/i;
+const MODALITY_RE = /response modalit|modalit(y|ies)|not supported by the model|unsupported/i;
+const NOT_FOUND_RE = /not found|is not supported for (bidi|generate)|404/i;
+const UNREACHABLE_RE = /timed? ?out|ECONNREFUSED|ENOTFOUND|ECONNRESET|closed before|closed during/i;
+
+export function mapLiveError(err: unknown): HttpError {
   if (err instanceof HttpError) return err;
   const message = err instanceof Error ? err.message : String(err);
-  if (/quota|resource.exhausted|429/i.test(message)) {
+  // Raw upstream failure for operators (message only; the key is never part of it).
+  console.warn("Gemini Live chat failure:", message.slice(0, 300));
+  if (MODALITY_RE.test(message)) {
+    return new HttpError(
+      502,
+      "gemini_unsupported_modality",
+      "Cloud coach model rejected this request type.",
+    );
+  }
+  if (QUOTA_RE.test(message)) {
     return new HttpError(
       429,
       "gemini_quota",
       "Cloud coach hit today’s free limit. Try again tomorrow, or keep using local lock-in coaching.",
     );
   }
-  if (/timed? ?out|ECONNREFUSED|ENOTFOUND|closed before|closed during/i.test(message)) {
+  if (NOT_FOUND_RE.test(message)) {
+    return new HttpError(502, "gemini_model_unavailable", "Cloud coach model is unavailable.");
+  }
+  if (UNREACHABLE_RE.test(message)) {
     return new HttpError(502, "gemini_unreachable", "Could not reach Gemini.");
   }
   return new HttpError(502, "gemini_failed", message || "Gemini Live chat failed.");
 }
 
 /**
- * Open a private Live TEXT session for this request only, collect one reply, close.
+ * Open a private AUDIO Live session, collect its output transcript, then close.
+ * User input remains text clientContent; no TTS round trip is required.
  */
 export async function geminiLiveChat(input: LiveChatInput): Promise<string> {
   let gemini: WebSocket | null = null;
@@ -142,12 +161,13 @@ function collectLiveTextReply(gemini: WebSocket, input: LiveChatInput): Promise<
       }
     };
 
-    const onClose = () => {
+    const onClose = (code?: number, reason?: Buffer) => {
       if (assistant.trim() || fragments.length) {
         finish(undefined, assistant || fragments.join(""));
         return;
       }
-      finish(new Error("Gemini closed before a reply"));
+      const detail = reason?.length ? ` (${code}: ${reason.toString("utf8").slice(0, 200)})` : "";
+      finish(new Error(`Gemini closed before a reply${detail}`));
     };
     const onError = (error: Error) => finish(error);
 
