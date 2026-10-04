@@ -6,6 +6,12 @@ import { fileURLToPath } from "node:url";
 
 import { googleConfigured, smtpConfigured, type Config } from "./config.ts";
 import { HttpError, escapeHtml, sendEmpty, sendHtml, sendJson } from "./http.ts";
+import {
+  clientIp,
+  rateLimited,
+  type RateLimiter,
+  type RateRule,
+} from "./security/rateLimit.ts";
 import type {
   AdminBrowseResult,
   AdminBrowseTable,
@@ -53,6 +59,10 @@ const PILL_KEYS = new Set([
 export type AdminDeps = {
   config: Config;
   store: Store;
+  /** Optional abuse shield for POST /admin/login (per-IP). */
+  limiter?: RateLimiter;
+  adminLoginRule?: RateRule;
+  now?: () => Date;
 };
 
 function cookieSecret(config: Config): string {
@@ -788,8 +798,18 @@ export async function handleAdmin(
   }
 
   if (method === "POST" && path === "/admin/login") {
+    if (deps.limiter && deps.adminLoginRule) {
+      const ip = clientIp(req, deps.config.trustProxy);
+      const nowMs = (deps.now ?? (() => new Date()))().getTime();
+      const result = deps.limiter.hit("admin-login", ip, deps.adminLoginRule, nowMs);
+      if (!result.ok) {
+        console.warn("[admin] login rate-limited for", ip);
+        throw rateLimited(result.retryAfterSeconds, "admin_login_rate_limited");
+      }
+    }
     const password = await readPassword(req);
     if (!passwordsMatch(password, deps.config.adminPassword)) {
+      console.warn("[admin] failed login attempt");
       sendHtml(res, 401, loginPage("Incorrect password."));
       return true;
     }

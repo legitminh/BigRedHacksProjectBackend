@@ -20,7 +20,17 @@ There is no `.env` with real keys in the repo. Fill `.env` before trying a real 
 openssl rand -base64 32
 ```
 
-Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup. Leave the SMTP variables blank for local email login; the code is written to `data/outbox.jsonl`. Set `GEMINI_API_KEY` for Copilot (`POST /v1/gemini/chat`) and companion text (`POST /v1/companion/chat`); both open short-lived Gemini Live WebSocket sessions (`GEMINI_LIVE_MODEL`, TEXT modality). Default `LOCAL_CHAT_PROVIDER=gemini` uses Live first with silent Ollama fallback (`OLLAMA_CHAT_MODEL`, default `qwen2.5:7b`). Set `LOCAL_CHAT_PROVIDER=ollama` (aliases: `llama`, `local`) to force local Llama and never call Gemini for chat. Set `XAI_API_KEY` (optional `XAI_TTS_VOICE`, default `eve`) for study heads-up TTS (`POST /v1/voice/tts`); the desktop falls back to macOS `say` if unset or slow (~4s). Set `PRESAGE_API_KEY` on this API for camera accountability vitals (`POST /v1/camera/observe`); the desktop uploads short clips here and never holds the Presage key on that path.
+Put that value in `SESSION_SECRET` (at least 32 characters). Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from the Web client below. Leave `DATABASE_URL` empty to store users in `data/store.json`. Set it to a TigerData Postgres URL when you want users stored there. The server creates the tables in `src/db/schema.sql` on startup. Leave the SMTP variables blank for local email login; the code is written to `data/outbox.jsonl`.
+
+**Gemini surfaces (do not conflate):**
+
+| Surface | Env | API | Notes |
+|---|---|---|---|
+| Copilot / companion **text** | `GEMINI_MODEL` (default `gemini-3.5-flash-lite`) | REST `generateContent` via `POST /v1/gemini/chat` + `/v1/companion/chat` | Default `LOCAL_CHAT_PROVIDER=gemini` tries Gemini REST first; silent Ollama fallback (`OLLAMA_CHAT_MODEL`, default `qwen2.5:7b`) on quota/outage. A Gemini **429 on chat is REST quota**, not a Live WebSocket failure. |
+| School digest / deep Drive | `GEMINI_OVERVIEW_MODEL` | REST overview | Once/day digest + optional Lite depth (`LITE_DEPTH_USE_LLM=1`). |
+| Talk / Live **voice** | `GEMINI_LIVE_MODEL` + **`XAI_API_KEY`** | `WS /v1/companion/live` | Live WebSocket only. Heads-up TTS (`POST /v1/voice/tts`) can fall back to macOS `say`; **Live cannot**. |
+
+Set `LOCAL_CHAT_PROVIDER=ollama` (aliases: `llama`, `local`) to force local Llama and never call Gemini for chat. Set `PRESAGE_API_KEY` on this API for camera accountability vitals (`POST /v1/camera/observe`); the desktop uploads short clips here and never holds the Presage key on that path.
 
 ```bash
 npm run dev
@@ -35,9 +45,9 @@ The process listens on `BIND_HOST:PORT` (default `http://127.0.0.1:8787`). `GET 
 
 `storage` is `postgres` when `DATABASE_URL` is set.
 
-**Connection status panel** (desktop Settings → Connection) uses `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, and Copilot chat provider. Auth is optional (JWT enriches account + Calendar/Drive). Probe results are cached ~30s. Indicator meanings: **[docs/STATUS.md](./docs/STATUS.md)**.
+**Connection status panel** (desktop Settings → Connection) uses `GET /v1/status` — aggregated live probes for Gemini, Ollama, Google, account, Copilot chat provider, Presage, and storage. Auth is optional (JWT enriches account + Calendar/Drive). Probe results are cached ~300s (`cache_ttl_seconds` in the payload). Indicator meanings: **[docs/STATUS.md](./docs/STATUS.md)**.
 
-**Restart limitations (single process):** in-flight Google sign-in polls and **calendar-connect** polls (`/v1/google/calendar/start` → `/poll`) live in process memory. A restart drops them; the app simply starts the connect flow again. Already-completed grants and tokens are stored durably. Run one API process (no horizontal scaling) unless these are moved to shared storage.
+**Restart limitations (single process):** in-flight Google sign-in polls, **calendar-connect** polls (`/v1/google/calendar/start` → `/poll`), and **camera presence ladder / stress cooldowns** live in process memory. A restart drops them; the app simply starts the connect flow again (camera may re-nag the first away/stress rung). Already-completed grants and tokens are stored durably. Run one API process (no horizontal scaling) unless these are moved to shared storage.
 
 **Admin console:** the `wp_admin` cookie is `HttpOnly; SameSite=Strict` and gets `Secure` automatically when `PUBLIC_BASE_URL` starts with `https://`.
 
@@ -337,7 +347,23 @@ For local development, leave `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`,
 
 ## Memory, tasks, calendar, and session recap
 
-Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the full contract. The client never writes Postgres. Live Gemini runs through the server-side proxy (`WS /v1/companion/live`).
+Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the full contract. The client never writes Postgres. Live Gemini voice runs through the server-side proxy (`WS /v1/companion/live`); Copilot text uses REST (see matrix above).
+
+### Desktop Mac v1 surface vs server/future
+
+The shipping Mac app calls a **narrow** authenticated surface. Other product routes stay for admin, tests, or future clients — do not treat them as desktop QA blockers.
+
+| Used by desktop today | Server / admin / future (no Mac callers) |
+|---|---|
+| Auth Google start/poll/refresh, `DELETE /v1/me/data` | Email OTP auth |
+| `GET /v1/status` | `/v1/memory*`, `/v1/voice/health` |
+| `POST /v1/gemini/chat`, `/v1/companion/chat`, `WS /v1/companion/live` | `/v1/tasks*`, `/v1/sessions` |
+| `/v1/coach/api/*`, `POST /v1/voice/tts` | Calendar write/agenda, Drive folders |
+| Google connect summary, Drive search/inventory/deep-brief | Synonyms: `google/calendar/*` ≈ `google/connect/*` |
+| `GET/PUT /v1/study-memory`, school-digest | — |
+| `POST /v1/camera/observe` | — |
+
+**Lock-in cloud persistence:** the Mac syncs mission history via **`PUT /v1/study-memory` only**. `POST /v1/tasks` and `POST /v1/sessions` are **not** wired from lock-in start/stop (admin / future recap APIs). Camera observe still uses the desktop’s local `session_id`.
 
 ### Memory
 
@@ -353,7 +379,7 @@ Every route below needs `Authorization: Bearer ACCESS_TOKEN`. `specs.md` is the 
 
 Load `GET /v1/memory` after sign-in and inject that card into Gemini. Call `PUT` from the profile screen and from a confirmed remember action.
 
-### Tasks
+### Tasks (API / future — not used by current Mac lock-in)
 
 `POST /v1/tasks` with `{ "title", "mode", "planned_minutes", "deadline_event_id"? }` creates an `active` task and marks any previous active task `dropped`. `mode` is `advise`, `pair`, or `ask`. `planned_minutes` is 1 to 240.
 
@@ -383,9 +409,9 @@ Sign-in stays `openid email profile`. Calendar is a second consent.
 
 `PATCH /v1/calendar/events/:id` and `DELETE /v1/calendar/events/:id` work only when `waypoint` is `1`. Otherwise `403` `not_waypoint_event`. Patch sends `start` and `end` for a study block, or `due` for a deadline.
 
-### Session recap
+### Session recap (API / future — Mac uses study-memory instead)
 
-`POST /v1/sessions` stores the lock-in recap the app speaks at the end:
+`POST /v1/sessions` stores a lock-in recap for future clients / admin. The current desktop does **not** call this; it persists via study-memory:
 
 ```json
 {

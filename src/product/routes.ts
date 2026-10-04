@@ -404,8 +404,14 @@ export async function handleProduct(
       history,
       message,
     });
-    // Same shape either way — desktop must not show quota / provider friction.
-    sendJson(res, 200, { role: "assistant", content: reply, user_id: user.id });
+    // Spoken UX stays calm; optional provider/degraded for Settings / diagnostics.
+    sendJson(res, 200, {
+      role: "assistant",
+      content: reply.content,
+      user_id: user.id,
+      provider: reply.provider,
+      degraded: reply.degraded,
+    });
     return true;
   }
   if (method === "POST" && path === "/v1/companion/chat") {
@@ -433,7 +439,13 @@ export async function handleProduct(
       history,
       message,
     });
-    sendJson(res, 200, { role: "assistant", content: reply, user_id: user.id });
+    sendJson(res, 200, {
+      role: "assistant",
+      content: reply.content,
+      user_id: user.id,
+      provider: reply.provider,
+      degraded: reply.degraded,
+    });
     return true;
   }
   if (method === "GET" && path === "/v1/drive/recent") {
@@ -819,6 +831,12 @@ function parseChatHistory(raw: unknown): CompanionTurn[] {
     .filter((item) => item.role !== "system" && item.content.length > 0);
 }
 
+type ChatFallbackResult = {
+  content: string;
+  provider: "gemini" | "ollama";
+  degraded: boolean;
+};
+
 async function chatWithLocalFallback(
   deps: ProductDeps,
   input: {
@@ -826,7 +844,7 @@ async function chatWithLocalFallback(
     history: Array<{ role: "user" | "assistant" | "system"; content: string }>;
     message: string;
   },
-): Promise<string> {
+): Promise<ChatFallbackResult> {
   const localReady = Boolean(deps.config.ollamaBaseUrl);
   const backend = selectChatBackend(deps.config);
   const forceLocal = isLocalChatForced(deps.config);
@@ -851,7 +869,7 @@ async function chatWithLocalFallback(
         deps.config.ollamaChatModel,
       );
     }
-    return ollamaChat({
+    const content = await ollamaChat({
       baseUrl: deps.config.ollamaBaseUrl!,
       model: deps.config.ollamaChatModel,
       system: input.system,
@@ -860,9 +878,10 @@ async function chatWithLocalFallback(
       numCtx: deps.config.ollamaChatNumCtx,
       fetchImpl: deps.fetch,
     });
+    return { content, provider: "ollama", degraded: false };
   }
 
-  // Cloud companion path: Gemini first, silent Ollama fallback on quota/outage.
+  // Cloud companion path: Gemini first, Ollama fallback on quota/outage.
   if (!deps.config.geminiApiKey) {
     throw new HttpError(
       503,
@@ -878,23 +897,26 @@ async function chatWithLocalFallback(
 
   try {
     // REST Gemini always Flash-Lite for chat; overview Flash is digest-only (/v1/school-digest).
+    let content: string;
     if (deps.liveChat) {
-      return await deps.liveChat({
+      content = await deps.liveChat({
         apiKey: deps.config.geminiApiKey,
         model: chatModel,
         system: input.system,
         history: input.history,
         message: input.message,
       });
+    } else {
+      content = await geminiChat({
+        apiKey: deps.config.geminiApiKey,
+        model: chatModel,
+        system: input.system,
+        history: input.history as ChatTurn[],
+        message: input.message,
+        fetchImpl: deps.fetch,
+      });
     }
-    return await geminiChat({
-      apiKey: deps.config.geminiApiKey,
-      model: chatModel,
-      system: input.system,
-      history: input.history as ChatTurn[],
-      message: input.message,
-      fetchImpl: deps.fetch,
-    });
+    return { content, provider: "gemini", degraded: false };
   } catch (error) {
     if (!localReady || !shouldFallbackToLocal(error)) throw error;
     console.warn(
@@ -904,7 +926,7 @@ async function chatWithLocalFallback(
     );
   }
 
-  return ollamaChat({
+  const content = await ollamaChat({
     baseUrl: deps.config.ollamaBaseUrl!,
     model: deps.config.ollamaChatModel,
     system: input.system,
@@ -913,6 +935,7 @@ async function chatWithLocalFallback(
     numCtx: deps.config.ollamaChatNumCtx,
     fetchImpl: deps.fetch,
   });
+  return { content, provider: "ollama", degraded: true };
 }
 
 function clampInt(value: string | null, fallback: number, min: number, max: number): number {

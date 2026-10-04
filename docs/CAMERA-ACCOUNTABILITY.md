@@ -16,7 +16,7 @@ Request JSON:
   "phase": "active" | "paused" | "break",
   "mime": "video/mp4" | "video/webm" | "image/jpeg",
   "data_base64": "<base64 payload, max ~8MB decoded>",
-  "client_meta": { "brightness": 0 }
+  "client_meta": { "brightness": 128, "brightness_measured": true }
 }
 ```
 
@@ -52,14 +52,16 @@ Nudge `kind` values (internal tags — **never** speak the kind string; use `tex
 | `stressed` | Stress breath fallback after a recent `suggest_break` | Slow breath |
 
 - `nudge` is `null` when silent (cooldown, `paused`/`break`, already spoken ladder step, etc.).
-- Rate limit: ~1 observe / 25s per user (429 if faster).
-- Do not persist video bytes. Process then discard.
-- If `PRESAGE_API_KEY` unset or Presage fails: still run presence heuristics; **`vitals` is `null`** (no invented stress). Desktop may apply local VIDEOINPUT fallback separately.
-- `vitals.stressed` from Presage when `stress_index > 150` **or** HRV/RMSSD `< 20`.
+- Rate limit: ~1 observe / 25s per user (429 if faster). Concurrent observes for the same session are serialized server-side.
+- Do not persist video bytes on the API host. Process then discard locally. **When `PRESAGE_API_KEY` is set and phase is `active`, short video clips are uploaded to Presage Physiology (third-party biometric processing).** Retention at Presage is outside Waypoint control — unset the key to disable uploads; pause/break phases never upload. Prefer shortest clips; rotate the key after vendor incidents.
+- If `PRESAGE_API_KEY` unset, Presage transport/auth fails, phase is `paused`/`break`, or mime is `image/jpeg`: still run presence heuristics with **`face_detected: null`** (uncertain — do **not** mark away); **`vitals` is `null`** (no invented stress). JPEG observes cannot detect leave/stress — desktop should send `video/mp4` or `video/webm` for accountability.
+- Empty Presage success (no usable scalars, no explicit face flag) stays **uncertain** — not away. Real leave requires an explicit vendor face/quality signal (`face_detected: false` / equivalent).
+- `vitals.stressed` from Presage when `stress_index > 150` **or** HRV/RMSSD `< 20` (zero/sentinel HRV ignored).
+- Camera ladder / stress cooldown state is **in-process only** (single API instance; restart may re-nag).
 
 ### Env
 
-`PRESAGE_API_KEY` — server only (never in the Mac app for this path).
+`PRESAGE_API_KEY` — server only (never in the Mac app for this path). Unset disables third-party video upload.
 
 ## Spirit (nudge policy)
 

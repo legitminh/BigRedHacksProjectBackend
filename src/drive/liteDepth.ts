@@ -18,10 +18,17 @@ import { geminiChat } from "../gemini/chat.ts";
 export const LITE_DEPTH_CHUNK_CHARS = 4_200;
 /** Overlap so dates/sentences straddling a cut are seen twice. */
 export const LITE_DEPTH_CHUNK_OVERLAP = 450;
-export const LITE_DEPTH_CHUNK_CONCURRENCY = 3;
-export const LITE_DEPTH_FILE_CONCURRENCY = 2;
+/** Keep low: each concurrent chunk was a Flash-Lite RPM burn. */
+export const LITE_DEPTH_CHUNK_CONCURRENCY = 1;
+export const LITE_DEPTH_FILE_CONCURRENCY = 1;
 /** Max notes kept from a single chunk after parse. */
 export const LITE_DEPTH_MAX_NOTES_PER_CHUNK = 18;
+/**
+ * Per-chunk Flash-Lite map-reduce is opt-in. Default off to conserve free-tier RPM;
+ * local heuristics already extract due dates / grading / exam lines for chat.
+ * Set LITE_DEPTH_USE_LLM=1 to re-enable.
+ */
+export const LITE_DEPTH_USE_LLM = process.env.LITE_DEPTH_USE_LLM === "1";
 
 export type LiteDepthFile = {
   name: string;
@@ -318,7 +325,7 @@ async function extractNotesFromChunk(
   chunkTotal: number,
   input: Pick<PrepareLiteDepthInput, "geminiApiKey" | "liteModel" | "fetchImpl" | "utterance">,
 ): Promise<ExtractedNote[]> {
-  if (!input.geminiApiKey?.trim()) {
+  if (!input.geminiApiKey?.trim() || !LITE_DEPTH_USE_LLM) {
     return heuristicNotesFromText(chunk.body, chunk.title);
   }
   const prompt = [

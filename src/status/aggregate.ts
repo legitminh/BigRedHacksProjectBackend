@@ -33,7 +33,8 @@ export type StatusDeps = {
   now?: () => Date;
 };
 
-const DEFAULT_TTL_SECONDS = 30;
+/** Longer TTL: listModels probes still count against Gemini free-tier RPM. */
+const DEFAULT_TTL_SECONDS = 300;
 const GEMINI_PROBE_TIMEOUT_MS = 5_000;
 const OLLAMA_PROBE_TIMEOUT_MS = 5_000;
 
@@ -80,7 +81,9 @@ function modelListed(tagsJson: unknown, wanted: string): boolean {
   if (!Array.isArray(models)) return false;
   return models.some((m) => {
     const n = (m.name ?? m.model ?? "").toLowerCase();
-    return n === name || n.startsWith(`${name}:`) || n.startsWith(`${name}`);
+    // Exact or tagged (`moondream:latest`) / digest (`moondream@sha256:…`) — not bare prefix
+    // (`moondream` must not match `moondream2`).
+    return n === name || n.startsWith(`${name}:`) || n.startsWith(`${name}@`);
   });
 }
 
@@ -259,7 +262,7 @@ function presageIndicator(config: Config): ServiceIndicator {
   };
 }
 
-/** Config-only — Grok TTS key presence (desktop falls back to macOS say). */
+/** Config-only — Grok TTS key presence (heads-ups fall back to macOS say; Live does not). */
 function xaiIndicator(config: Config): ServiceIndicator {
   if (config.xaiApiKey) {
     return {
@@ -267,7 +270,7 @@ function xaiIndicator(config: Config): ServiceIndicator {
       label: "Grok voice",
       state: "ok",
       status: "Configured",
-      detail: `Study heads-up TTS ready (${config.xaiTtsVoice})`,
+      detail: `Heads-up TTS + Live speak ready (${config.xaiTtsVoice})`,
       optional: true,
     };
   }
@@ -276,7 +279,52 @@ function xaiIndicator(config: Config): ServiceIndicator {
     label: "Grok voice",
     state: "warn",
     status: "Degraded",
-    detail: "XAI_API_KEY unset — Live voice needs it; heads-ups fall back to macOS say",
+    detail: "XAI_API_KEY unset — Talk/Live unavailable; heads-ups fall back to macOS say",
+    optional: true,
+  };
+}
+
+/**
+ * Talk / Live voice readiness. Gemini Live + Grok TTS are both required at runtime;
+ * this row surfaces that clearly even when `xai_tts` stays optional for heads-up fallback.
+ */
+function companionLiveIndicator(config: Config, gemini: ProbeResult): ServiceIndicator {
+  if (!config.geminiApiKey) {
+    return {
+      id: "companion_live",
+      label: "Talk / Live voice",
+      state: "err",
+      status: "Offline",
+      detail: "GEMINI_API_KEY unset — Live companion unavailable",
+      optional: true,
+    };
+  }
+  if (!config.xaiApiKey) {
+    return {
+      id: "companion_live",
+      label: "Talk / Live voice",
+      state: "warn",
+      status: "Unavailable",
+      detail: "Needs XAI_API_KEY (Grok) plus Gemini Live — Talk will not connect",
+      optional: true,
+    };
+  }
+  if (gemini.state === "err") {
+    return {
+      id: "companion_live",
+      label: "Talk / Live voice",
+      state: "warn",
+      status: "Degraded",
+      detail: `Gemini Live model ${config.geminiLiveModel} not reachable`,
+      optional: true,
+    };
+  }
+  return {
+    id: "companion_live",
+    label: "Talk / Live voice",
+    state: "ok",
+    status: "Ready",
+    detail: `Live ready (${config.geminiLiveModel} + Grok ${config.xaiTtsVoice})`,
     optional: true,
   };
 }
@@ -460,6 +508,7 @@ export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse>
       optional: false,
     },
     chatProviderIndicator(deps.config, gemini, ollama),
+    companionLiveIndicator(deps.config, gemini),
     xaiIndicator(deps.config),
     accountIndicator(deps.user),
     googleOauthIndicator(deps.config),
@@ -468,10 +517,27 @@ export async function aggregateStatus(deps: StatusDeps): Promise<StatusResponse>
     presageIndicator(deps.config),
   ];
 
-  // Gemini-only failures do not flip ok when Copilot can fall back (chat_provider).
-  // Optional rows (presage, xai_tts) warn when unset and do not flip ok.
-  const critical = new Set(["api", "google_oauth", "ollama", "chat_provider"]);
-  const hardDown = services.some((s) => critical.has(s.id) && s.state === "err");
+  // Critical rows flip global `ok`. Ollama is only hard-critical when local chat is forced
+  // (or Gemini is not the primary path); cloud-primary + Gemini healthy keeps ok true
+  // even if the optional Ollama fallback probe fails. Signed-in Google disconnect is
+  // product-critical for Copilot Calendar/Drive.
+  const critical = new Set<string>(["api", "google_oauth", "chat_provider"]);
+  const backend = selectChatBackend(deps.config);
+  if (backend === "ollama" || deps.config.localChatProvider === "ollama") {
+    critical.add("ollama");
+  } else if (gemini.state === "err" && ollama.state === "err") {
+    // Both engines down — already reflected via chat_provider err; keep ollama listed.
+    critical.add("ollama");
+  }
+  if (deps.user) {
+    critical.add("google");
+  }
+  // Treat Offline google (warn) as hard-down for signed-in users — Copilot needs Calendar/Drive.
+  const hardDown = services.some((s) => {
+    if (!critical.has(s.id)) return false;
+    if (s.id === "google") return s.state === "err" || s.state === "warn";
+    return s.state === "err";
+  });
   return {
     ok: !hardDown,
     checked_at: now.toISOString(),

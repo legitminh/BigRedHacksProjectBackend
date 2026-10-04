@@ -382,8 +382,10 @@ test("gemini chat falls back to local Ollama on quota without surfacing friction
       body: JSON.stringify({ message: "What should I study next?", history: [] }),
     });
     assert.equal(res.status, 200);
-    const body = (await res.json()) as { content: string };
+    const body = (await res.json()) as { content: string; provider: string; degraded: boolean };
     assert.equal(body.content, "Local coach reply from Ollama.");
+    assert.equal(body.provider, "ollama");
+    assert.equal(body.degraded, true);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
@@ -503,8 +505,10 @@ test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini REST Flash-Lite when healt
       body: JSON.stringify({ message: "Help me plan tomorrow", history: [] }),
     });
     assert.equal(res.status, 200);
-    const body = (await res.json()) as { content: string };
+    const body = (await res.json()) as { content: string; provider: string; degraded: boolean };
     assert.equal(body.content, "Cloud companion reply.");
+    assert.equal(body.provider, "gemini");
+    assert.equal(body.degraded, false);
     assert.equal(cloudCalls, 1);
     assert.equal(hitOllama.length, 0, "healthy Gemini REST must not fall through to Ollama");
   } finally {

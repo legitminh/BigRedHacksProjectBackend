@@ -185,7 +185,8 @@ test("POST /v1/camera/observe returns suggest_break nudge when stressed", async 
   );
 });
 
-test("POST /v1/camera/observe stays silent on break and paused when stressed", async () => {
+test("POST /v1/camera/observe stays silent on break and paused (no Presage upload)", async () => {
+  let analyzeCalls = 0;
   await withApp(
     async (base, token) => {
       for (const phase of ["break", "paused"] as const) {
@@ -206,21 +207,27 @@ test("POST /v1/camera/observe stays silent on break and paused when stressed", a
         const body = (await res.json()) as {
           vitals: { stressed: boolean } | null;
           nudge: { kind: string; text: string } | null;
+          watching_note: string;
         };
-        assert.equal(body.vitals?.stressed, true);
+        assert.equal(body.vitals, null);
         assert.equal(body.nudge, null, `expected silence on phase=${phase}`);
+        assert.match(body.watching_note, /skipped during pause\/break/i);
       }
+      assert.equal(analyzeCalls, 0);
     },
     {
-      cameraAnalyze: async () => ({
-        heart_rate: 88,
-        breathing_rate: 18,
-        stress_index: 200,
-        stressed: true,
-        focus_ok: false,
-        source: "presage",
-        raw_summary: "stressed",
-      }),
+      cameraAnalyze: async () => {
+        analyzeCalls += 1;
+        return {
+          heart_rate: 88,
+          breathing_rate: 18,
+          stress_index: 200,
+          stressed: true,
+          focus_ok: false,
+          source: "presage",
+          raw_summary: "stressed",
+        };
+      },
     },
   );
 });
@@ -406,7 +413,7 @@ test("POST /v1/camera/observe rate limit allows ~25s desktop cadence", async () 
   );
 });
 
-test("POST /v1/camera/observe Presage failure yields null vitals; away confirms on second fail", async () => {
+test("POST /v1/camera/observe Presage failure yields null vitals and stays uncertain", async () => {
   await withApp(
     async (base, token) => {
       const headers = {
@@ -433,8 +440,8 @@ test("POST /v1/camera/observe Presage failure yields null vitals; away confirms 
       };
       assert.equal(body.vitals, null);
       assert.equal(body.nudge, null);
-      // First failure: face_detected=false but away not yet confirmed.
-      assert.equal(body.face_detected, false);
+      // API/transport failures must not mark the student away.
+      assert.equal(body.face_detected, null);
       assert.equal(body.presence, "uncertain");
 
       const second = await fetch(`${base}/v1/camera/observe`, {
@@ -448,9 +455,8 @@ test("POST /v1/camera/observe Presage failure yields null vitals; away confirms 
         face_detected: boolean | null;
         vitals: unknown;
       };
-      // Sustained analyze failures (phone-over-lens / walk-away) enter the away ladder.
-      assert.equal(secondBody.face_detected, false);
-      assert.equal(secondBody.presence, "left_frame");
+      assert.equal(secondBody.face_detected, null);
+      assert.equal(secondBody.presence, "uncertain");
       assert.equal(secondBody.vitals, null);
     },
     {
@@ -461,7 +467,60 @@ test("POST /v1/camera/observe Presage failure yields null vitals; away confirms 
   );
 });
 
-test("POST /v1/camera/observe maps null Presage vitals to away after confirm", async () => {
+test("POST /v1/camera/observe keeps empty Presage success uncertain (not away)", async () => {
+  await withApp(
+    async (base, token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      };
+      const payload = {
+        session_id: "lock-empty",
+        phase: "active",
+        mime: "video/mp4",
+        data_base64: Buffer.from("clip-bytes").toString("base64"),
+      };
+      const first = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(first.status, 200);
+      const firstBody = (await first.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      assert.equal(firstBody.face_detected, null);
+      assert.equal(firstBody.presence, "uncertain");
+
+      const second = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      assert.equal(second.status, 200);
+      const secondBody = (await second.json()) as {
+        face_detected: boolean | null;
+        presence: string;
+      };
+      assert.equal(secondBody.face_detected, null);
+      assert.equal(secondBody.presence, "uncertain");
+    },
+    {
+      cameraAnalyze: async () => ({
+        heart_rate: null,
+        breathing_rate: null,
+        stress_index: null,
+        stressed: false,
+        focus_ok: false,
+        source: "presage",
+        raw_summary: "HR=null RR=null",
+      }),
+    },
+  );
+});
+
+test("POST /v1/camera/observe ladders away on explicit vendor no-face", async () => {
   await withApp(
     async (base, token) => {
       const headers = {
@@ -505,7 +564,77 @@ test("POST /v1/camera/observe maps null Presage vitals to away after confirm", a
         focus_ok: false,
         source: "presage",
         raw_summary: "HR=null RR=null",
+        face_detected: false,
       }),
+    },
+  );
+});
+
+test("POST /v1/camera/observe JPEG skips Presage and notes leave unavailable", async () => {
+  await withApp(async (base, token) => {
+    const res = await fetch(`${base}/v1/camera/observe`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        session_id: "jpeg-1",
+        phase: "active",
+        mime: "image/jpeg",
+        data_base64: Buffer.from("jpeg-bytes").toString("base64"),
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      face_detected: boolean | null;
+      vitals: null;
+      watching_note: string;
+      presence: string;
+    };
+    assert.equal(body.face_detected, null);
+    assert.equal(body.vitals, null);
+    assert.equal(body.presence, "uncertain");
+    assert.match(body.watching_note, /JPEG observe skips Presage/i);
+  });
+});
+
+test("POST /v1/camera/observe skips Presage upload during break", async () => {
+  let analyzeCalls = 0;
+  await withApp(
+    async (base, token) => {
+      const res = await fetch(`${base}/v1/camera/observe`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          session_id: "break-1",
+          phase: "break",
+          mime: "video/mp4",
+          data_base64: Buffer.from("clip-bytes").toString("base64"),
+        }),
+      });
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as { vitals: null; watching_note: string };
+      assert.equal(body.vitals, null);
+      assert.equal(analyzeCalls, 0);
+      assert.match(body.watching_note, /skipped during pause\/break/i);
+    },
+    {
+      cameraAnalyze: async () => {
+        analyzeCalls += 1;
+        return {
+          heart_rate: 70,
+          breathing_rate: 14,
+          stress_index: 40,
+          stressed: false,
+          focus_ok: true,
+          source: "presage",
+          raw_summary: "ok",
+        };
+      },
     },
   );
 });

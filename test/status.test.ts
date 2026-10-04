@@ -136,6 +136,10 @@ function stubFetch(handlers: {
         headers: { "Content-Type": "application/json" },
       });
     }
+    // Best-effort Google revoke during disconnect — keep tests offline.
+    if (url.includes("oauth2.googleapis.com/revoke")) {
+      return new Response(null, { status: 200 });
+    }
     return fetch(input, init);
   }) as typeof fetch;
 }
@@ -163,7 +167,7 @@ test("GET /v1/status reports config-only for anonymous callers (no live probes)"
       const body = (await response.json()) as StatusResponse;
       assert.equal(body.ok, true);
       assert.equal(typeof body.checked_at, "string");
-      assert.equal(body.cache_ttl_seconds, 30);
+      assert.equal(body.cache_ttl_seconds, 300);
       assert.equal(byId(body, "gemini").state, "ok");
       assert.equal(byId(body, "gemini").status, "Configured");
       assert.equal(byId(body, "ollama").state, "ok");
@@ -176,6 +180,8 @@ test("GET /v1/status reports config-only for anonymous callers (no live probes)"
       assert.equal(byId(body, "presage").state, "warn");
       assert.equal(byId(body, "presage").status, "Degraded");
       assert.equal(byId(body, "xai_tts").state, "warn");
+      assert.equal(byId(body, "companion_live").state, "warn");
+      assert.equal(byId(body, "companion_live").status, "Unavailable");
       assert.equal(byId(body, "storage").status, "Local file");
       assert.equal(geminiHits, 0);
       assert.equal(ollamaHits, 0);
@@ -203,6 +209,25 @@ test("GET /v1/status marks Gemini quota and Ollama down when signed in", async (
   );
 });
 
+test("GET /v1/status stays ok when Gemini healthy and Ollama down (cloud primary)", async () => {
+  await withApp(
+    async (base) => {
+      const access = await signIn(base);
+      const response = await fetch(`${base}/v1/status`, {
+        headers: { Authorization: `Bearer ${access}` },
+      });
+      assert.equal(response.status, 200);
+      const body = (await response.json()) as StatusResponse;
+      assert.equal(body.ok, true);
+      assert.equal(byId(body, "gemini").state, "ok");
+      assert.equal(byId(body, "ollama").state, "err");
+      assert.equal(byId(body, "chat_provider").state, "warn");
+      assert.equal(byId(body, "chat_provider").status, "Degraded");
+    },
+    { fetchImpl: stubFetch({ geminiOk: true, ollamaOk: false }) },
+  );
+});
+
 test("GET /v1/status enriches account + Google when signed in", async () => {
   await withApp(
     async (base) => {
@@ -217,6 +242,40 @@ test("GET /v1/status enriches account + Google when signed in", async () => {
       // Desktop Google sign-in also grants Calendar/Drive scopes.
       assert.equal(byId(body, "google").state, "ok");
       assert.match(byId(body, "google").detail, /Calendar and Drive/i);
+    },
+    { fetchImpl: stubFetch({ geminiOk: true, ollamaOk: true }) },
+  );
+});
+
+test("GET /v1/status is not ok when signed-in Google Calendar/Drive is disconnected", async () => {
+  await withApp(
+    async (base) => {
+      const access = await signIn(base);
+      const headers = { Authorization: `Bearer ${access}` };
+
+      // Connected + other criticals healthy → global ok.
+      const connectedRes = await fetch(`${base}/v1/status`, { headers });
+      assert.equal(connectedRes.status, 200);
+      const connected = (await connectedRes.json()) as StatusResponse;
+      assert.equal(connected.ok, true);
+      assert.equal(byId(connected, "google").state, "ok");
+      assert.equal(byId(connected, "google").status, "Connected");
+
+      const disconnect = await fetch(`${base}/v1/google/disconnect`, {
+        method: "POST",
+        headers,
+      });
+      assert.equal(disconnect.status, 204);
+
+      const response = await fetch(`${base}/v1/status`, { headers });
+      assert.equal(response.status, 200);
+      const body = (await response.json()) as StatusResponse;
+      assert.equal(body.ok, false);
+      assert.equal(byId(body, "google").state, "warn");
+      assert.equal(byId(body, "google").status, "Offline");
+      assert.match(byId(body, "google").detail, /re-link Calendar and Drive/i);
+      // Waypoint session remains; only Calendar/Drive grant is gone.
+      assert.equal(byId(body, "account").state, "ok");
     },
     { fetchImpl: stubFetch({ geminiOk: true, ollamaOk: true }) },
   );

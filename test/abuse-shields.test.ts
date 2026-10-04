@@ -567,3 +567,24 @@ test("chat is rate limited per IP", async () => {
     { rateRules: { chatIp: { limit: 1, windowMs: 60_000 } } },
   );
 });
+
+test("chat is rate limited per authenticated user", async () => {
+  await withApp(
+    async (base) => {
+      const access = await signIn(base);
+      const chat = () =>
+        fetch(`${base}/v1/gemini/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${access}` },
+          body: JSON.stringify({ message: "hi" }),
+        });
+      assert.notEqual((await chat()).status, 429);
+      const blocked = await chat();
+      assert.equal(blocked.status, 429);
+      assert.equal((await blocked.json() as { error: { code: string } }).error.code, "rate_limited");
+    },
+    {
+      rateRules: { chatUser: { limit: 1, windowMs: 60_000 }, chatIp: { limit: 100, windowMs: 60_000 } },
+    },
+  );
+});

@@ -410,6 +410,18 @@ test("live limits come from env with sane defaults", () => {
     }),
     { maxPerUser: 1, maxGlobal: 5, allowQueryToken: false },
   );
+  assert.equal(
+    loadLiveLimits({ NODE_ENV: "production" }).allowQueryToken,
+    false,
+  );
+  assert.equal(
+    loadLiveLimits({ PUBLIC_BASE_URL: "https://api.example.com" }).allowQueryToken,
+    false,
+  );
+  assert.equal(
+    loadLiveLimits({ NODE_ENV: "production", LIVE_ALLOW_QUERY_TOKEN: "1" }).allowQueryToken,
+    true,
+  );
 });
 
 test("access token prefers subprotocol, then header, then (gated) query", () => {

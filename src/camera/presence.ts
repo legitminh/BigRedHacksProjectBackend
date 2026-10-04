@@ -30,6 +30,11 @@ export type ObservePresenceInput = {
   phase: CameraPhase;
   faceDetected: boolean | null;
   brightness?: number | null;
+  /**
+   * When false/omitted, brightness 0 (common placeholder) is ignored.
+   * Obstructed only applies to a measured low reading, and never overrides a detected face.
+   */
+  brightnessMeasured?: boolean;
   stressed?: boolean | null;
   now?: Date;
 };
@@ -104,11 +109,16 @@ export function isSilentCameraPhase(phase: CameraPhase): boolean {
 function classify(
   faceDetected: boolean | null,
   brightness: number | null | undefined,
+  brightnessMeasured?: boolean,
 ): PresenceState {
-  if (typeof brightness === "number" && brightness < 25) {
+  // Face wins over lighting: a detected face must not become an obstructed nag.
+  if (faceDetected === true) return "present";
+  const measured =
+    brightnessMeasured === true ||
+    (typeof brightness === "number" && Number.isFinite(brightness) && brightness > 0);
+  if (measured && typeof brightness === "number" && brightness < 25) {
     return "camera_obstructed";
   }
-  if (faceDetected === true) return "present";
   if (faceDetected === false) return "left_frame";
   return "uncertain";
 }
@@ -191,7 +201,11 @@ export function observePresence(
     session.lastStressNudgeAt = now;
   }
 
-  const raw = classify(input.faceDetected, input.brightness ?? null);
+  const raw = classify(
+    input.faceDetected,
+    input.brightness ?? null,
+    input.brightnessMeasured,
+  );
 
   let nudge: PresenceNudge | null = null;
 

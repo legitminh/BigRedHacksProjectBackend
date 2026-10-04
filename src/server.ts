@@ -242,7 +242,15 @@ async function handle(
     return;
   }
 
-  if (await handleAdmin(method, path, req, res, { config: deps.config, store: deps.store })) {
+  if (
+    await handleAdmin(method, path, req, res, {
+      config: deps.config,
+      store: deps.store,
+      limiter: deps.shields.limiter,
+      adminLoginRule: deps.shields.rules.adminLoginIp,
+      now: deps.now,
+    })
+  ) {
     return;
   }
 
@@ -256,6 +264,7 @@ async function handle(
     return;
   }
   if (method === "GET" && path === "/v1/auth/google/poll") {
+    limit(deps, "auth-poll", shieldIp(deps, req), "authPollIp");
     pollGoogle(url, res, deps);
     return;
   }
@@ -302,6 +311,13 @@ async function handle(
   }
   if (method === "POST" && (path === "/v1/gemini/chat" || path === "/v1/companion/chat")) {
     limit(deps, "chat", shieldIp(deps, req), "chatIp");
+    const chatUser = await optionalUser(deps, req, deps.now());
+    if (chatUser) {
+      limit(deps, "chat-user", chatUser.id, "chatUser");
+    }
+  }
+  if (method === "GET" && path === "/v1/google/calendar/poll") {
+    limit(deps, "auth-poll", shieldIp(deps, req), "authPollIp");
   }
   if (method === "POST" && path === "/v1/camera/observe") {
     // Meter by user id when JWT is present; fall back to IP before auth fails inside product.

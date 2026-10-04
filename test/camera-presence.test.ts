@@ -516,6 +516,37 @@ test("false return: brief appearance then away resets return confirmation timer"
   assert.equal(confirmedBack.nudge?.kind, "welcome_back");
 });
 
+test("face present wins over placeholder brightness 0", () => {
+  const store = new CameraSessionStore();
+  const out = observePresence(store, {
+    userId: "u",
+    sessionId: "s",
+    phase: "active",
+    faceDetected: true,
+    brightness: 0,
+    now: at(9_000_000),
+  });
+  assert.equal(out.presence, "present");
+  assert.equal(out.nudge, null);
+});
+
+test("observe lock serializes overlapping session work", async () => {
+  const store = new CameraSessionStore();
+  const order: number[] = [];
+  const a = store.withObserveLock("u", "s", async () => {
+    order.push(1);
+    await new Promise((r) => setTimeout(r, 30));
+    order.push(2);
+    return "a";
+  });
+  const b = store.withObserveLock("u", "s", async () => {
+    order.push(3);
+    return "b";
+  });
+  assert.deepEqual(await Promise.all([a, b]), ["a", "b"]);
+  assert.deepEqual(order, [1, 2, 3]);
+});
+
 test("obstructed camera line fires after held delay with helpful non-shaming line", () => {
   const store = new CameraSessionStore();
   const t0 = 6_000_000;
@@ -523,8 +554,9 @@ test("obstructed camera line fires after held delay with helpful non-shaming lin
     userId: "u",
     sessionId: "s",
     phase: "active",
-    faceDetected: true,
+    faceDetected: null,
     brightness: 10,
+    brightnessMeasured: true,
     now: at(t0),
   });
   assert.equal(start.presence, "camera_obstructed");
@@ -534,8 +566,9 @@ test("obstructed camera line fires after held delay with helpful non-shaming lin
     userId: "u",
     sessionId: "s",
     phase: "active",
-    faceDetected: true,
+    faceDetected: null,
     brightness: 10,
+    brightnessMeasured: true,
     now: at(t0 + 30_000),
   });
   assert.equal(held.nudge?.kind, "camera_obstructed");
