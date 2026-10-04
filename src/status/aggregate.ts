@@ -331,7 +331,7 @@ function chatProviderIndicator(
       label: "Copilot chat",
       state: fallbackReady ? "ok" : "warn",
       status: fallbackReady ? "Connected" : "Degraded",
-      detail: `Gemini primary (${config.geminiModel}); Ollama fallback ${
+      detail: `Gemini Live primary (${config.geminiLiveModel}); Ollama fallback ${
         fallbackReady ? "ready" : "unavailable"
       }`,
       optional: false,

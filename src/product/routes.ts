@@ -17,7 +17,7 @@ import {
 import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
 import { buildCompanionChatSystem, buildCopilotChatSystem } from "../companion/geminiLive.ts";
 import { createDriveClient, summarizeDriveFiles, type DriveClient } from "../drive/client.ts";
-import { geminiChat } from "../gemini/chat.ts";
+import { geminiLiveChat, type LiveChatInput } from "../gemini/liveChat.ts";
 import {
   isLocalChatForced,
   ollamaChat,
@@ -58,6 +58,8 @@ export type ProductDeps = {
   calendarConnects: CalendarConnects;
   now: () => Date;
   fetch: FetchLike;
+  /** Override Live text chat (tests). Default: short-lived Gemini Live TEXT session. */
+  liveChat?: (input: LiveChatInput) => Promise<string>;
 };
 
 function nowSeconds(now: Date): number {
@@ -561,18 +563,19 @@ async function chatWithLocalFallback(
   }
 
   try {
-    return await geminiChat({
+    // Per-request Live TEXT WebSocket — isolated system/history; no shared session state.
+    const chat = deps.liveChat ?? geminiLiveChat;
+    return await chat({
       apiKey: deps.config.geminiApiKey,
-      model: deps.config.geminiModel,
+      model: deps.config.geminiLiveModel,
       system: input.system,
       history: input.history,
       message: input.message,
-      fetchImpl: deps.fetch,
     });
   } catch (error) {
     if (!localReady || !shouldFallbackToLocal(error)) throw error;
     console.warn(
-      "Gemini chat unavailable; falling back to local Ollama model",
+      "Gemini Live chat unavailable; falling back to local Ollama model",
       deps.config.ollamaChatModel,
       error instanceof HttpError ? error.code : error,
     );

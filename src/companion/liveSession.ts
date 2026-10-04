@@ -275,6 +275,8 @@ export type ConnectGeminiOptions = {
   /** Override the upstream URL (tests). */
   url?: string;
   timeoutMs?: number;
+  /** Default AUDIO voice setup; text chat passes setupTextLiveMessage. */
+  buildSetup?: (model: string, system: string) => unknown;
   /**
    * Called synchronously with the socket *before* any await, so the caller can close it
    * (e.g. client disconnects mid-setup).
@@ -289,6 +291,7 @@ export async function connectGemini(
   options: ConnectGeminiOptions = {},
 ): Promise<WebSocket> {
   const timeoutMs = options.timeoutMs ?? SETUP_TIMEOUT_MS;
+  const buildSetup = options.buildSetup ?? setupMessage;
   const gemini = new WebSocket(options.url ?? liveWsUrl(apiKey));
   options.onSocket?.(gemini);
   // Persistent handler: a late 'error' (e.g. after abort/terminate) must never be unhandled.
@@ -316,7 +319,7 @@ export async function connectGemini(
       gemini.once("close", onClose);
     });
 
-    gemini.send(JSON.stringify(setupMessage(model, system)));
+    gemini.send(JSON.stringify(buildSetup(model, system)));
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;

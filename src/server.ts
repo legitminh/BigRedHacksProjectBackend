@@ -21,7 +21,7 @@ import {
   rateLimited,
   type RateRules,
 } from "./security/rateLimit.ts";
-import { handleProduct } from "./product/routes.ts";
+import { handleProduct, type ProductDeps } from "./product/routes.ts";
 import { handleVoiceHealth, handleVoiceTts } from "./voice/tts.ts";
 import { aggregateStatus } from "./status/aggregate.ts";
 import {
@@ -48,6 +48,8 @@ export type AppDeps = {
   calendarConnects?: CalendarConnects;
   now?: () => Date;
   fetch?: FetchLike;
+  /** Override Live text chat for tests (defaults to geminiLiveChat). */
+  liveChat?: ProductDeps["liveChat"];
   /** Abuse-shield state; defaults to a fresh in-process limiter per app. */
   limiter?: RateLimiter;
   /** Override individual rate-limit rules (tests / ops). */
@@ -67,7 +69,7 @@ type HandleDeps = Required<
     AppDeps,
     "config" | "store" | "pending" | "google" | "mailer" | "calendar" | "drive" | "calendarConnects" | "now" | "fetch"
   >
-> & { shields: Shields };
+> & { shields: Shields; liveChat?: ProductDeps["liveChat"] };
 
 function shieldIp(deps: HandleDeps, req: IncomingMessage): string {
   return clientIp(req, deps.config.trustProxy);
@@ -308,6 +310,7 @@ async function handle(
       calendarConnects: deps.calendarConnects,
       now: deps.now,
       fetch: deps.fetch,
+      liveChat: deps.liveChat,
     })
   ) {
     return;

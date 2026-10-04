@@ -76,6 +76,25 @@ export function setupMessage(model: string, systemInstruction: string): unknown 
   };
 }
 
+/**
+ * Text-only Live setup for Copilot / companion HTTP chat.
+ * One short-lived WS session per request — no audio tools or VAD.
+ */
+export function setupTextLiveMessage(model: string, systemInstruction: string): unknown {
+  const modelName = model.startsWith("models/") ? model : `models/${model}`;
+  return {
+    setup: {
+      model: modelName,
+      generationConfig: {
+        responseModalities: ["TEXT"],
+      },
+      systemInstruction: {
+        parts: [{ text: systemInstruction }],
+      },
+    },
+  };
+}
+
 export function audioMessage(pcm: Buffer): unknown {
   return {
     realtimeInput: {
@@ -96,6 +115,41 @@ export function textTurnMessage(text: string): unknown {
           parts: [{ text }],
         },
       ],
+      turnComplete: true,
+    },
+  };
+}
+
+export type LiveChatTurn = {
+  role: "user" | "assistant" | "system";
+  content: string;
+};
+
+/**
+ * Pack prior turns + the latest user message into one Live clientContent frame.
+ * Assistant history maps to Gemini Live role `model`.
+ */
+export function chatTurnsMessage(history: LiveChatTurn[], message: string): unknown {
+  const turns: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+  for (const turn of history) {
+    if (turn.role === "system") continue;
+    const text = turn.content.trim();
+    if (!text) continue;
+    turns.push({
+      role: turn.role === "assistant" ? "model" : "user",
+      parts: [{ text }],
+    });
+  }
+  const latest = message.trim();
+  if (latest) {
+    turns.push({
+      role: "user",
+      parts: [{ text: latest }],
+    });
+  }
+  return {
+    clientContent: {
+      turns,
       turnComplete: true,
     },
   };

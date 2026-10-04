@@ -226,22 +226,6 @@ test("companion chat injects study context and stays backend-mediated", async ()
   const sent: { code: string }[] = [];
   const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
   let sawSystem = "";
-  const fetchImpl: typeof fetch = async (input, init) => {
-    const url = String(input);
-    if (url.includes("generativelanguage.googleapis.com")) {
-      const body = JSON.parse(String(init?.body ?? "{}")) as {
-        systemInstruction?: { parts?: Array<{ text?: string }> };
-      };
-      sawSystem = body.systemInstruction?.parts?.map((p) => p.text ?? "").join("") ?? "";
-      return new Response(
-        JSON.stringify({
-          candidates: [{ content: { parts: [{ text: "Let's walk through one heap example." }] } }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-    return fetch(input, init);
-  };
   const server: Server = createApp({
     config: loadConfig({
       GOOGLE_CLIENT_ID: "client-id",
@@ -254,7 +238,10 @@ test("companion chat injects study context and stays backend-mediated", async ()
     google: google(),
     mailer,
     calendar: calendar([]),
-    fetch: fetchImpl,
+    liveChat: async (input) => {
+      sawSystem = input.system;
+      return "Let's walk through one heap example.";
+    },
     now: () => new Date("2026-10-03T18:00:00.000Z"),
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -297,14 +284,9 @@ test("gemini chat falls back to local Ollama on quota without surfacing friction
   const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
   const sent: { code: string }[] = [];
   const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
+  const { HttpError } = await import("../src/http.ts");
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
-    if (url.includes("generativelanguage.googleapis.com")) {
-      return new Response(
-        JSON.stringify({ error: { message: "Quota exceeded for free_tier", status: "RESOURCE_EXHAUSTED" } }),
-        { status: 429, headers: { "Content-Type": "application/json" } },
-      );
-    }
     if (url.includes("/api/chat")) {
       return new Response(
         JSON.stringify({ message: { role: "assistant", content: "Local coach reply from Ollama." } }),
@@ -329,6 +311,9 @@ test("gemini chat falls back to local Ollama on quota without surfacing friction
     mailer,
     calendar: calendar([]),
     fetch: fetchImpl,
+    liveChat: async () => {
+      throw new HttpError(429, "gemini_quota", "quota");
+    },
     now: () => new Date("2026-10-03T18:00:00.000Z"),
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -411,23 +396,14 @@ test("LOCAL_CHAT_PROVIDER=ollama never calls Gemini even when GEMINI_API_KEY is 
   }
 });
 
-test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini when healthy (cloud companion)", async () => {
+test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini Live when healthy (cloud companion)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "waypoint-product-"));
   const sent: { code: string }[] = [];
   const mailer: Mailer = { async sendLoginCode(message) { sent.push({ code: message.code }); } };
-  const hitGemini: string[] = [];
+  let liveCalls = 0;
   const hitOllama: string[] = [];
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
-    if (url.includes("generativelanguage.googleapis.com")) {
-      hitGemini.push(url);
-      return new Response(
-        JSON.stringify({
-          candidates: [{ content: { parts: [{ text: "Cloud companion reply." }] } }],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
     if (url.includes("/api/chat")) {
       hitOllama.push(url);
       return new Response(
@@ -453,6 +429,11 @@ test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini when healthy (cloud compan
     mailer,
     calendar: calendar([]),
     fetch: fetchImpl,
+    liveChat: async (input) => {
+      liveCalls += 1;
+      assert.match(input.model, /live/i);
+      return "Cloud companion reply.";
+    },
     now: () => new Date("2026-10-03T18:00:00.000Z"),
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -468,8 +449,8 @@ test("LOCAL_CHAT_PROVIDER=gemini still reaches Gemini when healthy (cloud compan
     assert.equal(res.status, 200);
     const body = (await res.json()) as { content: string };
     assert.equal(body.content, "Cloud companion reply.");
-    assert.equal(hitGemini.length, 1);
-    assert.equal(hitOllama.length, 0, "healthy Gemini must not fall through to Ollama");
+    assert.equal(liveCalls, 1);
+    assert.equal(hitOllama.length, 0, "healthy Gemini Live must not fall through to Ollama");
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }

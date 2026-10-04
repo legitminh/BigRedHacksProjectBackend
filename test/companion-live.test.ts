@@ -16,7 +16,9 @@ import {
   sampleRateFromMime,
   screencapToolResponse,
   SCREENCAP_TOOL,
+  chatTurnsMessage,
   setupMessage,
+  setupTextLiveMessage,
   signalsFromMessage,
   toolCallsFromMessage,
 } from "../src/companion/geminiLive.ts";
@@ -44,6 +46,45 @@ test("setup requests audio + transcripts like the Live demo", () => {
   assert.ok(setup.setup.inputAudioTranscription);
   assert.ok(setup.setup.outputAudioTranscription);
   assert.equal(setup.setup.tools[0]?.functionDeclarations[0]?.name, SCREENCAP_TOOL);
+});
+
+test("text Live setup is TEXT-only without audio tools", () => {
+  const setup = setupTextLiveMessage("gemini-3.8-live", "You are Waypoint.") as {
+    setup: {
+      model: string;
+      generationConfig: { responseModalities: string[] };
+      tools?: unknown;
+      inputAudioTranscription?: unknown;
+      realtimeInputConfig?: unknown;
+    };
+  };
+  assert.equal(setup.setup.model, "models/gemini-3.8-live");
+  assert.deepEqual(setup.setup.generationConfig.responseModalities, ["TEXT"]);
+  assert.equal(setup.setup.tools, undefined);
+  assert.equal(setup.setup.inputAudioTranscription, undefined);
+  assert.equal(setup.setup.realtimeInputConfig, undefined);
+});
+
+test("chatTurnsMessage packs history as user/model turns", () => {
+  const payload = chatTurnsMessage(
+    [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+      { role: "system", content: "ignore" },
+    ],
+    "next?",
+  ) as {
+    clientContent: { turns: { role: string; parts: { text: string }[] }[]; turnComplete: boolean };
+  };
+  assert.equal(payload.clientContent.turnComplete, true);
+  assert.deepEqual(
+    payload.clientContent.turns.map((t) => [t.role, t.parts[0].text]),
+    [
+      ["user", "hi"],
+      ["model", "hello"],
+      ["user", "next?"],
+    ],
+  );
 });
 
 test("parses request_screencap tool calls", () => {
