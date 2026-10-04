@@ -30,6 +30,7 @@ export type RotateResult =
   | { status: "reuse" }
   | { status: "invalid" };
 
+import type { DriveCachedFile } from "../drive/cache.ts";
 import type {
   CalendarConnection,
   PaceSample,
@@ -91,6 +92,22 @@ export type AdminUserDetail = {
   tokens: { active: number; total: number; revoked: number };
 };
 
+export type SchoolDigestSource = {
+  id: string;
+  name: string;
+};
+
+export type SchoolDigest = {
+  userId: string;
+  digestDate: string;
+  timezone: string;
+  model: string;
+  digestText: string;
+  sources: SchoolDigestSource[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type AdminBrowseTable =
   | "users"
   | "tasks"
@@ -141,6 +158,12 @@ export type Store = {
   saveTask(userId: string, task: TaskRecord): Promise<void>;
   insertSession(userId: string, session: SessionRecap): Promise<SessionRecap>;
   listSessions(userId: string): Promise<SessionRecap[]>;
+  getDriveFileCache(userId: string, fileId: string): Promise<DriveCachedFile | null>;
+  upsertDriveFileCache(entry: DriveCachedFile): Promise<void>;
+  listDriveFileCache(userId: string): Promise<DriveCachedFile[]>;
+  clearDriveFileCache(userId: string): Promise<void>;
+  getSchoolDigest(userId: string, digestDate: string): Promise<SchoolDigest | null>;
+  upsertSchoolDigest(digest: SchoolDigest): Promise<void>;
   /** Permanently delete the user account and all synced data (admin row gone). */
   clearUserData(userId: string, now: Date): Promise<void>;
   close(): Promise<void>;

@@ -164,7 +164,7 @@ test("ephemeral token returns Google's token without the API key", async () => {
       assert.deepEqual(JSON.parse(raw), {
         token: "auth_tokens/live-once",
         expire_time: "2026-10-03T16:29:00.000Z",
-        model: "gemini-flash-latest",
+        model: "gemini-3.5-flash-lite",
       });
       assert.equal(
         requestUrl,

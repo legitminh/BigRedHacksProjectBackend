@@ -21,7 +21,14 @@ export type Config = {
   smtpPass: string | null;
   mailFrom: string | null;
   geminiApiKey: string | null;
+  /** Short Copilot / voice REST turns (Flash-Lite — high free RPD). */
   geminiModel: string;
+  /**
+   * Deeper REST model when DEEP BRIEF / FULL CONTENTS or list-style asks need every row.
+   * Flash-Lite collapses inventories into category blurbs; default gemini-3.5-flash (free tier).
+   * gemini-3.8-flash is an alternative if your key exposes it.
+   */
+  geminiOverviewModel: string;
   /** Gemini Live model for study companion WebSocket proxy (`/v1/companion/live`). */
   geminiLiveModel: string;
   /**
@@ -184,8 +191,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     smtpPass: nonempty(env.SMTP_PASS),
     mailFrom: nonempty(env.MAIL_FROM),
     geminiApiKey: nonempty(env.GEMINI_API_KEY),
-    // Copilot / companion HTTP chat (REST). Flash-Lite = highest free-tier RPD; avoid full Flash (~20 RPD).
+    // Copilot / companion HTTP chat (REST). Flash-Lite = highest free-tier RPD for short turns.
     geminiModel: nonempty(env.GEMINI_MODEL) ?? "gemini-3.5-flash-lite",
+    geminiOverviewModel: nonempty(env.GEMINI_OVERVIEW_MODEL) ?? "gemini-3.5-flash",
     // Voice companion Live only (`/v1/companion/live`). Not used for HTTP Copilot text.
     geminiLiveModel: nonempty(env.GEMINI_LIVE_MODEL) ?? "gemini-3.8-live",
     xaiApiKey: nonempty(env.XAI_API_KEY),

@@ -199,6 +199,8 @@ export function createApp(deps: AppDeps): Server {
   attachCompanionLiveUpgrade(server, {
     config: deps.config,
     store: deps.store,
+    drive,
+    calendar,
     now: nowFn,
   });
 
@@ -472,7 +474,7 @@ function assertLoginReady(config: Config): void {
 
 /** Sign-in + Calendar + Drive in one consent (required for the desktop app). */
 const GOOGLE_LOGIN_SCOPES =
-  "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/drive.readonly";
+  "openid email profile https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly";
 
 async function startGoogle(
   res: ServerResponse,

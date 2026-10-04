@@ -25,6 +25,8 @@ export interface CameraPresenceSession {
   obstructedSince: Date | null;
   obstructedSaid: boolean;
   lastStressNudgeAt: Date | null;
+  /** Last stress-family nudge kind (`suggest_break` | `stressed`) for alternation. */
+  lastStressNudgeKind: "suggest_break" | "stressed" | null;
   lastSeenAt: Date;
 }
 
@@ -47,6 +49,7 @@ export function createEmptySession(now: Date): CameraPresenceSession {
     obstructedSince: null,
     obstructedSaid: false,
     lastStressNudgeAt: null,
+    lastStressNudgeKind: null,
     lastSeenAt: now,
   };
 }

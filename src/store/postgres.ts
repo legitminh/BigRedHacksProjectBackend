@@ -8,6 +8,11 @@ import { Pool, type PoolClient } from "pg";
 import { canonicalEmail } from "../auth/email.ts";
 import { hashesMatch } from "../auth/tokens.ts";
 import {
+  clipCachedText,
+  driveCacheEvictFileIds,
+  type DriveCachedFile,
+} from "../drive/cache.ts";
+import {
   DEFAULT_INTERACTION,
   type Interaction,
   type Level,
@@ -26,6 +31,8 @@ import type {
   GoogleProfile,
   PublicUser,
   RotateResult,
+  SchoolDigest,
+  SchoolDigestSource,
   Store,
   StoredRefreshToken,
 } from "./types.ts";
@@ -50,6 +57,65 @@ function toPublic(row: UserRow): PublicUser {
 
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
+}
+
+function mapDriveCacheRow(row: {
+  user_id: string;
+  file_id: string;
+  name: string;
+  mime_type: string;
+  modified_time: string;
+  text: string;
+  kind: string | null;
+  extracted_at: Date;
+}): DriveCachedFile {
+  return {
+    userId: row.user_id,
+    fileId: row.file_id,
+    name: row.name,
+    mimeType: row.mime_type,
+    modifiedTime: row.modified_time,
+    text: row.text,
+    kind: row.kind ?? undefined,
+    extractedAt: new Date(row.extracted_at).toISOString(),
+  };
+}
+
+const SCHOOL_DIGEST_MAX_TEXT = 80_000;
+
+function clipSchoolDigestText(text: string): string {
+  if (text.length <= SCHOOL_DIGEST_MAX_TEXT) return text;
+  return `${text.slice(0, SCHOOL_DIGEST_MAX_TEXT - 1).trimEnd()}…`;
+}
+
+function mapSchoolDigestRow(row: {
+  user_id: string;
+  digest_date: Date;
+  timezone: string;
+  model: string;
+  digest_text: string;
+  sources_json: SchoolDigestSource[] | string;
+  created_at: Date;
+  updated_at: Date;
+}): SchoolDigest {
+  const digestDate =
+    row.digest_date instanceof Date
+      ? row.digest_date.toISOString().slice(0, 10)
+      : String(row.digest_date).slice(0, 10);
+  const sources =
+    typeof row.sources_json === "string"
+      ? (JSON.parse(row.sources_json) as SchoolDigestSource[])
+      : row.sources_json;
+  return {
+    userId: row.user_id,
+    digestDate,
+    timezone: row.timezone,
+    model: row.model,
+    digestText: row.digest_text,
+    sources: Array.isArray(sources) ? sources : [],
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
 }
 
 const userReturning = `RETURNING id, email, email_verified, name, picture`;
@@ -912,6 +978,143 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
         note: row.note,
       }));
     },
+    async getDriveFileCache(userId, fileId) {
+      const result = await pool.query<{
+        user_id: string;
+        file_id: string;
+        name: string;
+        mime_type: string;
+        modified_time: string;
+        text: string;
+        kind: string | null;
+        extracted_at: Date;
+      }>(
+        `SELECT user_id, file_id, name, mime_type, modified_time, text, kind, extracted_at
+         FROM drive_file_cache WHERE user_id = $1 AND file_id = $2`,
+        [userId, fileId],
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      return mapDriveCacheRow(row);
+    },
+    async upsertDriveFileCache(entry) {
+      const clipped: DriveCachedFile = { ...entry, text: clipCachedText(entry.text) };
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const existing = await client.query<{ file_id: string; extracted_at: Date }>(
+          `SELECT file_id, extracted_at FROM drive_file_cache WHERE user_id = $1`,
+          [entry.userId],
+        );
+        const forUser = existing.rows.map((row) => ({
+          userId: entry.userId,
+          fileId: row.file_id,
+          name: "",
+          mimeType: "",
+          modifiedTime: "",
+          text: "",
+          extractedAt: new Date(row.extracted_at).toISOString(),
+        }));
+        const evict = driveCacheEvictFileIds(forUser, entry.fileId);
+        if (evict.length > 0) {
+          await client.query(
+            `DELETE FROM drive_file_cache WHERE user_id = $1 AND file_id = ANY($2::text[])`,
+            [entry.userId, evict],
+          );
+        }
+        await client.query(
+          `INSERT INTO drive_file_cache
+             (user_id, file_id, name, mime_type, modified_time, text, kind, extracted_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (user_id, file_id) DO UPDATE SET
+             name = EXCLUDED.name,
+             mime_type = EXCLUDED.mime_type,
+             modified_time = EXCLUDED.modified_time,
+             text = EXCLUDED.text,
+             kind = EXCLUDED.kind,
+             extracted_at = EXCLUDED.extracted_at`,
+          [
+            clipped.userId,
+            clipped.fileId,
+            clipped.name,
+            clipped.mimeType,
+            clipped.modifiedTime,
+            clipped.text,
+            clipped.kind ?? null,
+            clipped.extractedAt,
+          ],
+        );
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    async listDriveFileCache(userId) {
+      const result = await pool.query<{
+        user_id: string;
+        file_id: string;
+        name: string;
+        mime_type: string;
+        modified_time: string;
+        text: string;
+        kind: string | null;
+        extracted_at: Date;
+      }>(
+        `SELECT user_id, file_id, name, mime_type, modified_time, text, kind, extracted_at
+         FROM drive_file_cache WHERE user_id = $1 ORDER BY extracted_at DESC`,
+        [userId],
+      );
+      return result.rows.map(mapDriveCacheRow);
+    },
+    async clearDriveFileCache(userId) {
+      await pool.query(`DELETE FROM drive_file_cache WHERE user_id = $1`, [userId]);
+    },
+    async getSchoolDigest(userId, digestDate) {
+      const result = await pool.query<{
+        user_id: string;
+        digest_date: Date;
+        timezone: string;
+        model: string;
+        digest_text: string;
+        sources_json: SchoolDigestSource[];
+        created_at: Date;
+        updated_at: Date;
+      }>(
+        `SELECT user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at
+         FROM school_digests WHERE user_id = $1 AND digest_date = $2::date`,
+        [userId, digestDate],
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      return mapSchoolDigestRow(row);
+    },
+    async upsertSchoolDigest(digest) {
+      const clipped = clipSchoolDigestText(digest.digestText);
+      await pool.query(
+        `INSERT INTO school_digests
+           (user_id, digest_date, timezone, model, digest_text, sources_json, created_at, updated_at)
+         VALUES ($1, $2::date, $3, $4, $5, $6::jsonb, $7::timestamptz, $8::timestamptz)
+         ON CONFLICT (user_id, digest_date) DO UPDATE SET
+           timezone = EXCLUDED.timezone,
+           model = EXCLUDED.model,
+           digest_text = EXCLUDED.digest_text,
+           sources_json = EXCLUDED.sources_json,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          digest.userId,
+          digest.digestDate,
+          digest.timezone,
+          digest.model,
+          clipped,
+          JSON.stringify(digest.sources),
+          digest.createdAt,
+          digest.updatedAt,
+        ],
+      );
+    },
     async clearUserData(userId, _now) {
       const client = await pool.connect();
       try {
@@ -921,6 +1124,8 @@ export async function openPostgres(databaseUrl: string): Promise<Store> {
           [userId],
         );
         const email = emailRow.rows[0]?.email?.trim().toLowerCase() ?? null;
+        await client.query(`DELETE FROM drive_file_cache WHERE user_id = $1`, [userId]);
+        await client.query(`DELETE FROM school_digests WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM session_recaps WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM tasks WHERE user_id = $1`, [userId]);
         await client.query(`DELETE FROM pace_samples WHERE user_id = $1`, [userId]);

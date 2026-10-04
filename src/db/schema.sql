@@ -93,3 +93,30 @@ CREATE TABLE IF NOT EXISTS session_recaps (
   attention TEXT NOT NULL,
   note TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS drive_file_cache (
+  user_id UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  file_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  modified_time TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL,
+  kind TEXT,
+  extracted_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, file_id)
+);
+
+CREATE INDEX IF NOT EXISTS drive_file_cache_user_extracted_idx
+  ON drive_file_cache (user_id, extracted_at);
+
+CREATE TABLE IF NOT EXISTS school_digests (
+  user_id UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  digest_date DATE NOT NULL,
+  timezone TEXT NOT NULL DEFAULT 'UTC',
+  model TEXT NOT NULL,
+  digest_text TEXT NOT NULL,
+  sources_json JSONB NOT NULL DEFAULT '[]',
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (user_id, digest_date)
+);
