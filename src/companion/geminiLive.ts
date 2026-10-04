@@ -19,6 +19,24 @@ Do not introduce yourself with a long preamble — wait for the student, or repl
 You cannot see the student's screen and must not request screenshots or screen capture. \
 Help from what they say, type, and the study context only.`;
 
+/**
+ * Live is STT-only for Copilot mic: Grok speaks the Flash-Lite reply.
+ * Ask Gemini to stay silent so we burn less Live audio generation.
+ */
+export const LISTEN_ONLY_LIVE_SYSTEM = `\
+You are a silent speech-to-text helper for Waypoint. \
+Transcribe the student accurately. Do not speak, greet, advise, or continue the conversation. \
+If you must emit audio, keep it to a single short acknowledgment word at most. \
+Never request screenshots or screen capture.`;
+
+/** Short spoken replies via Flash-Lite before Grok TTS. */
+export const VOICE_REPLY_SYSTEM = `\
+You are Waypoint Companion in a live voice loop. \
+Reply in 1–2 short spoken sentences, plain text only — no markdown, lists, emoji, or stage directions. \
+Use Calendar and Drive facts from STUDY CONTEXT when present — never claim you cannot access Google Drive if files or calendar are listed. \
+If Calendar/Drive are missing, tell them to open Settings → Account and tap Re-link Calendar & Drive. \
+Stay on their study context. Do not introduce yourself at length.`;
+
 export type LiveSignal =
   | { kind: "interim_user"; text: string }
   | { kind: "final_user"; text: string }
@@ -314,6 +332,8 @@ redirect to studying.`;
 
 export const MAX_UNTRUSTED_GOALS_CHARS = 500;
 export const MAX_UNTRUSTED_NOTES_CHARS = 1_500;
+/** Calendar/Drive summaries attached to Live / companion context (excerpts are long). */
+export const MAX_UNTRUSTED_GOOGLE_CONTEXT_CHARS = 14_000;
 /** Desktop Copilot sends calendar/Drive context in `system`; keep it generous but bounded. */
 export const MAX_UNTRUSTED_CLIENT_SYSTEM_CHARS = 24_000;
 
@@ -336,7 +356,7 @@ function untrustedBlock(label: string, text: string): string {
   return `<<<UNTRUSTED ${label}>>> ${text} <<<END UNTRUSTED>>>`;
 }
 
-/** Shared study-context block: goals/notes are untrusted + capped; numeric fields are server-formatted. */
+/** Shared study-context block: goals/notes/Google are untrusted + capped; numeric fields are server-formatted. */
 export function formatStudyContext(context?: Record<string, unknown> | null): string {
   if (!context || typeof context !== "object") return "No active study context.";
   const lines: string[] = [];
@@ -358,6 +378,24 @@ export function formatStudyContext(context?: Record<string, unknown> | null): st
   if (typeof context.paused === "boolean") {
     lines.push(context.paused ? "Session is paused (on a break)." : "Session is active.");
   }
+  const calendar = sanitizeUntrustedMultiline(
+    context.calendar_summary,
+    MAX_UNTRUSTED_GOOGLE_CONTEXT_CHARS,
+  );
+  if (calendar) {
+    lines.push(
+      `Google Calendar (partial):\n<<<UNTRUSTED calendar>>>\n${calendar}\n<<<END UNTRUSTED>>>`,
+    );
+  }
+  const drive = sanitizeUntrustedMultiline(
+    context.drive_summary,
+    MAX_UNTRUSTED_GOOGLE_CONTEXT_CHARS,
+  );
+  if (drive) {
+    lines.push(
+      `Google Drive (partial):\n<<<UNTRUSTED drive>>>\n${drive}\n<<<END UNTRUSTED>>>`,
+    );
+  }
   return lines.length ? lines.join("\n") : "No active study context.";
 }
 
@@ -366,6 +404,30 @@ export function buildCompanionSystem(context?: Record<string, unknown> | null): 
     SERVER_SAFETY_PREAMBLE,
     "",
     DEFAULT_LIVE_SYSTEM,
+    "",
+    "STUDY CONTEXT:",
+    formatStudyContext(context),
+  ].join("\n");
+}
+
+/** Gemini Live session used only for mic transcription. */
+export function buildCompanionListenSystem(context?: Record<string, unknown> | null): string {
+  return [
+    SERVER_SAFETY_PREAMBLE,
+    "",
+    LISTEN_ONLY_LIVE_SYSTEM,
+    "",
+    "STUDY CONTEXT:",
+    formatStudyContext(context),
+  ].join("\n");
+}
+
+/** Flash-Lite system for voice replies that Grok will speak. */
+export function buildCompanionVoiceReplySystem(context?: Record<string, unknown> | null): string {
+  return [
+    SERVER_SAFETY_PREAMBLE,
+    "",
+    VOICE_REPLY_SYSTEM,
     "",
     "STUDY CONTEXT:",
     formatStudyContext(context),

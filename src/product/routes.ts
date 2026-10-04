@@ -16,7 +16,11 @@ import {
 } from "../calendar/classify.ts";
 import { createCalendarClient, type CalendarClient } from "../calendar/client.ts";
 import { buildCompanionChatSystem, buildCopilotChatSystem } from "../companion/geminiLive.ts";
-import { createDriveClient, summarizeDriveFiles, type DriveClient } from "../drive/client.ts";
+import {
+  createDriveClient,
+  summarizeDriveFilesWithExcerpts,
+  type DriveClient,
+} from "../drive/client.ts";
 import { geminiChat, type ChatTurn } from "../gemini/chat.ts";
 import type { LiveChatInput } from "../gemini/liveChat.ts";
 import {
@@ -340,24 +344,32 @@ export async function handleProduct(
   if (method === "GET" && path === "/v1/drive/recent") {
     const user = await requireUser(deps, req, now);
     const access = await googleAccess(deps, user.id);
-    const limit = clampInt(url.searchParams.get("limit"), 6, 1, 20);
+    const limit = clampInt(url.searchParams.get("limit"), 12, 1, 25);
     const files = await deps.drive.listRecent(access, limit);
-    sendJson(res, 200, {
+    const summary = await summarizeDriveFilesWithExcerpts(
+      deps.drive,
+      access,
       files,
-      summary: summarizeDriveFiles(files, "Recently modified Drive files (partial listing):"),
-    });
+      "Recently modified Drive files (partial listing with text excerpts):",
+      { maxFiles: limit, maxCharsPerFile: 4_000 },
+    );
+    sendJson(res, 200, { files, summary });
     return true;
   }
   if (method === "GET" && path === "/v1/drive/search") {
     const user = await requireUser(deps, req, now);
     const access = await googleAccess(deps, user.id);
     const q = url.searchParams.get("q") ?? "";
-    const limit = clampInt(url.searchParams.get("limit"), 5, 1, 20);
+    const limit = clampInt(url.searchParams.get("limit"), 8, 1, 25);
     const files = await deps.drive.search(access, q, limit);
-    sendJson(res, 200, {
+    const summary = await summarizeDriveFilesWithExcerpts(
+      deps.drive,
+      access,
       files,
-      summary: summarizeDriveFiles(files, `Drive search for “${q.trim() || "…"}”:`),
-    });
+      `Drive search for “${q.trim() || "…"}” (with text excerpts):`,
+      { maxFiles: limit, maxCharsPerFile: 4_000 },
+    );
+    sendJson(res, 200, { files, summary });
     return true;
   }
   if (method === "GET" && path === "/v1/calendar/summary") {

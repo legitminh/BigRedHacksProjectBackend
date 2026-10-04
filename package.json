@@ -12,7 +12,10 @@
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "dependencies": {
+    "jszip": "^3.10.2",
+    "mammoth": "^1.13.0",
     "pg": "^8.16.3",
+    "unpdf": "^1.8.1",
     "ws": "^8.22.0"
   },
   "devDependencies": {

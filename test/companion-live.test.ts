@@ -8,6 +8,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import {
   buildCompanionChatSystem,
   buildCompanionSystem,
+  buildCompanionVoiceReplySystem,
   buildCopilotChatSystem,
   denyToolResponse,
   MAX_UNTRUSTED_GOALS_CHARS,
@@ -160,6 +161,19 @@ test("study context lands in companion system prompt", () => {
   assert.match(system, /Waypoint Companion/);
   assert.match(system, /CS 2110 heaps/);
   assert.match(system, /binary heap insert/);
+});
+
+test("voice reply system includes Calendar and Drive summaries", () => {
+  const system = buildCompanionVoiceReplySystem({
+    goals: "heaps",
+    calendar_summary: "Tue: CS 2110 quiz 10am",
+    drive_summary: "Recently modified: CS2110_syllabus.pdf",
+  });
+  assert.match(system, /Google Calendar/);
+  assert.match(system, /CS 2110 quiz/);
+  assert.match(system, /Google Drive/);
+  assert.match(system, /CS2110_syllabus/);
+  assert.match(system, /cannot access Google Drive|Re-link Calendar/i);
 });
 
 test("sample rate parses from mime", () => {
